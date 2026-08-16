@@ -1,0 +1,50 @@
+# The standard integration: validate every invoice in the repository on every
+# pull request, annotate the failures on the diff, and file them on the Security
+# tab so they are tracked rather than scrolled past.
+#
+# No secrets. The rule engine is bundled into the action at a pinned version and
+# runs inside the runner, so this workflow works on a fork PR, on a self-hosted
+# runner with no egress, and identically a year from now.
+
+name: E-invoices
+
+on:
+  pull_request:
+    paths:
+      - "invoices/**"
+      - ".github/workflows/einvoices.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  # Required only by the SARIF upload below. Drop both if you drop that step.
+  security-events: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: einvoice
+        uses: attestwire/validate-einvoice-action@v1
+        with:
+          files: |
+            invoices/**/*.xml
+            invoices/**/*.pdf
+            !invoices/**/draft-*.xml
+          sarif: einvoice.sarif
+
+      # `always()`: the report is most useful on the run that failed.
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: einvoice.sarif
+          category: einvoice
+
+      - if: always()
+        run: |
+          echo "${{ steps.einvoice.outputs.file-count }} documents, \
+                ${{ steps.einvoice.outputs.error-count }} errors, \
+                ${{ steps.einvoice.outputs.warning-count }} warnings"

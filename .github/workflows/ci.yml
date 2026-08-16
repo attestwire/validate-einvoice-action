@@ -1,0 +1,95 @@
+# CI for the action's own repository.
+#
+# The dist check is the one that earns its keep. A JavaScript action runs the
+# COMMITTED bundle, not the source: edit `src/`, forget `npm run build`, and
+# every consumer keeps running the previous version while the repository shows
+# the new one. Nothing else in this file would catch that, and no reviewer
+# reliably catches it either, so it is a job.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # node20 is what the action declares; node22 is where the runners are
+        # heading. Both, on all three runner images, because a path separator
+        # bug on Windows is otherwise found by a customer.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  dist:
+    name: dist is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Fail if dist/ differs from a fresh build
+        run: |
+          if [ -n "$(git status --porcelain dist/)" ]; then
+            echo "::error::dist/ is stale. Run 'npm run build' and commit the result."
+            git diff --stat dist/
+            exit 1
+          fi
+
+  self-test:
+    name: the action validates its own fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The action, used as a consumer would use it, against the fixtures that
+      # are supposed to pass.
+      - id: clean
+        uses: ./
+        with:
+          files: |
+            test/fixtures/*.xml
+            test/fixtures/*.pdf
+            !test/fixtures/not-an-invoice.xml
+            !test/fixtures/xrechnung-ubl-missing-buyer-reference.xml
+          sarif: einvoice.sarif
+
+      - name: A clean fixture set must report valid with zero errors
+        run: |
+          test "${{ steps.clean.outputs.valid }}" = "true"
+          test "${{ steps.clean.outputs.error-count }}" = "0"
+          test "${{ steps.clean.outputs.file-count }}" = "4"
+
+      # And the negative control: the broken fixture must fail the step. Without
+      # this, a build of the action that found nothing at all would pass above.
+      - id: broken
+        continue-on-error: true
+        uses: ./
+        with:
+          files: test/fixtures/xrechnung-ubl-missing-buyer-reference.xml
+
+      - name: The broken fixture must fail the step
+        run: |
+          test "${{ steps.broken.outcome }}" = "failure"
+          test "${{ steps.broken.outputs.valid }}" = "false"
+          test "${{ steps.broken.outputs.error-count }}" = "1"

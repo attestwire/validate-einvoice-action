@@ -1,0 +1,75 @@
+# Pinned on pull requests, current on a schedule.
+#
+# THE PROBLEM THIS SOLVES. E-invoicing rule sets move — XRechnung ships a new
+# configuration roughly twice a year, Peppol BIS Billing three times — and each
+# release can make a document that was accepted last month invalid this month.
+# Two bad options are usually on offer: pin, and find out about the change when
+# a customer rejects an invoice; or always track, and have unrelated builds go
+# red on a morning when nothing in your repository changed.
+#
+# This takes both. Pull requests run the bundled, pinned engine, so a red build
+# on a PR is always about the PR. A Monday-morning scheduled run judges the same
+# invoices against the CURRENT rule set through the hosted validator, and opens
+# an issue when they disagree — which turns a rule-set change into a triaged
+# ticket rather than a support email from a customer.
+
+name: E-invoice rule currency
+
+on:
+  pull_request:
+    paths: ["invoices/**"]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  pinned:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: attestwire/validate-einvoice-action@v1
+        with:
+          files: "invoices/**/*.xml"
+
+  current:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `continue-on-error`: a document that the current rule set rejects is
+      # news, not a broken build. The verdict is read off the output below.
+      - id: einvoice
+        continue-on-error: true
+        uses: attestwire/validate-einvoice-action@v1
+        with:
+          files: "invoices/**/*.xml"
+          api-key: ${{ secrets.ATTESTWIRE_API_KEY }}
+          record: true
+
+      - if: steps.einvoice.outputs.valid == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `E-invoice: ${{ steps.einvoice.outputs.error-count }} documents rejected by the current rule set`,
+              body: [
+                'The invoices in this repository pass the rule set pinned into the action,',
+                'and fail the rule set live today. Either the rules moved or an invoice did.',
+                '',
+                'Job summary: ' + `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                'Rule currency: https://attestwire.com/rule-currency',
+                '',
+                'Validation Records:',
+                `${{ steps.einvoice.outputs.record-urls }}`.split('\n').filter(Boolean).map(u => '- ' + u).join('\n'),
+              ].join('\n'),
+              labels: ['e-invoicing'],
+            });
+            core.info(`Opened ${data.html_url}`);

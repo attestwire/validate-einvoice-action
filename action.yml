@@ -1,0 +1,92 @@
+name: "Validate E-Invoice (EN 16931)"
+description: "Validate EN 16931 e-invoices (UBL, CII, Factur-X PDF) in CI. Runs locally by default — no API key, no network."
+author: "Attestwire"
+
+branding:
+  icon: "check-circle"
+  color: "blue"
+
+inputs:
+  files:
+    description: >-
+      Glob of invoice files to validate, one pattern per line. `!` prefixes an
+      exclusion. `.xml` files are read as UBL or CII (auto-detected); `.pdf`
+      files are read as Factur-X / ZUGFeRD and the embedded CII XML is
+      validated.
+    required: false
+    default: "**/*.xml"
+  profile:
+    description: >-
+      Force the profile every document is judged against — one of `en16931`,
+      `xrechnung-ubl`, `xrechnung-cii`, `facturx-en16931`, `peppol-bis-3`.
+      Omit to use the profile declared by each document's CustomizationID.
+    required: false
+    default: ""
+  fail-on:
+    description: >-
+      Severity that fails the job: `error` (fatal findings only, the default) or
+      `warning` (fatal or warning).
+    required: false
+    default: "error"
+  api-key:
+    description: >-
+      Attestwire API key. Supplying it switches the action to api mode: each
+      document is POSTed to the hosted validator, which always runs the current
+      rule set and returns provenance. Omit it and everything runs locally in
+      the runner. Pass via `secrets`, never inline.
+    required: false
+    default: ""
+  record:
+    description: >-
+      api mode only. Mint a shareable Validation Record per document and surface
+      its URL in the outputs and the job summary.
+    required: false
+    default: "false"
+  max-characters:
+    description: >-
+      Cap on XML document size, in characters. Documents above the cap are
+      refused rather than parsed. Defaults to the engine default (400,000);
+      the hosted API's ceiling is 2,000,000.
+    required: false
+    default: ""
+  sarif:
+    description: >-
+      Path to write a SARIF 2.1.0 report to. One run per invocation, with every
+      document's findings and the rule descriptors. Upload it with
+      `github/codeql-action/upload-sarif` to get findings on the Security tab.
+    required: false
+    default: ""
+  summary:
+    description: >-
+      Write a findings table to the job summary, with each rule ID linked to its
+      page on attestwire.com/rules.
+    required: false
+    default: "true"
+  annotations:
+    description: >-
+      Emit `::error` / `::warning` workflow commands, so findings appear inline
+      on the pull request and in the job log.
+    required: false
+    default: "true"
+  api-url:
+    description: "Base URL of the hosted validator. Advanced; api mode only."
+    required: false
+    default: "https://api.attestwire.com"
+
+outputs:
+  valid:
+    description: "`true` when no document produced a fatal finding, `false` otherwise."
+  error-count:
+    description: "Total fatal findings across every document."
+  warning-count:
+    description: "Total warning findings across every document."
+  file-count:
+    description: "Number of documents validated."
+  sarif-path:
+    description: "Path the SARIF report was written to, or empty when `sarif` was not set."
+  record-urls:
+    description: "Newline-separated Validation Record URLs, or empty outside api mode with `record: true`."
+
+runs:
+  using: "node20"
+  main: "dist/index.js"
