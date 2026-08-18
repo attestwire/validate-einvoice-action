@@ -81,10 +81,16 @@ export async function discover(patterns) {
   return found.filter((f) => /\.(xml|pdf)$/i.test(f)).sort();
 }
 
-/** Absolute runner paths are noise in a report; repo-relative paths are not. */
+/**
+ * Absolute runner paths are noise in a report; repo-relative paths are not.
+ * Always with forward slashes: annotations and SARIF URIs address files in the
+ * repository, not on the runner's filesystem, and a `\`-separated path from a
+ * Windows runner matches nothing on github.com.
+ */
 function relative(file, cwd = process.cwd()) {
   const rel = path.relative(cwd, file);
-  return rel && !rel.startsWith("..") ? rel : file;
+  if (!rel || rel.startsWith("..")) return file;
+  return rel.split(path.sep).join("/");
 }
 
 export async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {}) {

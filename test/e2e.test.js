@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { FIXTURES, HERE } from "./helpers.js";
+import { ENGINE_VERSION } from "../src/version.js";
 
 const run = promisify(execFile);
 const BUNDLE = path.join(HERE, "..", "dist", "index.js");
@@ -34,6 +35,8 @@ async function runAction(inputs, extraEnv = {}) {
 
   const env = {
     PATH: process.env.PATH,
+    // Windows cannot run a process without its OS root; absent elsewhere.
+    ...(process.env.SYSTEMROOT ? { SYSTEMROOT: process.env.SYSTEMROOT } : {}),
     GITHUB_OUTPUT: outputFile,
     GITHUB_STEP_SUMMARY: summaryFile,
     ...Object.fromEntries(
@@ -53,7 +56,9 @@ async function runAction(inputs, extraEnv = {}) {
 
   // `key=value` and the heredoc form both appear in $GITHUB_OUTPUT; the values
   // this action writes are single-line, so the simple form is what we parse.
-  const raw = await readFile(outputFile, "utf8");
+  // `@actions/core` writes with os.EOL, so a Windows run needs the `\r`s gone
+  // before a value can be compared with `===`.
+  const raw = (await readFile(outputFile, "utf8")).replace(/\r\n/g, "\n");
   const outputs = Object.fromEntries(
     [...raw.matchAll(/^(.+?)<<ghadelimiter_[^\n]+\n([\s\S]*?)\nghadelimiter_[^\n]+$/gm)]
       .map(([, k, v]) => [k, v]),
@@ -96,7 +101,7 @@ test("the bundle writes a SARIF log a code-scanning upload would accept", async 
 
   const [runLog] = log.runs;
   assert.equal(runLog.tool.driver.name, "@attestwire/en16931");
-  assert.equal(runLog.tool.driver.version, "0.7.0");
+  assert.equal(runLog.tool.driver.version, ENGINE_VERSION);
   assert.ok(Array.isArray(runLog.tool.driver.rules));
   assert.equal(runLog.tool.driver.rules[0].id, "BR-DE-15");
   assert.equal(runLog.tool.driver.rules[0].helpUri, "https://attestwire.com/rules/BR-DE-15");

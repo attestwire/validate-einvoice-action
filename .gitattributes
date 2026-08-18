@@ -1,0 +1,5 @@
+# Windows runners check out with core.autocrlf=true by default; tests that
+# read action.yml, the README and the sources line-by-line must see the same
+# bytes on every OS, so every text file is LF in the working tree everywhere.
+* text=auto eol=lf
+*.pdf binary
