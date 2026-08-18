@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/attestwire/validate-einvoice-action/actions/workflows/ci.yml/badge.svg)](https://github.com/attestwire/validate-einvoice-action/actions/workflows/ci.yml)
 [![Marketplace](https://img.shields.io/badge/marketplace-validate--e--invoice-blue)](https://github.com/marketplace/actions/validate-e-invoice-en-16931)
-[![engine: @attestwire/en16931 0.7.0](https://img.shields.io/badge/engine-%40attestwire%2Fen16931%400.7.0-blue)](https://www.npmjs.com/package/@attestwire/en16931)
+[![engine: @attestwire/en16931 0.7.3](https://img.shields.io/badge/engine-%40attestwire%2Fen16931%400.7.3-blue)](https://www.npmjs.com/package/@attestwire/en16931)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
 **Fail the build when an e-invoice would be rejected — before a customer's ERP,
@@ -10,7 +10,7 @@ a Peppol access point or a tax authority rejects it for you.**
 
 Validates EN 16931 documents in UBL 2.1 and UN/CEFACT CII — XRechnung, Peppol
 BIS Billing 3.0, and the CII payload inside a Factur-X / ZUGFeRD PDF — against
-297 rule IDs. Every finding names the official rule, the business term it
+270 rule IDs. Every finding names the official rule, the business term it
 constrains, why the regulation requires it, and the fix.
 
 **It runs entirely inside the runner by default.** No API key, no account, no
@@ -126,7 +126,7 @@ its page on [attestwire.com/rules](https://attestwire.com/rules):
 >
 > **12** documents · **1** error · **0** warnings · **3** informational
 >
-> Mode: **local** · Rules: bundled `@attestwire/en16931@0.7.0` — pinned, offline, no key · Fails on: `error`
+> Mode: **local** · Rules: bundled `@attestwire/en16931@0.7.3` — pinned, offline, no key · Fails on: `error`
 >
 > ### FAIL — `invoices/2026-000142.xml`
 > UBL · xrechnung-ubl
@@ -166,7 +166,7 @@ your invoice broke or the rules moved.
 
 So this action ships the engine **pinned**:
 
-- **Local mode (default)** — `@attestwire/en16931@0.7.0` is bundled into
+- **Local mode (default)** — `@attestwire/en16931@0.7.3` is bundled into
   `dist/index.js`. A given tag of this action always runs exactly those rules.
   Same commit, same verdict, on any runner, offline, forever. You upgrade rules
   the way you upgrade any dependency: by bumping the action's tag, in a pull
