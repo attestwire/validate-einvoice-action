@@ -262,6 +262,16 @@ Complete workflows are in [`examples/`](examples/):
   PRs, hosted on a schedule, so a rule-set change is a Monday-morning issue
   rather than a Friday-afternoon rejection.
 
+## Related
+
+- [`@attestwire/en16931`](https://github.com/attestwire/en16931): the rule
+  engine this action bundles, for validating and generating invoices in your
+  own code. MIT, no network calls.
+- [`medusa-plugin-einvoice`](https://github.com/attestwire/medusa-plugin-einvoice):
+  XRechnung and Factur-X from Medusa v2 orders, on the same engine.
+- [Rule reference](https://attestwire.com/rules/): one page per rule, with the
+  reason and the fix. Every finding in the job summary links to its page.
+
 ## Licence
 
 MIT. The bundled rule engine, [`@attestwire/en16931`](https://www.npmjs.com/package/@attestwire/en16931),
