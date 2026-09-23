@@ -10,8 +10,9 @@ a Peppol access point or a tax authority rejects it for you.**
 
 Validates EN 16931 documents in UBL 2.1 and UN/CEFACT CII — XRechnung, Peppol
 BIS Billing 3.0, and the CII payload inside a Factur-X / ZUGFeRD PDF — against
-270 rule IDs. Every finding names the official rule, the business term it
-constrains, why the regulation requires it, and the fix.
+270 rule IDs reachable from caller input. Every finding names the official
+rule, the business term it constrains, why the regulation requires it, and the
+fix.
 
 **It runs entirely inside the runner by default.** No API key, no account, no
 network call, nothing leaves your infrastructure. The rule engine is bundled at
@@ -266,3 +267,9 @@ Complete workflows are in [`examples/`](examples/):
 MIT. The bundled rule engine, [`@attestwire/en16931`](https://www.npmjs.com/package/@attestwire/en16931),
 is MIT too — it needs no account and no key, and nothing it does makes a network
 call. Use it directly if you want validation outside CI.
+
+The code is what the licence covers. "Attestwire"™ and the Attestwire logo are
+trademarks of this project's owner, and no trademark right comes with MIT. Say
+your action or product uses this one, or is built on it — that is accurate and
+fine. Do not name or brand a product or service "Attestwire", and do not word it
+so a reader would think we endorse yours.
