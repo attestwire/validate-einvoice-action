@@ -110,7 +110,8 @@ export async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {})
     core.setOutput("record-urls", "");
     core.setFailed(
       `No invoice files matched \`${inputs.files.replace(/\n/g, " ")}\`. ` +
-        "Nothing was validated, so this run proves nothing — fix the `files` pattern.",
+        "Nothing was validated, so this run proves nothing — fix the `files` pattern. " +
+        "If the pattern is right, check the job runs `actions/checkout` before this step.",
     );
     return { results: [], counts: { files: 0, errors: 0, warnings: 0, information: 0 } };
   }

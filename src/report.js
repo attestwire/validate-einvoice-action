@@ -73,7 +73,10 @@ export function emitAnnotations(results, core) {
     for (const f of r.findings) {
       if (f.severity === "information") continue;
       const emit = isFatal(f) ? core.error : core.warning;
-      const detail = [f.message, f.fix ? `Fix: ${f.fix}` : "", f.xpath ? `At: ${f.xpath}` : ""]
+      // The engine's rules state locations as UBL paths; on a CII document
+      // they point at nothing, so they are left out rather than shown wrong.
+      const at = f.xpath && !(r.syntax === "cii" && f.xpath.startsWith("/ubl:")) ? f.xpath : "";
+      const detail = [f.message, f.fix ? `Fix: ${f.fix}` : "", at ? `At: ${at}` : ""]
         .filter(Boolean)
         .join(" ");
       emit.call(core, detail, {
@@ -124,7 +127,14 @@ export function summaryMarkdown(results, { mode, engineVersion, failOn, provenan
       : `bundled \`@attestwire/en16931@${engineVersion}\` — pinned, offline, no key`;
   out.push(`Mode: **${mode}** · Rules: ${ruleset} · Fails on: \`${failOn}\``, "");
 
-  for (const r of results) {
+  // Failures first, then files with only warnings; files with nothing to say
+  // are one line at the end, so a failure is never buried between them.
+  const rank = (r) => (r.findings.some(isFatal) ? 0 : r.findings.length > 0 ? 1 : 2);
+  const ordered = results.map((r, i) => ({ r, i })).sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i);
+  const clean = ordered.filter(({ r }) => r.findings.length === 0 && !r.recordUrl && !r.recordUnavailable);
+
+  for (const { r } of ordered) {
+    if (clean.some((c) => c.r === r)) continue;
     const fileErrors = r.findings.filter(isFatal).length;
     const mark = fileErrors > 0 ? "FAIL" : "pass";
     const facts = [
@@ -154,6 +164,14 @@ export function summaryMarkdown(results, { mode, engineVersion, failOn, provenan
 
     if (r.recordUrl) out.push(`Validation Record: ${r.recordUrl}`, "");
     if (r.recordUnavailable) out.push(`Validation Record unavailable: ${r.recordUnavailable}`, "");
+  }
+
+  if (clean.length > 0) {
+    out.push(
+      `### pass — ${clean.length} document${clean.length === 1 ? "" : "s"} with no findings`,
+      clean.map(({ r }) => `\`${r.file}\``).join(" · "),
+      "",
+    );
   }
 
   out.push(

@@ -107,10 +107,32 @@ test("the summary names the hosted rule set and links rule currency in api mode"
   assert.match(md, /rule-currency/);
 });
 
-test("a clean run says PASS and reports no findings per file", () => {
+test("a clean run says PASS and lists the clean files on one line", () => {
   const md = summaryMarkdown([results[0]], { mode: "local", engineVersion: "0.7.0", failOn: "error" });
   assert.match(md, /— PASS/);
-  assert.match(md, /No findings\./);
+  assert.match(md, /### pass — 1 document with no findings\n`invoices\/a\.xml`/);
+});
+
+test("failures come first and clean files are not interleaved with them", () => {
+  const clean = (file) => ({ file, syntax: "ubl", profile: "en16931", container: null, findings: [] });
+  const failing = { file: "z-bad.xml", syntax: "ubl", profile: "en16931", container: null, findings: [fatal] };
+  const md = summaryMarkdown([clean("a.xml"), failing, clean("b.xml")], {
+    mode: "local", engineVersion: "0.7.0", failOn: "error",
+  });
+  assert.ok(md.indexOf("z-bad.xml") < md.indexOf("`a.xml`"), "the failure is listed before the clean files");
+  assert.match(md, /### pass — 2 documents with no findings\n`a\.xml` · `b\.xml`/);
+});
+
+test("a CII document's annotation drops a UBL location", () => {
+  const seen = [];
+  const core = { error: (m) => seen.push(m), warning: (m) => seen.push(m) };
+  emitAnnotations(
+    [{ file: "x.xml", syntax: "cii", findings: [{ ...fatal, xpath: "/ubl:Invoice/cbc:ID" }] },
+     { file: "y.xml", syntax: "ubl", findings: [{ ...fatal, xpath: "/ubl:Invoice/cbc:ID" }] }],
+    core,
+  );
+  assert.doesNotMatch(seen[0], /At: \/ubl:/);
+  assert.match(seen[1], /At: \/ubl:Invoice\/cbc:ID/);
 });
 
 test("a pipe inside a finding cannot break the summary table", () => {

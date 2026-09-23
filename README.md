@@ -21,12 +21,17 @@ a pinned version, so the same commit gives the same verdict next year.
 ## Quickstart
 
 ```yaml
+- uses: actions/checkout@v7
 - uses: attestwire/validate-einvoice-action@v1
   with:
-    files: "invoices/**/*.xml"
+    files: |
+      invoices/**/*.xml
+      invoices/**/*.pdf
 ```
 
-That is the whole integration. It fails the job on any fatal finding, annotates
+That is the whole integration. Point `files` at your invoices rather than
+leaving the `**/*.xml` default: every matched file is validated, and a
+`pom.xml` is not an invoice. It fails the job on any fatal finding, annotates
 the offending files on the pull request, and writes a findings table to the job
 summary.
 
