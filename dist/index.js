@@ -62890,7 +62890,7 @@ function generateXRechnungUBL(inv, options = {}) {
         return groupAlways(lineElement, [
             el("cbc:ID", line.id),
             el("cbc:Note", line.note),
-            el(quantityElement, formatNumber(line.quantity, 4), {
+            el(quantityElement, formatQuantity(line.quantity), {
                 unitCode: line.unitCode,
             }),
             el("cbc:LineExtensionAmount", formatAmount(net), {
@@ -62968,7 +62968,7 @@ function generateXRechnungUBL(inv, options = {}) {
                 }),
                 line.baseQuantity === undefined
                     ? null
-                    : el("cbc:BaseQuantity", formatNumber(line.baseQuantity, 4), {
+                    : el("cbc:BaseQuantity", formatQuantity(line.baseQuantity), {
                         unitCode: line.unitCode,
                     }),
                 priceAllowance,
@@ -63678,7 +63678,7 @@ function generateCii(inv, options = {}) {
                         el("ram:ChargeAmount", formatPrice(line.grossUnitPrice)),
                         line.baseQuantity === undefined
                             ? null
-                            : el("ram:BasisQuantity", formatNumber(line.baseQuantity, 4), {
+                            : el("ram:BasisQuantity", formatQuantity(line.baseQuantity), {
                                 unitCode: line.unitCode,
                             }),
                         groupAlways("ram:AppliedTradeAllowanceCharge", [
@@ -63692,13 +63692,13 @@ function generateCii(inv, options = {}) {
                     el("ram:ChargeAmount", formatPrice(line.unitPrice)),
                     line.baseQuantity === undefined
                         ? null
-                        : el("ram:BasisQuantity", formatNumber(line.baseQuantity, 4), {
+                        : el("ram:BasisQuantity", formatQuantity(line.baseQuantity), {
                             unitCode: line.unitCode,
                         }),
                 ]),
             ]),
             groupAlways("ram:SpecifiedLineTradeDelivery", [
-                el("ram:BilledQuantity", formatNumber(line.quantity, 4), {
+                el("ram:BilledQuantity", formatQuantity(line.quantity), {
                     unitCode: line.unitCode,
                 }),
             ]),
@@ -66527,8 +66527,11 @@ function readParty(r, el) {
         party.contact = value;
     }
     const postal = r.grp(el, "PostalTradeAddress");
+    // No address is no address, not a blank one: see the same line in parse.ts.
     if (postal)
         party.address = readAddress(r, postal);
+    else
+        delete party.address;
     const endpoint = r.grp(el, "URIUniversalCommunication");
     if (endpoint) {
         const uri = r.ramEl(endpoint, "URIID");
@@ -66654,14 +66657,17 @@ function readLine(r, el) {
         ? parseXsDecimal(quantity.text.trim())
         : undefined;
     if (quantity && quantityValue === undefined) {
-        r.note(quantity, "unknown", `${decimalRejectionReason(quantity.text.trim())} The quantity was read as 0.`);
+        r.note(quantity, "unknown", `${decimalRejectionReason(quantity.text.trim())} The quantity was left unset, so BR-22 reports it.`);
     }
     const line = {
         id: lineDocument ? (r.ram(lineDocument, "LineID") ?? "") : "",
         description: "",
-        quantity: quantityValue ?? 0,
+        // Absent or unreadable is left unset, not read as 0: a 0 made BR-22
+        // unreachable from XML, and the document passed where the official
+        // validators reject it (differential test, 2026-09-23). BR-22 reports it.
+        quantity: quantityValue,
         unitCode: quantity ? (attr(quantity, "unitCode") ?? "") : "",
-        unitPrice: 0,
+        unitPrice: undefined, // set from the price element, or BR-26 reports it
         vatCategory: "",
     };
     if (lineDocument) {
@@ -66712,7 +66718,7 @@ function readLine(r, el) {
             set(line, "orderLineReference", r.ram(orderLine, "LineID"));
         const netPrice = r.grp(agreement, "NetPriceProductTradePrice");
         if (netPrice) {
-            line.unitPrice = r.num(netPrice, "ChargeAmount") ?? 0;
+            line.unitPrice = r.num(netPrice, "ChargeAmount"); // absent: BR-26 reports it, see quantity
             set(line, "baseQuantity", r.num(netPrice, "BasisQuantity"));
         }
         // BT-148/BT-147: a separate price element in CII, with the discount as an
@@ -66968,7 +66974,7 @@ function parseCiiInvoice(xml, options = {}) {
     }
     // --- ram:ApplicableHeaderTradeSettlement ---------------------------------
     const settlement = r.grp(transaction, "ApplicableHeaderTradeSettlement");
-    const declared = {};
+    const declared = { syntax: "cii", specificationIdentifier: customizationId?.trim() ?? "" };
     const defects = [];
     // BR-DEC-19/-20/-23 and the BR-DEC document-total rules are written against
     // the serialised decimal, so the count has to be taken while the text is
@@ -67180,8 +67186,12 @@ function parseCiiInvoice(xml, options = {}) {
             // unreadable first amount made the *second* one look like the first and a
             // readable BT-111 was then filed as BT-110. Position is a fact about the
             // document, not about whether the text parses.
+            const invoiceCurrency = invoice.currency?.trim().toUpperCase();
+            let inInvoiceCurrency = 0;
             for (const amount of r.ramAll(summation, "TaxTotalAmount")) {
                 const currencyId = attr(amount, "currencyID")?.toUpperCase();
+                if (invoiceCurrency && currencyId?.trim() === invoiceCurrency)
+                    inInvoiceCurrency += 1;
                 const inAccountingCurrency = accountingCurrency !== undefined &&
                     currencyId === accountingCurrency &&
                     (currenciesDiffer || taxTotalIndex > 0);
@@ -67202,6 +67212,8 @@ function parseCiiInvoice(xml, options = {}) {
                     declared.taxAmount = value;
                 }
             }
+            if (invoiceCurrency)
+                declared.taxTotalsInInvoiceCurrency = inInvoiceCurrency;
         }
         const preceding = [];
         for (const reference of r.grpAll(settlement, "InvoiceReferencedDocument")) {
@@ -67597,8 +67609,13 @@ function parse_readParty(r, el) {
         }
     }
     const postal = r.cac(el, "PostalAddress");
+    // No PostalAddress is no address, not a blank one: BR-08 / BR-10 report the
+    // missing group. The blank default made them unreachable from XML, and the
+    // document got BR-09 (country code) where KoSIT reports BR-08 (2026-09-23).
     if (postal)
         party.address = parse_readAddress(r, postal);
+    else
+        delete party.address;
     for (const taxScheme of r.cacAll(el, "PartyTaxScheme")) {
         const companyId = r.cbc(taxScheme, "CompanyID");
         const scheme = r.cac(taxScheme, "TaxScheme");
@@ -67692,14 +67709,17 @@ function parse_readLine(r, el, quantityElement) {
         ? parseXsDecimal(quantity.text.trim())
         : undefined;
     if (quantity && quantityValue === undefined) {
-        r.note(quantity, "unknown", `${decimalRejectionReason(quantity.text.trim())} The quantity was read as 0.`);
+        r.note(quantity, "unknown", `${decimalRejectionReason(quantity.text.trim())} The quantity was left unset, so BR-22 reports it.`);
     }
     const line = {
         id: r.cbc(el, "ID") ?? "",
         description: "",
-        quantity: quantityValue ?? 0,
+        // Absent or unreadable is left unset, not read as 0: a 0 made BR-22
+        // unreachable from XML, and the document passed where the official
+        // validators reject it (differential test, 2026-09-23). BR-22 reports it.
+        quantity: quantityValue,
         unitCode: quantity ? (attr(quantity, "unitCode") ?? "") : "",
-        unitPrice: 0,
+        unitPrice: undefined, // set from the price element, or BR-26 reports it
         vatCategory: "",
     };
     // BT-131 is derived from quantity, price and the line allowances and charges,
@@ -67789,7 +67809,7 @@ function parse_readLine(r, el, quantityElement) {
             line.itemAttributes = attributes;
     }
     if (price) {
-        line.unitPrice = r.num(price, "PriceAmount") ?? 0;
+        line.unitPrice = r.num(price, "PriceAmount"); // absent: BR-26 reports it, see quantity
         set(line, "baseQuantity", r.num(price, "BaseQuantity"));
         // BT-147/BT-148: a gross price with a discount hangs off cac:Price as an
         // allowance, never as a second price element.
@@ -68163,7 +68183,7 @@ function parseUbl(xml, options = {}) {
     // The VAT breakdown is recomputed from the lines, so only the two things the
     // model cannot derive are read here: the declared total (BT-110), and the
     // exemption reasons (BT-120 / BT-121), which are free text.
-    const declared = {};
+    const declared = { syntax: "ubl", specificationIdentifier: customizationId?.trim() ?? "" };
     const defects = [];
     // BR-DEC-19/-20/-23 and the BR-DEC document-total rules are written against
     // the serialised decimal, so the count has to be taken while the text is
@@ -68174,10 +68194,14 @@ function parseUbl(xml, options = {}) {
     const exemptionReasonCodes = {};
     const taxCurrencyCode = invoice.vatAccountingCurrency;
     let taxTotalIndex = 0;
+    const invoiceCurrency = invoice.currency?.trim().toUpperCase();
+    let inInvoiceCurrency = 0;
     for (const taxTotal of r.cacAll(root, "TaxTotal")) {
         const amountEl = r.cbcEl(taxTotal, "TaxAmount");
         const subtotals = r.cacAll(taxTotal, "TaxSubtotal");
         const currencyId = amountEl ? attr(amountEl, "currencyID") : undefined;
+        if (invoiceCurrency && currencyId?.trim().toUpperCase() === invoiceCurrency)
+            inInvoiceCurrency += 1;
         const isFirstTaxTotal = taxTotalIndex === 0;
         taxTotalIndex += 1;
         // BT-111: the same VAT total restated in the VAT accounting currency, as a
@@ -68257,6 +68281,8 @@ function parseUbl(xml, options = {}) {
                 exemptionReasonCodes[code] = reasonCode;
         }
     }
+    if (invoiceCurrency)
+        declared.taxTotalsInInvoiceCurrency = inInvoiceCurrency;
     if (declaredSubtotals.length > 0)
         declared.subtotals = declaredSubtotals;
     if (Object.keys(exemptionReasons).length > 0) {
@@ -68493,6 +68519,16 @@ function roundedRatio(numerator, denominator) {
     const n = numerator < 0n ? -numerator : numerator;
     return sign * ((2n * n + denominator) / (2n * denominator));
 }
+/**
+ * Currencies with no minor unit (ISO 4217 exponent 0). Their VAT per
+ * breakdown group (BT-117) is rounded to whole units: 1,234 JPY at 19% is
+ * 234 JPY of VAT, not 234.46, which no one can pay. Until 2026-09-23 it was
+ * computed in hundredths like every other currency; the amounts are still
+ * written with two decimals (234.00), as EN 16931's decimal rules expect.
+ */
+const ZERO_DECIMAL_CURRENCIES = new Set([
+    "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "UYI", "VND", "VUV", "XAF", "XOF", "XPF",
+]);
 /** Render an amount for XML: always exactly 2 decimals, no exponent, no `-0`. */
 function totals_formatAmount(value) {
     const rounded = round2(value);
@@ -68596,6 +68632,36 @@ function totals_formatPrice(value) {
     const [whole, decimals = ""] = fixed.split(".");
     const trimmed = decimals.replace(/0+$/, "");
     const kept = trimmed.length < 2 ? decimals.slice(0, 2) : trimmed;
+    return `${whole}.${kept}`;
+}
+/** Maximum decimals kept on a quantity. See {@link formatQuantity}. */
+const MAX_QUANTITY_DECIMALS = 12;
+/**
+ * Render a quantity (BT-129 invoiced quantity, BT-149 base quantity) at its
+ * natural precision, never below four decimals.
+ *
+ * ⚠ Until 0.8.x quantities were written with `formatNumber(q, 4)`, while the
+ * totals were computed from the unrounded quantity. `quantity: 3.3333333333`
+ * therefore validated clean and generated `3.3333`, and the document's own
+ * line amounts no longer multiplied out: PEPPOL-EN16931-R120 failed and the
+ * payable amount a reader recomputes drifted (by 0.80 on one fuzzed Stripe
+ * invoice). EN 16931 sets no decimal cap on BT-129, and Stripe's
+ * `quantity_decimal` carries up to twelve, so twelve are kept. Four is the
+ * floor so every committed fixture stays byte-identical.
+ */
+function totals_formatQuantity(value) {
+    if (!Number.isFinite(value)) {
+        throw new RangeError(`Cannot format non-finite quantity: ${value}`);
+    }
+    if (Math.abs(value) >= 1e21) {
+        throw new RangeError(`Cannot format the quantity ${value}: it is at or above 1e21, where JavaScript ` +
+            `switches to exponent notation and xs:decimal has no exponent form.`);
+    }
+    const rounded = roundTo(value, MAX_QUANTITY_DECIMALS);
+    const fixed = (rounded === 0 ? 0 : rounded).toFixed(MAX_QUANTITY_DECIMALS);
+    const [whole, decimals = ""] = fixed.split(".");
+    const trimmed = decimals.replace(/0+$/, "");
+    const kept = trimmed.length < 4 ? decimals.slice(0, 4) : trimmed;
     return `${whole}.${kept}`;
 }
 /** Categories whose VAT rate is fixed at zero (BR-AE-05, BR-Z-05, BR-E-05, BR-IC-05, BR-G-05). */
@@ -68781,11 +68847,15 @@ function totals_computeTotals(inv) {
             : 0;
         add(entry.vatCategory, totals_effectiveAllowanceChargeRate(entry), amount);
     }
+    const wholeUnits = ZERO_DECIMAL_CURRENCIES.has(String(inv.currency ?? "").trim().toUpperCase());
     const subtotals = [...groups.values()].map((group) => {
         // The rate is normalised to VAT_RATE_DECIMALS (2), so rate x 100 is an
-        // integer and taxable x rate / 100 is one exact ratio over 10,000.
+        // integer and taxable x rate / 100 is one exact ratio over 10,000 (in
+        // cents), or over 1,000,000 (in whole units, then back to cents).
         const rate = BigInt(Math.round((group.rate ?? 0) * 100));
-        const taxAmount = fromCents(roundedRatio(group.taxable * rate, 10000n));
+        const taxAmount = fromCents(wholeUnits
+            ? roundedRatio(group.taxable * rate, 1000000n) * 100n
+            : roundedRatio(group.taxable * rate, 10000n));
         const reason = inv.vatExemptionReasons?.[group.category] ??
             DEFAULT_EXEMPTION_REASONS[group.category];
         const reasonCode = inv.vatExemptionReasonCodes?.[group.category];
@@ -70517,31 +70587,64 @@ const codelistRules = [
         return out;
     },
     // BR-CL-17: the same code list, bound in UBL to cac:TaxCategory/cbc:ID —
-    // the *VAT breakdown* category (BT-118). Reported separately because the
-    // generated document carries both elements, and KoSIT reports both.
+    // the *VAT breakdown* category (BT-118).
+    //
+    // On a document that was read, the breakdown it STATES is what is checked.
+    // Until 2026-09-23 this looked only at the breakdown computed from the
+    // lines, so a bad code written in the document's own breakdown ("Q") passed
+    // while KoSIT rejected it, and a bad LINE code was reported twice (BR-CL-18
+    // and a derived BR-CL-17) where KoSIT reports BR-CL-18 once. On JSON input
+    // there is no stated breakdown; the generator writes one from the lines, so
+    // the computed one is checked, and both findings are correct there.
+    //
+    // The rule id depends on the syntax. The CEN CII schematron binds BR-CL-18
+    // to every ram:ApplicableTradeTax/ram:CategoryCode, which is the line's AND
+    // the breakdown's, and BR-CL-17 only to ram:CategoryTradeTax (allowances and
+    // charges). In UBL the breakdown is cac:TaxCategory, which is BR-CL-17.
     (inv, ctx) => {
-        if (linesOf(inv).length === 0)
-            return null;
-        const { totals: computed } = totalsOutcomeOf(inv, ctx);
-        // malformed line data; BR-22 / BR-24 / BR-26 report it
-        if (!computed)
-            return null;
+        const syntax = inv.declaredTotals?.syntax ??
+            (inv.profile === "xrechnung-cii" || inv.profile === "facturx-en16931" ? "cii" : "ubl");
+        const stated = inv.declaredTotals?.subtotals;
+        let categories;
+        let fromDocument;
+        if (Array.isArray(stated)) {
+            categories = stated.map((s) => String(s?.category ?? "").trim());
+            fromDocument = true;
+        }
+        else {
+            if (linesOf(inv).length === 0)
+                return null;
+            const { totals: computed } = totalsOutcomeOf(inv, ctx);
+            // malformed line data; BR-22 / BR-24 / BR-26 report it
+            if (!computed)
+                return null;
+            categories = computed.subtotals.map((s) => String(s.category ?? "").trim());
+            fromDocument = false;
+            // In CII the generated breakdown code is the same element type as the
+            // line's, and BR-CL-18 on the line already reports it.
+            if (syntax === "cii")
+                return null;
+        }
+        const rule = syntax === "cii" ? "BR-CL-18" : "BR-CL-17";
         const seen = new Set();
         const out = [];
-        for (const subtotal of computed.subtotals) {
-            const code = String(subtotal.category ?? "").trim();
+        for (const code of categories) {
             if (!code || VAT_CATEGORY_CODES_SET.has(code) || seen.has(code))
                 continue;
             seen.add(code);
             out.push({
-                rule: "BR-CL-17",
+                rule,
                 field: "BT-118",
                 severity: "fatal",
-                message: `The VAT breakdown (BG-23) computed from your lines contains a VAT category code (BT-118) of "${code}", which is not in UNTDID 5305. The breakdown categories are taken straight from the line categories (BT-151), so this is the document-level consequence of the same bad code — KoSIT reports it against both elements, and so do we.`,
-                fix: "Correct the offending line's vatCategory. The breakdown is always computed from the lines, so there is nothing to fix at document level.",
+                message: fromDocument
+                    ? `The VAT breakdown (BG-23) in this document states a VAT category code (BT-118) of "${code}", which is not in UNTDID 5305. EN 16931 admits exactly ${VAT_CATEGORY_CODES.length} codes: ${sample(VAT_CATEGORY_CODES, VAT_CATEGORY_CODES.length)}.`
+                    : `The VAT breakdown (BG-23) computed from your lines contains a VAT category code (BT-118) of "${code}", which is not in UNTDID 5305. The breakdown categories are taken straight from the line categories (BT-151), so this is the document-level consequence of the same bad code — the generated document carries both elements, and KoSIT reports it against both.`,
+                fix: fromDocument
+                    ? "Correct the category code in the VAT breakdown to the one the lines in that group carry."
+                    : "Correct the offending line's vatCategory. The breakdown is always computed from the lines, so there is nothing to fix at document level.",
                 example: `"vatCategory": "S", "vatRate": 19`,
                 xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:ID",
-                docsUrl: `${DOCS}/BR-CL-17`,
+                docsUrl: `${DOCS}/${rule}`,
             });
         }
         return out;
@@ -70644,6 +70747,58 @@ const TOTAL_SPECS = [
     },
 ];
 const coreRules = [
+    // BR-01: an Invoice shall have a Specification identifier (BT-24).
+    // Reachable only from a document: the readers record BT-24 as stated, and
+    // until 2026-09-23 a document without it was validated against a guessed
+    // profile with no finding at all.
+    (inv) => {
+        const id = inv.declaredTotals?.specificationIdentifier;
+        if (id === undefined || id !== "")
+            return null;
+        return err({
+            rule: "BR-01",
+            field: "BT-24",
+            severity: "fatal",
+            message: "This document has no specification identifier (BT-24: cbc:CustomizationID in UBL, the GuidelineSpecifiedDocumentContextParameter ID in CII). It is what names the rules the invoice follows, EN 16931 core, XRechnung or Peppol, and a receiver routes and validates on it. It was validated here against the core EN 16931 profile as a fallback.",
+            fix: 'State BT-24, e.g. "urn:cen.eu:en16931:2017" for core EN 16931, or the XRechnung or Peppol identifier your receiver expects.',
+            xpath: "/ubl:Invoice/cbc:CustomizationID",
+            docsUrl: `${DOCS}/BR-01`,
+        });
+    },
+    // BR-CO-15, the half that selects BT-110 by currency. The official test is
+    // `count(TaxTotal/TaxAmount[@currencyID = $DocumentCurrency]) eq 1 and
+    // TaxInclusive = TaxExclusive + that amount`. The readers used to take the
+    // first VAT total as BT-110 whatever its currency, so a document whose only
+    // VAT total was in another currency passed here and failed in KoSIT
+    // (differential test, 2026-09-23). The count is recorded by the readers;
+    // on the JSON model it is absent and this does not run.
+    (inv) => {
+        const count = inv.declaredTotals?.taxTotalsInInvoiceCurrency;
+        if (count === undefined || count === 1)
+            return null;
+        // The CII binding adds `or GrandTotalAmount = TaxBasisTotalAmount`: a CII
+        // invoice with no VAT (category O, or minimal documents) may omit the VAT
+        // total entirely. UBL has no such clause. Missing this clause flagged three
+        // official CII examples that KoSIT accepts (benchmark, 2026-09-23).
+        if (inv.declaredTotals?.syntax === "cii") {
+            const gross = inv.declaredTotals.taxInclusiveAmount;
+            const net = inv.declaredTotals.taxExclusiveAmount;
+            if (typeof gross !== "number" || typeof net !== "number" || gross === net)
+                return null;
+        }
+        const currency = (inv.currency ?? "").trim().toUpperCase();
+        return err({
+            rule: "BR-CO-15",
+            field: ["BT-110", "BT-5"],
+            severity: "fatal",
+            message: count === 0
+                ? `No VAT total (BT-110) in this document is stated in the invoice currency ${currency} (BT-5). BR-CO-15 reads BT-110 as the VAT total whose currencyID is the invoice currency, so the document has none, and its amount with VAT (BT-112) cannot equal BT-109 + BT-110. A VAT total in another currency is BT-111, the VAT accounting currency (BT-6) restatement, and does not count.`
+                : `This document states ${count} VAT totals (BT-110) in the invoice currency ${currency} (BT-5). BR-CO-15 requires exactly one: any further total belongs to the VAT accounting currency (BT-6), in that currency.`,
+            fix: `State the VAT total once with currencyID="${currency || "EUR"}". If you also report VAT in an accounting currency, add BT-6 and a second total in that currency.`,
+            xpath: "/ubl:Invoice/cac:TaxTotal/cbc:TaxAmount",
+            docsUrl: `${DOCS}/BR-CO-15`,
+        });
+    },
     // BR-04: An Invoice shall have an Invoice type code (BT-3).
     //
     // The model defaults BT-3 to "380", so this fires only when a caller sets the
@@ -70761,8 +70916,17 @@ const coreRules = [
             try {
                 amount = lineNetAmount(line);
             }
-            catch {
-                reason = `the item price base quantity (BT-149) is ${line.baseQuantity}, and dividing by it is undefined`;
+            catch (error) {
+                // Over the monetary ceiling is ATW-AMOUNT-OUT-OF-RANGE's finding, not
+                // a base-quantity problem; blaming BT-149 for it gave the wrong fix.
+                if (error instanceof AmountRangeError)
+                    continue;
+                // lineNetAmount throws for a zero base quantity, and round2 for a
+                // product that is not finite (1e200 x 1e200). Name the one that happened.
+                reason =
+                    line.baseQuantity === 0
+                        ? `the item price base quantity (BT-149) is 0, and dividing by it is undefined`
+                        : `the computation ${line.quantity} x ${line.unitPrice}${line.baseQuantity !== undefined ? ` / ${line.baseQuantity}` : ""} does not produce a finite amount`;
             }
             if (amount !== undefined && !Number.isFinite(amount)) {
                 reason = `the computation ${line.quantity} x ${line.unitPrice}${line.baseQuantity !== undefined ? ` / ${line.baseQuantity}` : ""} does not produce a finite amount`;
@@ -71078,7 +71242,6 @@ const coreRules = [
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-credit-note.js
 
 
-
 /**
  * Credit notes: the findings that exist only because the document is one.
  *
@@ -71132,26 +71295,16 @@ const creditNoteRules = [
     (inv, ctx) => {
         if (!isCreditNote(inv))
             return null;
-        // The only `computeTotals` site in the rule set that does not swallow a
-        // throw, and it stays that way. Every other site catches and returns null
-        // because BR-22 / BR-24 / BR-26 already report the malformed line; this one
-        // never had a catch, so a defect here has always propagated out of
-        // `validateInput`, and quietly turning that into a swallowed finding would
-        // be a behaviour change smuggled in under a performance change.
-        //
-        // The run cache records the error rather than raising it when it is built,
-        // so rethrowing it here reproduces the old timing exactly: the same error
-        // object, surfacing at this rule, after the rules before it have run.
-        //
-        // One exception: an AmountRangeError is already reported, once, as
-        // ATW-AMOUNT-OUT-OF-RANGE. Rethrowing it would turn that finding back into
-        // the exception the finding exists to replace, for credit notes only.
+        // Until 0.8.x this was the one `computeTotals` site that rethrew, kept so
+        // a performance refactor would not change behaviour silently. A fuzz run
+        // on 2026-09-23 showed what that cost: a credit note with a NaN quantity,
+        // price or VAT rate crashed `validateInput` with a bare RangeError, while
+        // the same line on an invoice (380) produced BR-22 / BR-24 / BR-S-05. It
+        // now returns null like every other site: those rules report the line, on
+        // credit notes too.
         const outcome = totalsOutcomeOf(inv, ctx);
-        if (outcome.threw) {
-            if (outcome.error instanceof AmountRangeError)
-                return null;
-            throw outcome.error;
-        }
+        if (outcome.threw)
+            return null;
         const totals = outcome.totals;
         const negativeLines = totals.lineNetAmounts
             .map((amount, index) => ({ amount, index }))
@@ -74593,6 +74746,228 @@ const referenceRules = [
     },
 ];
 
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-representable.js
+
+
+/**
+ * ATW-* findings for input the generators cannot write faithfully.
+ *
+ * A fuzz run on 2026-09-23 found inputs that `validateInput` passed and the
+ * generators then mangled or refused: text that was nothing but a NUL or a
+ * lone surrogate (stripped on output, leaving a mandatory field empty), a NaN
+ * allowance percentage or a gross price of 1e21 (a bare RangeError from
+ * `generateCii`), and a VAT rate of 1e308 (a BigInt RangeError from
+ * `computeTotals`). The contract is that anything `validateInput` passes can be
+ * generated, so these are findings here instead of surprises there.
+ *
+ * Values the regulation's own rules already judge are left to them: a NaN
+ * quantity, price or rate is BR-22 / BR-24 / BR-S-05, and an amount past the
+ * monetary ceiling is ATW-AMOUNT-OUT-OF-RANGE.
+ */
+/** What an XML 1.0 document cannot carry, and what the generators strip. */
+const NOT_XML = /[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+/**
+ * Numbers the generators format but no other rule checks for finiteness, or
+ * whose magnitude can reach 1e21, where `toFixed` switches to exponent
+ * notation and `xs:decimal` has no exponent form.
+ */
+const FORMATTED_NUMBERS = new Set(["percentage", "baseAmount", "grossUnitPrice", "priceDiscount", "baseQuantity", "quantity"]);
+const EXPONENT_LIMIT = 1e21;
+/** No VAT regime charges more than the price itself. */
+const MAX_VAT_RATE = 100;
+/**
+ * Fields the model types as numbers, and as text, by key. A JavaScript or JSON
+ * caller can still pass null, "5" or 5 in the wrong place; a second fuzz run
+ * (2026-09-23) found those passing validation and then crashing a generator or
+ * breaking the round trip. Each is one ATW-INPUT-TYPE finding, naming the path.
+ */
+const NUMBER_KEYS = new Set([
+    "quantity", "unitPrice", "grossUnitPrice", "priceDiscount", "baseQuantity", "vatRate", "rate",
+    "amount", "baseAmount", "percentage", "paidAmount", "roundingAmount", "taxAmountInAccountingCurrency",
+    "lineExtensionAmount", "taxExclusiveAmount", "taxInclusiveAmount", "payableAmount",
+    "allowanceTotalAmount", "chargeTotalAmount", "taxAmount", "taxableAmount",
+]);
+const STRING_KEYS = new Set([
+    "invoiceNumber", "issueDate", "currency", "invoiceTypeCode", "dueDate", "note", "noteSubjectCode",
+    "buyerReference", "orderReference", "salesOrderReference", "projectReference", "contractReference",
+    "despatchAdviceReference", "receivingAdviceReference", "tenderOrLotReference", "buyerAccountingReference",
+    "taxPointDate", "paymentTerms", "deliveryDate", "vatAccountingCurrency", "startDate", "endDate",
+    "descriptionCode", "name", "vatId", "taxRegistrationId", "legalRegistrationId", "legalRegistrationSchemeId",
+    "additionalLegalInformation", "tradingName", "legalName", "schemeId", "value", "email", "phone",
+    "line1", "line2", "line3", "city", "postalCode", "countrySubdivision", "countryCode", "id", "description",
+    "longDescription", "unitCode", "sellerItemId", "buyerItemId", "orderLineReference", "originCountryCode",
+    "meansCode", "meansName", "iban", "accountName", "bic", "remittanceInformation", "reason", "reasonCode",
+    "category", "vatCategory", "exemptionReason", "exemptionReasonCode", "mimeCode", "filename", "externalUri",
+    "reference", "content", "code", "text",
+]);
+/** Arrays whose entries must be objects. */
+const OBJECT_ARRAYS = new Set([
+    "lines", "allowances", "charges", "supportingDocuments", "precedingInvoices", "itemAttributes",
+    "itemClassifications", "subtotals",
+]);
+/** Maps whose values must be text. */
+const STRING_MAPS = new Set(["vatExemptionReasons", "vatExemptionReasonCodes"]);
+/** Reader-internal bookkeeping in declaredTotals, not caller input. */
+const SKIPPED_DECLARED = new Set(["defects", "overPrecise"]);
+const PROFILES = new Set(["en16931", "xrechnung-ubl", "xrechnung-cii", "facturx-en16931", "peppol-bis-3"]);
+const kindOf = (v) => (v === null ? "null" : Array.isArray(v) ? "an array" : typeof v === "string" ? `the text ${JSON.stringify(v).slice(0, 40)}` : `a ${typeof v}`);
+/** The business group or term a path lies in, for `field`. */
+const ROOT_TERMS = {
+    invoiceNumber: "BT-1",
+    issueDate: "BT-2",
+    invoiceTypeCode: "BT-3",
+    currency: "BT-5",
+    dueDate: "BT-9",
+    buyerReference: "BT-10",
+    projectReference: "BT-11",
+    contractReference: "BT-12",
+    orderReference: "BT-13",
+    salesOrderReference: "BT-14",
+    paymentTerms: "BT-20",
+    note: "BT-22",
+    seller: "BG-4",
+    buyer: "BG-7",
+    payee: "BG-10",
+    taxRepresentative: "BG-11",
+    invoicingPeriod: "BG-14",
+    payment: "BG-16",
+    allowances: "BG-20",
+    charges: "BG-21",
+    supportingDocuments: "BG-24",
+    lines: "BG-25",
+    precedingInvoices: "BG-3",
+};
+function termOf(path) {
+    const [root, , key] = path;
+    if (root === "lines" && key === "allowances")
+        return "BG-27";
+    if (root === "lines" && key === "charges")
+        return "BG-28";
+    return ROOT_TERMS[String(root)] ?? [];
+}
+const rules_representable_show = (path) => path.map((p, i) => (typeof p === "number" ? `[${p}]` : i === 0 ? p : `.${p}`)).join("");
+function finding(path, rule, severity, message, fix) {
+    return { rule, field: termOf(path), severity, message, fix, docsUrl: LIMITS_DOCS };
+}
+function wrongType(path, expected, value) {
+    return finding(path, "ATW-INPUT-TYPE", "fatal", `${rules_representable_show(path)} should be ${expected}, but it is ${kindOf(value)}. The rules and the generators rely on the InvoiceInput types.`, `Set ${rules_representable_show(path)} to ${expected}, or leave it out. A value parsed from JSON or a form is the usual cause: "19" where 19 is expected, or null for a field that is simply absent.`);
+}
+function walk(value, path, out, seen) {
+    const key = path[path.length - 1];
+    const parent = path[path.length - 2];
+    const inDeclared = path[0] === "declaredTotals";
+    if (value === undefined)
+        return;
+    if (typeof key === "string") {
+        if (NUMBER_KEYS.has(key) && typeof value !== "number") {
+            out.push(wrongType(path, "a number", value));
+            return;
+        }
+        // legalRegistrationId is text on a party and { value, schemeId } on the
+        // payee (BT-61), the one key the model types two ways.
+        const payeeShape = path[0] === "payee" && key === "legalRegistrationId" && value !== null && typeof value === "object" && !Array.isArray(value);
+        if (STRING_KEYS.has(key) && typeof value !== "string" && !payeeShape) {
+            out.push(wrongType(path, "text", value));
+            return;
+        }
+        if (OBJECT_ARRAYS.has(key) && !Array.isArray(value)) {
+            out.push(wrongType(path, "a list", value));
+            return;
+        }
+    }
+    if (typeof key === "number" && typeof parent === "string" && OBJECT_ARRAYS.has(parent) &&
+        (value === null || typeof value !== "object" || Array.isArray(value))) {
+        out.push(wrongType(path, "an object", value));
+        return;
+    }
+    if (typeof parent === "string" && STRING_MAPS.has(parent) && typeof value !== "string") {
+        out.push(wrongType(path, "text", value));
+        return;
+    }
+    const declaredFigure = inDeclared &&
+        typeof value === "number" &&
+        ((typeof key === "string" && key !== "rate" && key !== "taxTotalsInInvoiceCurrency") ||
+            (typeof key === "number" && parent === "lineNetAmounts"));
+    if (declaredFigure) {
+        // Stated figures: the declared-totals rules report a non-finite top-level
+        // total by name; everything else, and any figure past the monetary
+        // ceiling, is reported here, because the comparisons cannot compute it.
+        const topLevel = path.length === 2;
+        if (!Number.isFinite(value) && !topLevel) {
+            out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
+        }
+        else if (Number.isFinite(value) && Math.abs(value) > MAX_MONETARY_AMOUNT) {
+            out.push(finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, beyond the ${MAX_MONETARY_AMOUNT} this library computes exactly.`, "Check the unit: a figure this size is almost always a slip upstream."));
+        }
+        return;
+    }
+    if (inDeclared && key === "rate" && typeof value === "number" && !Number.isFinite(value)) {
+        out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
+        return;
+    }
+    if (typeof value === "string") {
+        const bad = value.match(NOT_XML);
+        if (!bad)
+            return;
+        const left = value.replace(NOT_XML, "").trim();
+        const codes = [...new Set(bad)].map((c) => `U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+        out.push(finding(path, "ATW-TEXT-NOT-XML", left === "" ? "fatal" : "warning", `${rules_representable_show(path)} contains ${codes.join(", ")}, which an XML document cannot carry. The generators remove ` +
+            (left === ""
+                ? "them, and nothing is left: the field would be written empty."
+                : "them, so the document would say something slightly different from your input."), "Remove control characters and unpaired surrogates from the text before building the invoice. They usually come from a copy-paste or a broken encoding upstream."));
+        return;
+    }
+    if (typeof value === "number") {
+        const key = path[path.length - 1];
+        if ((key === "vatRate" || key === "rate") && Number.isFinite(value) && Math.abs(value) > MAX_VAT_RATE) {
+            out.push(finding(path, "ATW-VAT-RATE-OUT-OF-RANGE", "fatal", `${rules_representable_show(path)} is ${value}%. No VAT regime charges more than the price itself, and a rate this size cannot be computed exactly.`, "Set the rate as a percentage: 19 for 19%, not 0.19 or 1900."));
+        }
+        else if (typeof key === "string" && FORMATTED_NUMBERS.has(key)) {
+            if (!Number.isFinite(value)) {
+                out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}. The XML type behind it, xs:decimal, has no NaN or infinity, so the document cannot be written.`, "Check the arithmetic that produced it: a division by zero, or a sum over a missing value, is the usual cause."));
+            }
+            else if (Math.abs(value) >= EXPONENT_LIMIT) {
+                out.push(finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, at or above 1e21, which cannot be written as an xs:decimal without exponent notation.`, "Check the unit: a value this size is almost always a slip upstream."));
+            }
+        }
+        return;
+    }
+    if (value === null || typeof value !== "object")
+        return;
+    if (seen.has(value))
+        return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+        value.forEach((item, i) => walk(item, [...path, i], out, seen));
+        return;
+    }
+    for (const [k, item] of Object.entries(value)) {
+        if (path.length === 1 && path[0] === "declaredTotals" && SKIPPED_DECLARED.has(k))
+            continue;
+        walk(item, [...path, k], out, seen);
+    }
+}
+const representableRules = [
+    (inv) => {
+        const out = [];
+        walk(inv, [], out, new Set());
+        // An unknown profile validated clean and was then refused by the
+        // generator (fuzz run, 2026-09-23).
+        const profile = inv.profile;
+        if (typeof profile !== "string" || !PROFILES.has(profile)) {
+            out.push({
+                rule: "ATW-PROFILE-UNKNOWN",
+                field: "BT-24",
+                severity: "fatal",
+                message: `profile is ${kindOf(profile)}, which is not a profile this library knows. It decides which rule set applies and which document the generators write.`,
+                fix: `Set profile to one of ${[...PROFILES].join(", ")}.`,
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
+];
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-vat.js
 
 
@@ -74731,14 +75106,24 @@ const taxableBaseFor = (inv, category, rate) => {
 };
 const vatRules = [
     // --- -01: the breakdown for a used category must exist, and be unique -----
+    //
+    // On a document that was read, the breakdown it STATES is what is checked.
+    // Until 2026-09-23 only the computed breakdown was, and that is built from
+    // the lines, so it could never lack a category: a document with a group
+    // deleted, or no breakdown at all, passed here and failed KoSIT.
     (inv, ctx) => {
         const totals = totalsOf(inv, ctx);
         if (!totals)
             return null;
+        const stated = inv.declaredTotals?.syntax
+            ? (inv.declaredTotals.subtotals ?? []).filter((s) => s && typeof s === "object")
+            : undefined;
         const out = [];
         for (const category of ALL_CATEGORIES) {
             const used = usesCategoryAnywhere(inv, category, ctx);
-            const groups = subtotalsFor(totals, category);
+            const groups = stated
+                ? stated.filter((s) => String(s.category ?? "").trim() === category)
+                : subtotalsFor(totals, category);
             const unique = EXACTLY_ONE.includes(category);
             const rule = ruleId(category, "01");
             if (used && groups.length === 0) {
@@ -74746,8 +75131,10 @@ const vatRules = [
                     rule,
                     field: "BT-118",
                     severity: "fatal",
-                    message: `An invoice line (BT-151), a document level allowance (BT-95) or a document level charge (BT-102) uses VAT category ${rules_vat_describe(category)}, so the VAT breakdown (BG-23) must contain ${unique ? "exactly one" : "at least one"} group with the VAT category code (BT-118) ${category} — but none was produced. The breakdown is the document's own summary of what VAT is due and why; a category that appears on the invoice but not in the breakdown means the tax authority cannot reconcile the two.`,
-                    fix: "The VAT breakdown is always computed by this library from the lines and the document level allowances and charges, so a missing group means one of those carries a vatCategory this build does not recognise. Check it against the nine supported codes: S, Z, E, AE, K, G, O, L, M.",
+                    message: `An invoice line (BT-151), a document level allowance (BT-95) or a document level charge (BT-102) uses VAT category ${rules_vat_describe(category)}, so the VAT breakdown (BG-23) must contain ${unique ? "exactly one" : "at least one"} group with the VAT category code (BT-118) ${category} — but ${stated ? "this document states none" : "none was produced"}. The breakdown is the document's own summary of what VAT is due and why; a category that appears on the invoice but not in the breakdown means the tax authority cannot reconcile the two.`,
+                    fix: stated
+                        ? `Add a VAT breakdown group (cac:TaxSubtotal, or ram:ApplicableTradeTax in CII) for category ${category}, with the taxable amount and VAT amount of the lines, allowances and charges that carry it.`
+                        : "The VAT breakdown is always computed by this library from the lines and the document level allowances and charges, so a missing group means one of those carries a vatCategory this build does not recognise. Check it against the nine supported codes: S, Z, E, AE, K, G, O, L, M.",
                     example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "${category}"${RATED_CATEGORIES.includes(category) ? ', "vatRate": 19' : ""} }]`,
                     xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:ID",
                     docsUrl: `${DOCS}/${rule}`,
@@ -74766,7 +75153,10 @@ const vatRules = [
                     docsUrl: `${DOCS}/${rule}`,
                 });
             }
-            if (!used && groups.length > 0) {
+            // The reverse direction (a group with nothing behind it) is not in either
+            // official binding; they report the stated group's -08 instead. So it is
+            // checked on the computed breakdown only (differential test, 2026-09-23).
+            if (!used && groups.length > 0 && !stated) {
                 out.push({
                     rule,
                     field: "BT-118",
@@ -74903,15 +75293,24 @@ const vatRules = [
                 ? `vatExemptionReasons.${category}`
                 : `vatExemptionReasonCodes.${category}`;
             const rule = ruleId(category, "10");
+            // A document that was read (declaredTotals is what the readers fill in,
+            // see DeclaredTotals) already carries the reason, and the official
+            // schematron rejects it: fatal, as there. JSON input is different: the
+            // generator drops the value, so the XML it writes passes, and the
+            // finding is a warning that the intent was discarded. Until 0.8.x it was
+            // a warning in both cases, and the CLI passed files KoSIT rejects.
+            const fromDocument = inv.declaredTotals !== undefined;
             out.push({
                 rule,
                 field: ["BT-120", "BT-121"],
-                severity: "warning",
+                severity: fromDocument ? "fatal" : "warning",
                 message: `A VAT breakdown with the VAT category code (BT-118) ${rules_vat_describe(category)} must not have a VAT exemption reason code (BT-121) or reason text (BT-120), but you supplied ${which} = "${String(supplied).trim()}". ${category === "S"
                     ? "Standard-rated supplies are taxed, so there is no exemption to explain"
                     : category === "Z"
                         ? "Zero rating is a rate, not an exemption — the supply is inside the VAT system and taxed at 0%, so no reason is due"
-                        : `Category ${category} charges ${category === "L" ? "IGIC" : "IPSI"}, which is a tax actually levied on the supply — an exemption reason would claim relief from the very tax the breakdown says you collected`}. ${rule} is fatal at document level; this finding is a warning because the library drops the value rather than emitting it, so the generated XML still passes — but your intent was silently discarded, which you should know about.`,
+                        : `Category ${category} charges ${category === "L" ? "IGIC" : "IPSI"}, which is a tax actually levied on the supply — an exemption reason would claim relief from the very tax the breakdown says you collected`}. ${fromDocument
+                    ? `This document states it, and ${rule} is fatal: the official validators reject the file.`
+                    : `${rule} is fatal at document level; this finding is a warning because the library drops the value rather than emitting it, so the generated XML still passes — but your intent was silently discarded, which you should know about.`}`,
                 fix: `Remove the "${category}" entry from ${!blank(text) ? "vatExemptionReasons" : "vatExemptionReasonCodes"}. If you need to say something to the buyer about this line, use the invoice note (BT-22) or the line note (BT-127), which carry free text without making a VAT claim.`,
                 example: `"${!blank(text) ? "vatExemptionReasons" : "vatExemptionReasonCodes"}": { }, "lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "${category}", "vatRate": ${category === "S" ? 19 : category === "Z" ? 0 : category === "L" ? 7 : 10} }]`,
                 xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReason",
@@ -75106,18 +75505,25 @@ const vatRules = [
         return out;
     },
     // --- BR-CO-18: an invoice shall have at least one VAT breakdown group -----
+    //
+    // On a document that was read, the groups it states are counted (see -01).
     (inv, ctx) => {
         const totals = totalsOf(inv, ctx);
         if (!totals)
             return null;
-        if (totals.subtotals.length > 0)
+        const stated = inv.declaredTotals?.syntax ? (inv.declaredTotals.subtotals ?? []) : undefined;
+        if ((stated ?? totals.subtotals).length > 0)
             return null;
+        if (stated && linesOf(inv).length === 0)
+            return null; // BR-16 reports it
         return err({
             rule: "BR-CO-18",
             field: "BG-23",
             severity: "fatal",
             message: "An invoice shall have at least one VAT breakdown group (BG-23). Even a document on which no VAT is due must say so explicitly and say why — with a category (BT-118), a taxable amount (BT-116) and a tax amount of zero (BT-117) — because \"no VAT breakdown\" and \"no VAT due\" are different claims, and only the second is something a tax authority can accept.",
-            fix: "Add at least one invoice line with a vatCategory. The breakdown is derived from the lines, so a document with lines always produces one.",
+            fix: stated
+                ? "Add the VAT breakdown to the document: one group per VAT category and rate, with its taxable amount (BT-116), VAT amount (BT-117) and category (BT-118)."
+                : "Add at least one invoice line with a vatCategory. The breakdown is derived from the lines, so a document with lines always produces one.",
             example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "S", "vatRate": 19 }]`,
             xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal",
             docsUrl: `${DOCS}/BR-CO-18`,
@@ -75126,6 +75532,7 @@ const vatRules = [
 ];
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-extended.js
+
 
 
 
@@ -75158,6 +75565,7 @@ const extendedRules = [
     ...referenceRules,
     ...germanRules,
     ...peppolRules,
+    ...representableRules,
 ];
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules.js
@@ -75192,6 +75600,19 @@ const rules_DOCS = "https://attestwire.com/rules";
  * Findings that carry an `ATW-` rule id are ours, not the regulator's.
  */
 const rules_LIMITS_DOCS = "https://github.com/attestwire/en16931#not-implemented-yet";
+/**
+ * Categories whose `-08` rule compares EXACTLY, per syntax, as the CEN
+ * schematrons write it (read from CEN-EN16931-UBL.sch / -CII.sch, Peppol
+ * 3.0.20). The two bindings disagree: UBL is exact for the zero-rate
+ * categories and ±1 for S, L, M; CII is the other way round, except O,
+ * which is exact in both. JSON input has no syntax and keeps ±1.
+ */
+const EXACT_08 = {
+    ubl: new Set(["Z", "E", "AE", "K", "G", "O"]),
+    cii: new Set(["S", "O", "L", "M"]),
+};
+/** Categories whose `-09` rule requires the stated VAT amount to be exactly 0. */
+const ZERO_TAX_09 = new Set(["Z", "E", "AE", "K", "G", "O"]);
 const rules_XRECHNUNG_PROFILES = new Set(["xrechnung-ubl", "xrechnung-cii"]);
 const rules_isXRechnung = (inv) => rules_XRECHNUNG_PROFILES.has(inv.profile);
 const rules_isPeppol = (inv) => inv.profile === "peppol-bis-3";
@@ -75557,8 +75978,11 @@ const baseInputRules = [
         const out = [];
         const check = (party, rule, field, who, path) => {
             const code = party?.address?.countryCode;
-            if (!party?.address)
-                return; // BR-08 / BR-10 already reported it
+            // With no address, BR-08 / BR-10 report it. In UBL, BR-09 / BR-11 are
+            // scoped to the address and so do not fire as well; in CII they are
+            // asserted from the document root and do (differential test, 2026-09-23).
+            if (!party?.address && inv.declaredTotals?.syntax !== "cii")
+                return;
             if (rules_blank(code) || !/^[A-Za-z]{2}$/.test(code)) {
                 out.push({
                     rule,
@@ -75869,13 +76293,22 @@ const baseInputRules = [
         })
         : null,
     // BR-IC-11: intra-community supply requires a delivery date or invoicing period.
-    (inv) => rules_usesCategory(inv, "K") && rules_blank(inv.deliveryDate)
+    //
+    // The official test is `string-length(ActualDeliveryDate) > 1 or
+    // exists(InvoicePeriod/*)`. Until 2026-09-23 only BT-72 was checked, so a
+    // K invoice that stated its period and no delivery date was rejected here
+    // and accepted by KoSIT (7 documents in the ZUGFeRD corpus).
+    (inv) => rules_usesCategory(inv, "K") &&
+        rules_blank(inv.deliveryDate) &&
+        rules_blank(inv.invoicingPeriod?.startDate) &&
+        rules_blank(inv.invoicingPeriod?.endDate) &&
+        rules_blank(inv.invoicingPeriod?.descriptionCode)
         ? rules_err({
             rule: "BR-IC-11",
             field: "BT-72",
             severity: "fatal",
             message: "An invoice with an intra-community supply (category K) must state the actual delivery date (BT-72) or an invoicing period (BG-14). The delivery date determines the period in which the supply is reported on your recapitulative statement.",
-            fix: 'Set deliveryDate to the date the goods left, as "YYYY-MM-DD".',
+            fix: 'Set deliveryDate to the date the goods left, as "YYYY-MM-DD", or state the invoicing period (invoicingPeriod.startDate and endDate) the supplies fall in.',
             example: `"deliveryDate": "2026-08-05"`,
             xpath: "/ubl:Invoice/cac:Delivery/cbc:ActualDeliveryDate",
             docsUrl: `${rules_DOCS}/BR-IC-11`,
@@ -75888,13 +76321,15 @@ const baseInputRules = [
             if (line.vatCategory !== "S")
                 continue;
             const rate = line.vatRate;
-            if (typeof rate === "number" && rate > 0)
+            // Judged as written: BT-152 has two decimals, so 1e-300 goes out as
+            // 0.00 and the document then fails the rule this let it through.
+            if (typeof rate === "number" && Number.isFinite(rate) && roundTo(rate, VAT_RATE_DECIMALS) > 0)
                 continue;
             out.push({
                 rule: "BR-S-05",
                 field: "BT-152",
                 severity: "fatal",
-                message: `Line ${index + 1} uses VAT category S (standard rated), so the invoiced item VAT rate (BT-152) must be greater than zero, but it is ${rate === undefined ? "missing" : rate}. A zero rate with category S is contradictory — if you genuinely charge no VAT, the category is Z, E, AE, K, G or O, and each of those has different evidencing requirements.`,
+                message: `Line ${index + 1} uses VAT category S (standard rated), so the invoiced item VAT rate (BT-152) must be greater than zero, but it is ${rate === undefined ? "missing" : typeof rate === "number" && rate > 0 ? `${rate}, which is written as 0.00 at two decimals` : rate}. A zero rate with category S is contradictory — if you genuinely charge no VAT, the category is Z, E, AE, K, G or O, and each of those has different evidencing requirements.`,
                 fix: 'Set line.vatRate to the applicable percentage as a number (19 for the German standard rate, 7 for the reduced rate). If no VAT is due, change vatCategory instead of setting the rate to 0.',
                 example: `"vatCategory": "S", "vatRate": 19`,
                 xpath: `/ubl:Invoice/cac:InvoiceLine[${index + 1}]/cac:Item/cac:ClassifiedTaxCategory/cbc:Percent`,
@@ -76073,8 +76508,15 @@ const baseInputRules = [
         if (!statesGroupTaxAmounts) {
             compare(declared.taxAmount, computed.taxAmount, "BR-CO-14", "BT-110", "the invoice total VAT amount (BT-110) to equal Σ VAT category tax amounts (BT-117)", "VAT is computed per category-and-rate group and rounded there (BR-CO-17), then summed. Computing VAT on the document total instead of per group is the usual cause of a one-cent break.");
         }
-        compare(declared.taxInclusiveAmount, round2(stated(declared.taxExclusiveAmount, computed.taxExclusiveAmount) +
-            stated(declared.taxAmount, computed.taxAmount)), "BR-CO-15", "BT-112", "the invoice total with VAT (BT-112) to equal BT-109 + BT-110", "Check whether one of BT-109 or BT-110 is also flagged above; BR-CO-15 often fails only as a consequence.", CHAINED);
+        // The CII binding of BR-CO-15 ends `or GrandTotal = TaxBasisTotal`: a CII
+        // invoice whose total with VAT equals its total without passes whatever
+        // its VAT total says (differential test, 2026-09-23; see rules-core.ts).
+        const ciiNoVat = declared.syntax === "cii" &&
+            typeof declared.taxInclusiveAmount === "number" &&
+            declared.taxInclusiveAmount === declared.taxExclusiveAmount;
+        if (!ciiNoVat)
+            compare(declared.taxInclusiveAmount, round2(stated(declared.taxExclusiveAmount, computed.taxExclusiveAmount) +
+                stated(declared.taxAmount, computed.taxAmount)), "BR-CO-15", "BT-112", "the invoice total with VAT (BT-112) to equal BT-109 + BT-110", "Check whether one of BT-109 or BT-110 is also flagged above; BR-CO-15 often fails only as a consequence.", CHAINED);
         compare(declared.payableAmount, round2(stated(declared.taxInclusiveAmount, computed.taxInclusiveAmount) -
             computed.paidAmount +
             computed.roundingAmount), "BR-CO-16", "BT-115", "the amount due for payment (BT-115) to equal BT-112 − paid amount (BT-113) + rounding amount (BT-114)", "BT-113 (paid amount) is subtracted and BT-114 (rounding amount) is added — and BT-114 is signed, so a rounding-down carries a negative value. A payable amount that equals BT-112 on an invoice with a deposit is the usual shape of this failure.", CHAINED);
@@ -76102,11 +76544,20 @@ const baseInputRules = [
         if (lines.length === 0)
             return null;
         const outcome = totalsOutcomeOf(inv, ctx);
-        // a malformed line is already reported by BR-22 / BR-26
-        if (outcome.threw)
-            return null;
-        const computed = outcome.totals;
         const out = [];
+        // Peppol's own reading of a line with a missing factor: quantity 1,
+        // price 0, base quantity 1 (the `let` defaults in PEPPOL-EN16931-UBL.sch).
+        // Used for R120 when the engine cannot compute the lines, which is exactly
+        // when a quantity or price is absent; returning early then (as until
+        // 2026-09-23) hid 14 R120 findings KoSIT reports.
+        const peppolLine = (line) => {
+            if (!line)
+                return undefined;
+            const num = (v, d) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+            const base = num(line.baseQuantity, 1) || 1;
+            const sum = (entries) => (entries ?? []).reduce((t, e) => t + num(e?.amount, 0), 0);
+            return round2((num(line.quantity, 1) * num(line.unitPrice, 0)) / base + sum(line.charges) - sum(line.allowances));
+        };
         // --- PEPPOL-EN16931-R120: BT-131 = BT-129 × BT-146 / BT-149 − ΣBT-136 + ΣBT-141
         //
         // Gated the way KoSIT gates it. The rule lives in the Peppol schematron,
@@ -76119,7 +76570,7 @@ const baseInputRules = [
             for (const [index, stated] of declaredLines.entries()) {
                 if (typeof stated !== "number" || !Number.isFinite(stated))
                     continue;
-                const derived = computed.lineNetAmounts[index];
+                const derived = outcome.threw ? peppolLine(lines[index]) : outcome.totals.lineNetAmounts[index];
                 if (derived === undefined)
                     continue;
                 // The Peppol rule's own slack: `u:slack(exp, val, 0.02)`, i.e. 0.02 of
@@ -76141,6 +76592,11 @@ const baseInputRules = [
                 });
             }
         }
+        // Everything below compares against the computed totals. A line the
+        // engine cannot compute is already reported by BR-22 / BR-26.
+        if (outcome.threw)
+            return out;
+        const computed = outcome.totals;
         // --- BR-CO-10: BT-106 = Σ BT-131, using the amounts the document states.
         //
         // The schematron sums what is written on the lines, not what the lines
@@ -76171,7 +76627,13 @@ const baseInputRules = [
         // --- BR-{S,Z,E,AE,IC,G,O,AF,AG}-08 and BR-CO-17, per breakdown group.
         const declaredSubtotals = declared.subtotals;
         if (declaredSubtotals && declaredSubtotals.length > 0) {
-            const key = (category, rate) => `${category ?? ""}|${rate === undefined ? "" : round2(rate)}`;
+            // Category O has no rate in the model (BT-119 is not stated for it), but
+            // documents commonly write 0. Keyed on the rate, the stated O group then
+            // matched nothing and its -08 check never ran (differential test,
+            // 2026-09-23: BR-O-08 missed). O is keyed on the category alone.
+            const key = (category, rate) => category === "O"
+                ? "O|"
+                : `${category ?? ""}|${rate === undefined ? "" : round2(rate)}`;
             const computedByKey = new Map(computed.subtotals.map((sub) => [key(sub.category, sub.rate), sub]));
             // The group's taxable amount as the document *states* it: the computed
             // group total, with each line's contribution swapped for the amount that
@@ -76208,15 +76670,28 @@ const baseInputRules = [
                         ...computedGroup,
                         taxableAmount: round2(computedGroup.taxableAmount + (statedGroupDelta.get(groupKey) ?? 0)),
                     }
-                    : undefined;
+                    : // No line, allowance or charge has this category and rate: the
+                        // official rule sums nothing, gets 0, and compares (a stated group
+                        // at a rate no line carries was missed until 2026-09-23). Only on a
+                        // document; JSON input groups are keyed identically by construction.
+                        inv.declaredTotals?.syntax !== undefined && stated.category
+                            ? { taxableAmount: 0 }
+                            : undefined;
                 // BT-116, against what the lines in that group state between them.
-                // The `-08` family's tolerance is the schematron's own ±1 whole unit
-                // of currency, signed on both sides — see `withinSignedTolerance`.
-                // Comparing exactly here would reject documents KoSIT accepts.
+                // In UBL the `-08` family's tolerance is the schematron's own ±1 whole
+                // unit of currency, signed on both sides (see `withinSignedTolerance`),
+                // and comparing exactly would reject documents KoSIT accepts. The CEN
+                // CII schematron is not the same: BR-S-08, BR-O-08, BR-AF-08 and
+                // BR-AG-08 there test `BasisAmount = round(sum(...))`, exactly, while
+                // Z, E, AE, K and G keep the ±1. A differential run against KoSIT on
+                // 2026-09-23 found 60 CII documents passed here and rejected there.
+                const syntax = inv.declaredTotals?.syntax;
+                const exact = syntax !== undefined && EXACT_08[syntax].has(stated.category ?? "S");
+                const agrees = (a, b) => exact ? round2(a) === round2(b) : withinSignedTolerance(a, b);
                 if (match &&
                     typeof stated.taxableAmount === "number" &&
                     Number.isFinite(stated.taxableAmount) &&
-                    !withinSignedTolerance(round2(stated.taxableAmount), match.taxableAmount)) {
+                    !agrees(round2(stated.taxableAmount), match.taxableAmount)) {
                     const rule = stated.category
                         ? `BR-${CATEGORY_RULE_INFIX[stated.category] ?? "S"}-08`
                         : "BR-S-08";
@@ -76225,7 +76700,7 @@ const baseInputRules = [
                         rule,
                         field: "BT-116",
                         severity: "fatal",
-                        message: `The VAT breakdown for category ${stated.category ?? "?"}${stated.rate === undefined ? "" : ` at ${stated.rate}%`} states a taxable amount (BT-116) of ${round2(stated.taxableAmount).toFixed(2)}, but the lines and document allowances and charges in that group come to ${match.taxableAmount.toFixed(2)} between them — a difference of ${delta > 0 ? "+" : ""}${delta.toFixed(2)} ${inv.currency}. ${rule} requires the two to agree, and the summands are the line amounts the document states (BT-131), not what those lines compute to.`,
+                        message: `The VAT breakdown for category ${stated.category ?? "?"}${stated.rate === undefined ? "" : ` at ${stated.rate}%`} states a taxable amount (BT-116) of ${round2(stated.taxableAmount).toFixed(2)}, but the lines and document allowances and charges in that group come to ${match.taxableAmount.toFixed(2)} between them — a difference of ${delta > 0 ? "+" : ""}${delta.toFixed(2)} ${inv.currency}. ${rule} requires the two to agree${exact ? ` exactly: the ${syntax?.toUpperCase()} binding of this rule allows no tolerance` : ""}, and the summands are the line amounts the document states (BT-131), not what those lines compute to.`,
                         fix: `BT-116 is Σ BT-131 for the group, less the document allowances (BT-92) in it and plus the document charges (BT-99) in it. Correct the group's lines, or drop declaredTotals.subtotals and let the library compute the breakdown.`,
                         example: `"declaredTotals": { "subtotals": [{ "category": "${stated.category ?? "S"}", "taxableAmount": ${match.taxableAmount.toFixed(2)} }] }`,
                         xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxableAmount",
@@ -76242,6 +76717,54 @@ const baseInputRules = [
                 // document KoSIT accepts — the probe caught it. `rules-vat.ts` applies
                 // the same helpers to the *computed* breakdown; this applies them to
                 // the *stated* one, which is where a parsed document's corruption is.
+                // BR-S-09 / BR-AF-09 / BR-AG-09 on the stated group: BT-117 within 1
+                // (exclusive) of round(|BT-116| × BT-119) / 100, as the schematron
+                // writes it. BR-CO-17 below tests the same thing under its own id; the
+                // official validators report the category id, so both are raised.
+                // In CII, BR-AF-09 and BR-AG-09 are `true()` and never fire.
+                if (stated.category &&
+                    (stated.category === "S" ||
+                        ((stated.category === "L" || stated.category === "M") && inv.declaredTotals?.syntax !== "cii")) &&
+                    typeof stated.taxAmount === "number" &&
+                    Number.isFinite(stated.taxAmount) &&
+                    typeof stated.taxableAmount === "number" &&
+                    Number.isFinite(stated.taxableAmount) &&
+                    typeof stated.rate === "number" &&
+                    Number.isFinite(stated.rate)) {
+                    const expected = Math.round(Math.abs(stated.taxableAmount) * stated.rate) / 100;
+                    if (!withinAbsoluteTolerance(stated.taxAmount, expected)) {
+                        const rule = `BR-${CATEGORY_RULE_INFIX[stated.category] ?? stated.category}-09`;
+                        out.push({
+                            rule,
+                            field: "BT-117",
+                            severity: "fatal",
+                            message: `The VAT breakdown for category ${stated.category} at ${stated.rate}% states a VAT amount (BT-117) of ${round2(stated.taxAmount).toFixed(2)} ${inv.currency} on a taxable amount of ${round2(stated.taxableAmount).toFixed(2)}, which at that rate is ${expected.toFixed(2)}. ${rule} allows a difference of strictly less than 1.00.`,
+                            fix: "Compute the group's VAT amount from its own taxable amount and rate, and check the rate matches the lines in the group.",
+                            xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxAmount",
+                            docsUrl: `${rules_DOCS}/${rule}`,
+                        });
+                    }
+                }
+                // BR-{Z,E,AE,IC,G,O}-09: in these categories the stated VAT amount
+                // must be exactly 0, in both syntaxes. BR-CO-17 below allowed anything
+                // that rounds to 0 (up to 0.49); KoSIT rejects 0.01 (differential
+                // test, 2026-09-23).
+                if (stated.category &&
+                    ZERO_TAX_09.has(stated.category) &&
+                    typeof stated.taxAmount === "number" &&
+                    Number.isFinite(stated.taxAmount) &&
+                    round2(stated.taxAmount) !== 0) {
+                    const rule = `BR-${CATEGORY_RULE_INFIX[stated.category] ?? stated.category}-09`;
+                    out.push({
+                        rule,
+                        field: "BT-117",
+                        severity: "fatal",
+                        message: `The VAT breakdown for category ${stated.category} states a VAT amount (BT-117) of ${round2(stated.taxAmount).toFixed(2)} ${inv.currency}. ${rule} requires it to be exactly 0: category ${stated.category} charges no VAT, and no tolerance applies.`,
+                        fix: `Set the group's VAT amount to 0.00. If VAT is really due on these lines, their category is not ${stated.category}.`,
+                        xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxAmount",
+                        docsUrl: `${rules_DOCS}/${rule}`,
+                    });
+                }
                 if (typeof stated.taxAmount === "number" &&
                     Number.isFinite(stated.taxAmount) &&
                     typeof stated.taxableAmount === "number" &&
@@ -76615,14 +77138,40 @@ function runInputRules(inv) {
     // still raises it, at the point in the run where it always did.
     const ctx = makeRuleContext(inv);
     const out = [];
+    let typeError = null;
     for (const rule of inputRules) {
-        const result = rule(inv, ctx);
+        let result;
+        try {
+            result = rule(inv, ctx);
+        }
+        catch (error) {
+            // The rules trust the InvoiceInput types. A JavaScript or JSON caller
+            // can still pass a number where text belongs, and a rule calling
+            // `.trim()` on it threw out of validateInput (fuzz run, 2026-09-23).
+            // Report it once, as a finding; anything else is a bug and propagates.
+            // A RangeError is the same thing for numbers (a NaN or 1e308 the rule
+            // cannot round); the input check usually names it already.
+            if (!(error instanceof TypeError) && !(error instanceof RangeError))
+                throw error;
+            typeError ??= error;
+            continue;
+        }
         if (!result)
             continue;
         if (Array.isArray(result))
             out.push(...result);
         else
             out.push(result);
+    }
+    if (typeError && !out.some((f) => /^ATW-(INPUT-TYPE|NUMBER-|VAT-RATE-OUT|AMOUNT-OUT|DECLARED-TOTAL)/.test(f.rule))) {
+        out.push({
+            rule: "ATW-INPUT-TYPE",
+            field: [],
+            severity: "fatal",
+            message: `A field of the invoice has a value of the wrong type, so some rules could not run (${typeError.message}). The input model expects text as strings, amounts as numbers, and lists as arrays.`,
+            fix: "Check the invoice object against the InvoiceInput type, for example by building it in TypeScript. A value parsed from JSON or a form is the usual cause: \"19\" where 19 is expected, or a number where text is.",
+            docsUrl: rules_LIMITS_DOCS,
+        });
     }
     return out;
 }
@@ -76710,7 +77259,7 @@ function validateInput(inv) {
 
 
 /** Profiles the `profile` input may name. Rejected early, with the list. */
-const PROFILES = Object.freeze([
+const read_PROFILES = Object.freeze([
   "en16931",
   "xrechnung-ubl",
   "xrechnung-cii",
@@ -77495,7 +78044,7 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * `test/version.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.8.0";
+const ENGINE_VERSION = "0.9.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";
@@ -77546,9 +78095,9 @@ function readInputs(core) {
   const annotations = bool(core.getInput("annotations"), true);
   const apiUrl = (core.getInput("api-url") || "https://api.attestwire.com").trim();
 
-  if (profile && !PROFILES.includes(profile)) {
+  if (profile && !read_PROFILES.includes(profile)) {
     throw new Error(
-      `profile: "${profile}" is not a profile this engine knows. Use one of ${PROFILES.join(", ")}, ` +
+      `profile: "${profile}" is not a profile this engine knows. Use one of ${read_PROFILES.join(", ")}, ` +
         "or omit it to judge each document against the profile it declares.",
     );
   }
