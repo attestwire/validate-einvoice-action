@@ -36727,6 +36727,56 @@ function round2(value) {
     const scaled = Number((Math.abs(value) * 100).toPrecision(15));
     return (sign * Math.round(scaled)) / 100;
 }
+/**
+ * The largest absolute monetary amount this library computes with, including
+ * every total it derives: 999,999,999,999.99.
+ *
+ * Not an EN 16931 rule — the standard sets no ceiling. It is a representation
+ * limit of the number-based API: `round2` re-normalises through 15 significant
+ * digits, and 14 digits of cents keeps every amount a digit inside that, where
+ * a JS number still holds the cents exactly. Further out a sum would lose cents
+ * without saying so, so the arithmetic refuses instead: `computeTotals` and the generators throw `AmountRangeError`,
+ * and `validateInput` reports ATW-AMOUNT-OUT-OF-RANGE as a finding.
+ */
+const MAX_MONETARY_AMOUNT = 999_999_999_999.99;
+const MAX_CENTS = 99999999999999n;
+/** An amount, or a total computed from amounts, is beyond `MAX_MONETARY_AMOUNT`. */
+class AmountRangeError extends RangeError {
+    /** The offending amount, as supplied or as computed. */
+    amount;
+    constructor(amount) {
+        super(`Monetary amount ${amount} exceeds the supported absolute maximum of ${MAX_MONETARY_AMOUNT}.`);
+        this.name = "AmountRangeError";
+        this.amount = amount;
+    }
+}
+/**
+ * Totals are summed in exact integer cents. Each amount is rounded half-up
+ * first (so the sum is of already-rounded amounts, as EN 16931 requires) and
+ * then added as a BigInt, so a 10,000-line invoice cannot drift by the cent
+ * that repeated float addition loses.
+ */
+function toCents(value) {
+    if (Math.abs(value) > MAX_MONETARY_AMOUNT)
+        throw new AmountRangeError(value);
+    return BigInt(Math.round(round2(value) * 100));
+}
+function fromCents(value) {
+    if (value > MAX_CENTS || value < -MAX_CENTS) {
+        throw new AmountRangeError(Number(value) / 100);
+    }
+    return Number(value) / 100;
+}
+/** Σ of already-rounded amounts, exact, negative adjustments included. */
+function sumAmounts(values) {
+    return fromCents(values.reduce((sum, value) => sum + toCents(value), 0n));
+}
+/** numerator / denominator, rounded half-up away from zero, like `round2`. */
+function roundedRatio(numerator, denominator) {
+    const sign = numerator < 0n ? -1n : 1n;
+    const n = numerator < 0n ? -numerator : numerator;
+    return sign * ((2n * n + denominator) / (2n * denominator));
+}
 /** Render an amount for XML: always exactly 2 decimals, no exponent, no `-0`. */
 function totals_formatAmount(value) {
     const rounded = round2(value);
@@ -36909,14 +36959,14 @@ function totals_effectiveAllowanceChargeRate(entry) {
 function sumLineAllowanceCharges(entries) {
     if (!entries || entries.length === 0)
         return 0;
-    let sum = 0;
+    let sum = 0n;
     for (const entry of entries) {
         const amount = entry?.amount;
         if (typeof amount !== "number" || !Number.isFinite(amount))
             continue;
-        sum = round2(sum + round2(amount));
+        sum += toCents(amount);
     }
-    return sum;
+    return fromCents(sum);
 }
 /**
  * BT-131 invoice line net amount.
@@ -36936,20 +36986,20 @@ function lineNetAmount(line) {
     const gross = (line.quantity * line.unitPrice) / base;
     const allowances = sumLineAllowanceCharges(line.allowances);
     const charges = sumLineAllowanceCharges(line.charges);
-    return round2(gross - allowances + charges);
+    return fromCents(toCents(round2(gross - allowances + charges)));
 }
 /** Σ BT-92 or Σ BT-99 over the document level entries, each rounded first. */
 function sumDocumentAllowanceCharges(entries) {
     if (!entries || entries.length === 0)
         return 0;
-    let sum = 0;
+    let sum = 0n;
     for (const entry of entries) {
         const amount = entry?.amount;
         if (typeof amount !== "number" || !Number.isFinite(amount))
             continue;
-        sum = round2(sum + round2(amount));
+        sum += toCents(amount);
     }
-    return sum;
+    return fromCents(sum);
 }
 /** The (category, rate) pair a line or a document allowance/charge belongs to. */
 const groupKey = (category, rate) => `${category}|${rate ?? ""}`;
@@ -36976,10 +37026,14 @@ const groupKey = (category, rate) => `${category}|${rate ?? ""}`;
  */
 function totals_computeTotals(inv) {
     const lineNetAmounts = inv.lines.map(lineNetAmount);
-    const lineExtensionAmount = round2(lineNetAmounts.reduce((sum, amount) => sum + amount, 0));
+    const lineExtensionAmount = sumAmounts(lineNetAmounts);
     const allowanceTotalAmount = sumDocumentAllowanceCharges(inv.allowances);
     const chargeTotalAmount = sumDocumentAllowanceCharges(inv.charges);
-    const taxExclusiveAmount = round2(lineExtensionAmount - allowanceTotalAmount + chargeTotalAmount);
+    const taxExclusiveAmount = sumAmounts([
+        lineExtensionAmount,
+        -allowanceTotalAmount,
+        chargeTotalAmount,
+    ]);
     // Group by (category, rate). Insertion order is preserved, and lines are
     // visited before document allowances and charges, so the breakdown comes out
     // in the order the categories first appear on the invoice.
@@ -36988,9 +37042,9 @@ function totals_computeTotals(inv) {
         const key = groupKey(category, rate);
         const existing = groups.get(key);
         if (existing)
-            existing.taxable = round2(existing.taxable + amount);
+            existing.taxable += toCents(amount);
         else
-            groups.set(key, { category, rate, taxable: amount });
+            groups.set(key, { category, rate, taxable: toCents(amount) });
     };
     for (const [index, line] of inv.lines.entries()) {
         add(line.vatCategory, totals_effectiveRate(line), lineNetAmounts[index] ?? 0);
@@ -37012,13 +37066,16 @@ function totals_computeTotals(inv) {
         add(entry.vatCategory, totals_effectiveAllowanceChargeRate(entry), amount);
     }
     const subtotals = [...groups.values()].map((group) => {
-        const taxAmount = round2((group.taxable * (group.rate ?? 0)) / 100);
+        // The rate is normalised to VAT_RATE_DECIMALS (2), so rate x 100 is an
+        // integer and taxable x rate / 100 is one exact ratio over 10,000.
+        const rate = BigInt(Math.round((group.rate ?? 0) * 100));
+        const taxAmount = fromCents(roundedRatio(group.taxable * rate, 10000n));
         const reason = inv.vatExemptionReasons?.[group.category] ??
             DEFAULT_EXEMPTION_REASONS[group.category];
         const reasonCode = inv.vatExemptionReasonCodes?.[group.category];
         const subtotal = {
             category: group.category,
-            taxableAmount: group.taxable,
+            taxableAmount: fromCents(group.taxable),
             taxAmount,
         };
         if (group.rate !== undefined)
@@ -37035,15 +37092,19 @@ function totals_computeTotals(inv) {
         }
         return subtotal;
     });
-    const taxAmount = round2(subtotals.reduce((sum, subtotal) => sum + subtotal.taxAmount, 0));
-    const taxInclusiveAmount = round2(taxExclusiveAmount + taxAmount);
+    const taxAmount = sumAmounts(subtotals.map((subtotal) => subtotal.taxAmount));
+    const taxInclusiveAmount = sumAmounts([taxExclusiveAmount, taxAmount]);
     const paidAmount = typeof inv.paidAmount === "number" && Number.isFinite(inv.paidAmount)
         ? round2(inv.paidAmount)
         : 0;
     const roundingAmount = typeof inv.roundingAmount === "number" && Number.isFinite(inv.roundingAmount)
         ? round2(inv.roundingAmount)
         : 0;
-    const payableAmount = round2(taxInclusiveAmount - paidAmount + roundingAmount);
+    const payableAmount = sumAmounts([
+        taxInclusiveAmount,
+        -paidAmount,
+        roundingAmount,
+    ]);
     return {
         lineNetAmounts,
         lineExtensionAmount,
@@ -39301,6 +39362,7 @@ const coreRules = [
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-credit-note.js
 
 
+
 /**
  * Credit notes: the findings that exist only because the document is one.
  *
@@ -39364,9 +39426,16 @@ const creditNoteRules = [
         // The run cache records the error rather than raising it when it is built,
         // so rethrowing it here reproduces the old timing exactly: the same error
         // object, surfacing at this rule, after the rules before it have run.
+        //
+        // One exception: an AmountRangeError is already reported, once, as
+        // ATW-AMOUNT-OUT-OF-RANGE. Rethrowing it would turn that finding back into
+        // the exception the finding exists to replace, for credit notes only.
         const outcome = totalsOutcomeOf(inv, ctx);
-        if (outcome.threw)
+        if (outcome.threw) {
+            if (outcome.error instanceof AmountRangeError)
+                return null;
             throw outcome.error;
+        }
         const totals = outcome.totals;
         const negativeLines = totals.lineNetAmounts
             .map((amount, index) => ({ amount, index }))
@@ -39479,6 +39548,7 @@ const creditNoteRules = [
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-decimals.js
 
 
+
 const DEC_SPECS = [
     {
         rule: "BR-DEC-09",
@@ -39589,6 +39659,28 @@ const LEXICAL_SPECS = {
     },
 };
 const decimalRules = [
+    // ATW-AMOUNT-OUT-OF-RANGE: ours, and a limit of this library, not of EN 16931.
+    //
+    // computeTotals refuses to sum past MAX_MONETARY_AMOUNT rather than lose the
+    // cents. Before this finding existed that refusal was a throw: the totals-based
+    // rules swallowed it, as they swallow every arithmetic throw, and an invoice
+    // for a quadrillion euros came back `valid: true`. Reported here once, as a
+    // fatal finding, so validateInput keeps its contract of returning findings.
+    (inv, ctx) => {
+        const outcome = totalsOutcomeOf(inv, ctx);
+        if (!outcome.threw || !(outcome.error instanceof AmountRangeError))
+            return null;
+        const max = MAX_MONETARY_AMOUNT.toLocaleString("en-US", { minimumFractionDigits: 2 });
+        return err({
+            rule: "ATW-AMOUNT-OUT-OF-RANGE",
+            field: ["BT-131", "BT-115"],
+            severity: "fatal",
+            message: `An amount on this invoice, or a total computed from its amounts, is ${String(outcome.error.amount)}, beyond the ${max} this library can compute with exactly. This is not a rule of the regulation — EN 16931 sets no maximum — but past that size a JavaScript number cannot hold every cent, so the totals would be silently wrong. The usual cause is not a genuinely huge invoice but a unit slip: a price in cents where euros were meant, a quantity multiplied twice, or an amount parsed from a string with its decimal separator dropped.`,
+            fix: `Check the line quantities (BT-129), prices (BT-146) and allowance or charge amounts for a value in the wrong unit. If the invoice really is this large, split it: no single amount or total may exceed ${max} in absolute value.`,
+            example: `"lines": [{ "quantity": 3, "unitPrice": 1250.00 }]`,
+            docsUrl: LIMITS_DOCS,
+        });
+    },
     // ATW-DECLARED-TOTAL-NOT-FINITE: ours, not the regulator's.
     //
     // `typeof NaN === "number"`, so a NaN or Infinity in declaredTotals passed
@@ -40259,10 +40351,10 @@ const germanRules = [
  *
  * Source:  OpenPEPPOL/peppol-bis-invoice-3
  *          rules/sch/PEPPOL-EN16931-UBL.sch
- * Ref:     master
+ * Ref:     v3.0.20
  * Lists:   PEPPOL-EN16931-CL008 (Peppol Participant Identifier Scheme)
  *          PEPPOL-EN16931-CL007 (ISO 4217 alpha-3, Peppol's copy)
- * Emitted: 2026-08-10 by scripts/build-peppol.mjs
+ * Emitted: 2026-08-17 by scripts/build-peppol.mjs
  *
  * Regenerate with: node scripts/build-peppol.mjs
  */
@@ -45669,7 +45761,7 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * `test/version.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.7.3";
+const ENGINE_VERSION = "0.8.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";

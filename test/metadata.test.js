@@ -51,9 +51,9 @@ test("engine version is stated once and matches the pin and the install", async 
   assert.equal(installed, ENGINE_VERSION, "run npm install; src/version.js and node_modules disagree");
 });
 
-test("action.yml declares a node20 action pointing at the built bundle", async () => {
+test("action.yml declares a node24 action pointing at the built bundle", async () => {
   const yaml = await read("action.yml");
-  assert.match(yaml, /using: "node20"/);
+  assert.match(yaml, /using: "node24"/);
   assert.match(yaml, /main: "dist\/index\.js"/);
 });
 

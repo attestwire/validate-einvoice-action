@@ -88,5 +88,5 @@ outputs:
     description: "Newline-separated Validation Record URLs, or empty outside api mode with `record: true`."
 
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.js"

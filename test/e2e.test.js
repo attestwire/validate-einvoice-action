@@ -2,7 +2,7 @@
  * The built bundle, run the way a runner runs it.
  *
  * Everything else in this suite imports `src/`. GitHub does not: it executes
- * `dist/index.js` with `node20`, feeds inputs through `INPUT_*` environment
+ * `dist/index.js` with `node24`, feeds inputs through `INPUT_*` environment
  * variables and reads outputs out of a file. A bundler misconfiguration — a
  * dependency left external, an ESM/CJS mismatch, a dynamic import ncc could not
  * see — is invisible to every other test in this directory and total in
