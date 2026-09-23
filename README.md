@@ -201,7 +201,7 @@ jobs:
   invoices:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: attestwire/validate-einvoice-action@v1
         with:
           files: "invoices/**/*.xml"

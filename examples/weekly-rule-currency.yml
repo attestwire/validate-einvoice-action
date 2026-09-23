@@ -31,7 +31,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: attestwire/validate-einvoice-action@v1
         with:
           files: "invoices/**/*.xml"
@@ -40,7 +40,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # `continue-on-error`: a document that the current rule set rejects is
       # news, not a broken build. The verdict is read off the output below.
