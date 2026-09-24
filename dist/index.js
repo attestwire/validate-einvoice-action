@@ -62047,6 +62047,24 @@ function parseXml(source, limits = {}) {
     const stack = [];
     let root;
     let elementCount = 0;
+    // Line and column of an offset. Elements are met in document order, so the
+    // scan only ever moves forward and the whole document is walked once: O(n)
+    // in total, not O(n) per element. A line ends at LF, CRLF or a lone CR, as
+    // XML 1.0 section 2.11 and every editor have it: a file saved with classic
+    // Mac line endings is not one long line.
+    let scanned = i;
+    let lineNo = 1;
+    let lineStart = i;
+    const position = (at) => {
+        for (; scanned < at; scanned += 1) {
+            const ch = source.charCodeAt(scanned);
+            if (ch === 10 || (ch === 13 && source.charCodeAt(scanned + 1) !== 10)) {
+                lineNo += 1;
+                lineStart = scanned + 1;
+            }
+        }
+        return [lineNo, at - lineStart + 1];
+    };
     const fail = (code, message) => {
         throw new XmlSyntaxError(code, `${message} (at character ${i})`);
     };
@@ -62138,6 +62156,12 @@ function parseXml(source, limits = {}) {
                 fail("xml_bad_comment", `A comment ends "--->" ${body.length + 4} characters in; a comment may not ` +
                     `end with a hyphen`);
             }
+            // The Char production covers comments too: a control character here is
+            // as ill-formed as one in text, and a reader that skips it would accept a
+            // file that every schema validator refuses.
+            if (ILLEGAL_XML_CHARS.test(body)) {
+                fail("xml_illegal_character", "A comment contains a control character that XML 1.0 does not permit");
+            }
             i = end + 3;
             continue;
         }
@@ -62168,7 +62192,11 @@ function parseXml(source, limits = {}) {
                 fail("xml_unterminated_pi", "Unterminated processing instruction");
             }
             // Processing instructions are skipped, never acted on. A stylesheet PI in
-            // particular must not cause this library to fetch anything.
+            // particular must not cause this library to fetch anything. Skipped is
+            // not unchecked: the same characters are forbidden here as in text.
+            if (ILLEGAL_XML_CHARS.test(source.slice(i + 2, end))) {
+                fail("xml_illegal_character", "A processing instruction contains a control character that XML 1.0 does not permit");
+            }
             i = end + 2;
             continue;
         }
@@ -62194,6 +62222,7 @@ function parseXml(source, limits = {}) {
             continue;
         }
         // --- start tag ----------------------------------------------------------
+        const [line, column] = position(i);
         i += 1;
         const qname = readName();
         elementCount += 1;
@@ -62339,6 +62368,8 @@ function parseXml(source, limits = {}) {
             local,
             qname,
             path,
+            line,
+            column,
             attributes,
             children: [],
             text: "",
@@ -66814,7 +66845,14 @@ function readLine(r, el) {
  * `InvoiceInput` whose `invoiceTypeCode` says so.
  */
 function parseCiiInvoice(xml, options = {}) {
-    const root = parseXml(xml, options);
+    return parseCiiTree(parseXml(xml, options));
+}
+/**
+ * The same reader over a tree that is already parsed. Internal: `validate`
+ * parses once and keeps the tree to locate findings in, rather than handing
+ * the text to the reader and parsing it a second time.
+ */
+function parseCiiTree(root) {
     if (root.namespace === UBL_INVOICE_NS || root.namespace === UBL_CREDIT_NOTE_NS) {
         throw new UnsupportedCiiSyntaxError(root.qname, root.namespace, "This is a UBL document — the syntax used by XRechnung UBL and Peppol BIS 3. " +
             "Read it with parseUblInvoice instead.");
@@ -67084,6 +67122,9 @@ function parseCiiInvoice(xml, options = {}) {
         let taxPointDate;
         let taxPointCode;
         for (const tax of r.grpAll(settlement, "ApplicableTradeTax")) {
+            // NOT trimmed, unlike UBL: the CII schematron compares ram:CategoryCode
+            // literally (`ram:CategoryCode = 'O'`), so " O " is not category O there
+            // and must not be here (review, 2026-09-23).
             const category = (r.ram(tax, "CategoryCode") ?? "");
             r.ram(tax, "TypeCode");
             // BT-116, BT-117, BT-118 and BT-119 are kept as *declared* figures and
@@ -67106,8 +67147,11 @@ function parseCiiInvoice(xml, options = {}) {
             if (statedTaxable) {
                 noteLexicalPrecision(overPrecise, "BT-116", statedTaxable.lexical, statedTaxable.xpath, { group });
             }
-            if (Object.keys(stated).length > 0)
-                declaredSubtotals.push(stated);
+            // Kept even when nothing in it could be read. Every child of
+            // ram:ApplicableTradeTax is optional in the CII schema, so a group with
+            // only a TypeCode is schema-valid, and KoSIT rejects it under BR-45 to
+            // BR-48. Dropping it meant no rule ever saw it (review, 2026-09-23).
+            declaredSubtotals.push(stated);
             const reason = r.ram(tax, "ExemptionReason");
             if (reason !== undefined)
                 exemptionReasons[category] = reason;
@@ -67661,11 +67705,23 @@ function parse_readPeriod(r, el) {
     set(period, "descriptionCode", r.cbc(el, "DescriptionCode"));
     return period;
 }
+/**
+ * A VAT category code (BT-95, BT-102, BT-118, BT-151) as the UBL schematron
+ * reads it: every one of its tests is on `normalize-space(cbc:ID)`, so
+ * "<cbc:ID> S </cbc:ID>" is category S there. One helper for every place the
+ * reader takes a category, because trimming only the breakdown's codes (and
+ * not the lines') made a consistently padded document that KoSIT accepts fail
+ * BR-S-08 here (review, 2026-09-23). The CII schematron compares
+ * ram:CategoryCode literally, so parse-cii.ts does not trim.
+ */
+function categoryCode(r, taxCategory) {
+    return (r.cbc(taxCategory, "ID") ?? "").replace(/\s+/g, " ").trim();
+}
 function parse_readDocumentAllowanceCharge(r, el) {
     const taxCategory = r.cac(el, "TaxCategory");
     const entry = {
         amount: r.num(el, "Amount") ?? 0,
-        vatCategory: (taxCategory ? (r.cbc(taxCategory, "ID") ?? "") : ""),
+        vatCategory: taxCategory ? categoryCode(r, taxCategory) : "",
     };
     set(entry, "baseAmount", r.num(el, "BaseAmount"));
     set(entry, "percentage", r.num(el, "MultiplierFactorNumeric"));
@@ -67792,7 +67848,7 @@ function parse_readLine(r, el, quantityElement) {
             line.itemClassifications = classifications;
         const taxCategory = r.cac(item, "ClassifiedTaxCategory");
         if (taxCategory) {
-            line.vatCategory = (r.cbc(taxCategory, "ID") ?? "");
+            line.vatCategory = categoryCode(r, taxCategory);
             set(line, "vatRate", r.num(taxCategory, "Percent"));
             const scheme = r.cac(taxCategory, "TaxScheme");
             if (scheme)
@@ -67859,7 +67915,14 @@ function parse_readLine(r, el, quantityElement) {
  * All three extend `ParseError` and carry a stable `code`.
  */
 function parseUbl(xml, options = {}) {
-    const root = parseXml(xml, options);
+    return parseUblTree(parseXml(xml, options));
+}
+/**
+ * The same reader over a tree that is already parsed. Internal: `validate`
+ * parses once and keeps the tree to locate findings in, rather than handing
+ * the text to the reader and parsing it a second time.
+ */
+function parseUblTree(root) {
     if (root.namespace === CII_NS || root.local === "CrossIndustryInvoice") {
         throw new UnsupportedSyntaxError(root.qname, root.namespace, "This is a CII (UN/CEFACT Cross Industry Invoice) document — the syntax used by " +
             "ZUGFeRD, Factur-X and XRechnung CII. It shares no element names with UBL. " +
@@ -68261,11 +68324,12 @@ function parseUbl(xml, options = {}) {
             }
             const category = r.cac(subtotal, "TaxCategory");
             if (!category) {
-                if (Object.keys(stated).length > 0)
-                    declaredSubtotals.push(stated);
+                // Kept even when empty, so BR-45 to BR-48 can judge it (see the same
+                // note in parse-cii.ts).
+                declaredSubtotals.push(stated);
                 continue;
             }
-            const code = (r.cbc(category, "ID") ?? "");
+            const code = categoryCode(r, category);
             if (code !== "")
                 stated.category = code;
             set(stated, "rate", r.num(category, "Percent"));
@@ -70642,7 +70706,7 @@ const codelistRules = [
                 fix: fromDocument
                     ? "Correct the category code in the VAT breakdown to the one the lines in that group carry."
                     : "Correct the offending line's vatCategory. The breakdown is always computed from the lines, so there is nothing to fix at document level.",
-                example: `"vatCategory": "S", "vatRate": 19`,
+                ...(fromDocument ? {} : { example: `"vatCategory": "S", "vatRate": 19` }),
                 xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:ID",
                 docsUrl: `${DOCS}/${rule}`,
             });
@@ -71829,8 +71893,11 @@ const germanRules = [
             return null;
         const declaredSubtotals = inv.declaredTotals?.subtotals;
         const groups = Array.isArray(declaredSubtotals) && declaredSubtotals.length > 0
-            ? declaredSubtotals.map((sub, index) => ({
-                category: sub?.category ?? computed.subtotals[index]?.category ?? "",
+            ? declaredSubtotals.map((sub) => ({
+                // The group's own category, or none. Borrowing the computed
+                // group's at the same index named "category S" for a stated group
+                // that has no category at all (review, 2026-09-23).
+                category: sub?.category ?? "",
                 rate: sub?.rate,
             }))
             : computed.subtotals;
@@ -71842,7 +71909,7 @@ const germanRules = [
                 rule: "BR-DE-14",
                 field: "BT-119",
                 severity: "fatal",
-                message: `XRechnung requires the element "VAT category rate" (BT-119) on every VAT breakdown group (BG-23), but the group for category ${subtotal.category} has none. Core EN 16931 excuses exactly one case from this — BR-48 allows a missing rate when the category is "O" (not subject to VAT) — and the German CIUS does not carry that exception forward. The practical consequence is that category O cannot be used in an XRechnung at all: BR-O-05 forbids a rate on the line, so no rate can reach the breakdown, and BR-DE-14 then rejects the document. Core EN 16931 validation passes; the German portal rejects.`,
+                message: `XRechnung requires the element "VAT category rate" (BT-119) on every VAT breakdown group (BG-23), but ${subtotal.category ? `the group for category ${subtotal.category}` : `breakdown group ${index + 1}, which states no category,`} has none. Core EN 16931 excuses exactly one case from this — BR-48 allows a missing rate when the category is "O" (not subject to VAT) — and the German CIUS does not carry that exception forward. The practical consequence is that category O cannot be used in an XRechnung at all: BR-O-05 forbids a rate on the line, so no rate can reach the breakdown, and BR-DE-14 then rejects the document. Core EN 16931 validation passes; the German portal rejects.`,
                 fix: 'Choose a different profile ("en16931" or "peppol-bis-3") for a genuinely out-of-scope transaction, or re-examine the categorisation: a supply that is inside the scope of VAT but taxed at nothing is category "Z" (zero rated) with vatRate 0, and that is what most transactions labelled "no VAT" actually are. Category "E" (exempt) with an exemption reason is the other common correct answer.',
                 example: `"vatCategory": "Z", "vatRate": 0`,
                 xpath: `/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal[${index + 1}]/cac:TaxCategory/cbc:Percent`,
@@ -74799,6 +74866,13 @@ const STRING_KEYS = new Set([
     "meansCode", "meansName", "iban", "accountName", "bic", "remittanceInformation", "reason", "reasonCode",
     "category", "vatCategory", "exemptionReason", "exemptionReasonCode", "mimeCode", "filename", "externalUri",
     "reference", "content", "code", "text",
+    // Missing until 2026-09-23 (review): an object in any of these passed
+    // validation and then made the generator throw.
+    "deliverToName", "schemeVersion", "mandateReference", "creditorIdentifier", "debitedAccount",
+    "holderName", "primaryAccountNumber",
+    // declaredTotals.syntax ("ubl" | "cii"): set by the readers, but a caller
+    // can set it too, and it switches on the stated-breakdown checks.
+    "syntax",
 ]);
 /** Arrays whose entries must be objects. */
 const OBJECT_ARRAYS = new Set([
@@ -74810,7 +74884,13 @@ const STRING_MAPS = new Set(["vatExemptionReasons", "vatExemptionReasonCodes"]);
 /** Reader-internal bookkeeping in declaredTotals, not caller input. */
 const SKIPPED_DECLARED = new Set(["defects", "overPrecise"]);
 const PROFILES = new Set(["en16931", "xrechnung-ubl", "xrechnung-cii", "facturx-en16931", "peppol-bis-3"]);
-const kindOf = (v) => (v === null ? "null" : Array.isArray(v) ? "an array" : typeof v === "string" ? `the text ${JSON.stringify(v).slice(0, 40)}` : `a ${typeof v}`);
+const kindOf = (v) => v === null
+    ? "null"
+    : Array.isArray(v)
+        ? "an array"
+        : typeof v === "string"
+            ? `the text ${JSON.stringify(v).slice(0, 40)}`
+            : `${/^[aeiou]/.test(typeof v) ? "an" : "a"} ${typeof v}`;
 /** The business group or term a path lies in, for `field`. */
 const ROOT_TERMS = {
     invoiceNumber: "BT-1",
@@ -74984,6 +75064,9 @@ const representableRules = [
  *     BR-O-11 / BR-O-12 (category O may not share a document with any other
  *     category) are fully falsifiable from caller input. They catch real
  *     mistakes today.
+ *   - (Since 0.9.0 a document that was READ is also judged on the breakdown
+ *     it states: `-01`, `-08`, `-09`, BR-CO-18, and since 0.10.0 BR-45, BR-46,
+ *     BR-47 and BR-48. The paragraph below is about JSON input.)
  *   - The `-01`, `-08` and `-09` families, and BR-45..BR-48 / BR-CO-17 /
  *     BR-CO-18, are evaluated against the breakdown `computeTotals` derives
  *     from your lines, your document allowances (BG-20) and your document
@@ -75135,7 +75218,13 @@ const vatRules = [
                     fix: stated
                         ? `Add a VAT breakdown group (cac:TaxSubtotal, or ram:ApplicableTradeTax in CII) for category ${category}, with the taxable amount and VAT amount of the lines, allowances and charges that carry it.`
                         : "The VAT breakdown is always computed by this library from the lines and the document level allowances and charges, so a missing group means one of those carries a vatCategory this build does not recognise. Check it against the nine supported codes: S, Z, E, AE, K, G, O, L, M.",
-                    example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "${category}"${RATED_CATEGORIES.includes(category) ? ', "vatRate": 19' : ""} }]`,
+                    // A JSON example only where the fix is in the JSON: for a read
+                    // document the fix is in the document's own breakdown.
+                    ...(stated
+                        ? {}
+                        : {
+                            example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "${category}"${RATED_CATEGORIES.includes(category) ? ', "vatRate": 19' : ""} }]`,
+                        }),
                     xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:ID",
                     docsUrl: `${DOCS}/${rule}`,
                 });
@@ -75413,6 +75502,8 @@ const vatRules = [
         if (!totals)
             return null;
         const out = [];
+        const inputHasUncategorised = linesOf(inv).some((line) => blank(line?.vatCategory)) ||
+            allowanceChargesOf(inv, ctx).some((t) => blank(t.entry.vatCategory));
         for (const [index, subtotal] of totals.subtotals.entries()) {
             const at = `/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal[${index + 1}]`;
             const which = `The VAT breakdown group for category ${subtotal.category}`;
@@ -75439,7 +75530,14 @@ const vatRules = [
                     docsUrl: `${DOCS}/BR-46`,
                 });
             }
-            if (blank(subtotal.category)) {
+            // A computed group has no category only when an input line, allowance or
+            // charge has none, and BR-CO-04 / BR-32 / BR-37 already report that on
+            // the item itself. Reporting it again here, as a defect in this library,
+            // was wrong twice over: KoSIT does not, and on a read document it also
+            // duplicated the stated-group BR-47 below (review, 2026-09-23). What is
+            // left is the arithmetic guard: a computed group with no category and
+            // no uncategorised input.
+            if (blank(subtotal.category) && !inputHasUncategorised) {
                 out.push({
                     rule: "BR-47",
                     field: "BT-118",
@@ -75457,6 +75555,69 @@ const vatRules = [
                     severity: "fatal",
                     message: `${which} has no VAT category rate (BT-119). Each VAT breakdown (BG-23) shall have one, with a single exception: category O ("Not subject to VAT"), where the transaction is outside the scope of VAT and therefore has no rate at all — which is a different statement from a rate of zero. Category ${subtotal.category} is inside the scope, so the rate must be present even though it is 0.`,
                     fix: advice,
+                    xpath: `${at}/cac:TaxCategory/cbc:Percent`,
+                    docsUrl: `${DOCS}/BR-48`,
+                });
+            }
+        }
+        // On a document that was read, the groups it STATES are complete or not in
+        // their own right. The readers keep a group whose BT-116, BT-117 or BT-119
+        // is missing rather than dropping it, and until this check a UBL file with
+        // no cbc:TaxableAmount in a group validated with no finding at all, while
+        // KoSIT rejects it under BR-45 (adversarial review, 2026-09-23). This is
+        // what moved BR-45, BR-46 and BR-48 off the arithmetic-invariant list.
+        // Input without declaredTotals.syntax is not judged here: a JSON caller
+        // who states part of a group is asking for a cross-check, not writing the
+        // document. A caller CAN set syntax, so entries that are not objects are
+        // skipped rather than trusted (`[null]` threw here and took the computed
+        // checks down with it; ATW-INPUT-TYPE reports the entry itself).
+        const stated = inv.declaredTotals?.syntax
+            ? (inv.declaredTotals.subtotals ?? []).filter((g) => g !== null && typeof g === "object" && !Array.isArray(g))
+            : [];
+        for (const [index, group] of stated.entries()) {
+            const at = `/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal[${index + 1}]`;
+            const which = `VAT breakdown group ${index + 1} of the document${group.category ? ` (category ${group.category})` : ""}`;
+            const fix = (term, what) => `State ${what} (${term}) on every VAT breakdown group of the document. It is mandatory in the group whatever its value, zero included.`;
+            if (typeof group.taxableAmount !== "number" || !Number.isFinite(group.taxableAmount)) {
+                out.push({
+                    rule: "BR-45",
+                    field: "BT-116",
+                    severity: "fatal",
+                    message: `${which} states no readable VAT category taxable amount (BT-116): the element is missing, empty, or not a plain decimal number such as 1500.00. Each VAT breakdown (BG-23) shall have one: it is the base the VAT was calculated on, and without it neither BR-CO-17 nor the group's -08 and -09 rules can be evaluated.`,
+                    fix: fix("BT-116", "the taxable amount"),
+                    xpath: `${at}/cbc:TaxableAmount`,
+                    docsUrl: `${DOCS}/BR-45`,
+                });
+            }
+            if (typeof group.taxAmount !== "number" || !Number.isFinite(group.taxAmount)) {
+                out.push({
+                    rule: "BR-46",
+                    field: "BT-117",
+                    severity: "fatal",
+                    message: `${which} states no readable VAT category tax amount (BT-117): the element is missing, empty, or not a plain decimal number. Each VAT breakdown (BG-23) shall have one, even when it is zero — an absent amount and a zero amount are different claims, and BR-CO-14 sums these values into the document VAT total.`,
+                    fix: fix("BT-117", "the VAT amount"),
+                    xpath: `${at}/cbc:TaxAmount`,
+                    docsUrl: `${DOCS}/BR-46`,
+                });
+            }
+            if (blank(group.category)) {
+                out.push({
+                    rule: "BR-47",
+                    field: "BT-118",
+                    severity: "fatal",
+                    message: `${which} states no VAT category code (BT-118). Each VAT breakdown (BG-23) shall be defined through one: the code selects the rule family the group is judged by, so a group without it cannot be interpreted.`,
+                    fix: "State the VAT category code (BT-118) on every VAT breakdown group of the document: the code of the lines and allowances the group sums.",
+                    xpath: `${at}/cac:TaxCategory/cbc:ID`,
+                    docsUrl: `${DOCS}/BR-47`,
+                });
+            }
+            if (group.rate === undefined && group.category !== "O") {
+                out.push({
+                    rule: "BR-48",
+                    field: "BT-119",
+                    severity: "fatal",
+                    message: `${which} states no readable VAT category rate (BT-119): the element is missing, empty, or not a plain decimal number. Each VAT breakdown (BG-23) shall have one, with a single exception: category O ("Not subject to VAT"), which has no rate at all — a different statement from a rate of zero.`,
+                    fix: "State the VAT rate (BT-119) on every VAT breakdown group of the document, zero included. The only group without one is category O, not subject to VAT.",
                     xpath: `${at}/cac:TaxCategory/cbc:Percent`,
                     docsUrl: `${DOCS}/BR-48`,
                 });
@@ -75524,7 +75685,9 @@ const vatRules = [
             fix: stated
                 ? "Add the VAT breakdown to the document: one group per VAT category and rate, with its taxable amount (BT-116), VAT amount (BT-117) and category (BT-118)."
                 : "Add at least one invoice line with a vatCategory. The breakdown is derived from the lines, so a document with lines always produces one.",
-            example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "S", "vatRate": 19 }]`,
+            ...(stated
+                ? {}
+                : { example: `"lines": [{ "id": "1", "description": "Beratung", "quantity": 1, "unitCode": "C62", "unitPrice": 100, "vatCategory": "S", "vatRate": 19 }]` }),
             xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal",
             docsUrl: `${DOCS}/BR-CO-18`,
         });
@@ -77163,12 +77326,16 @@ function runInputRules(inv) {
         else
             out.push(result);
     }
+    // The exception's own text is deliberately NOT in the message. It is the
+    // runtime's wording, not ours, and a service that returns findings to its
+    // callers (apps/api) promises never to echo an exception; a scan of that
+    // service's source cannot see a message built here (review, 2026-09-23).
     if (typeError && !out.some((f) => /^ATW-(INPUT-TYPE|NUMBER-|VAT-RATE-OUT|AMOUNT-OUT|DECLARED-TOTAL)/.test(f.rule))) {
         out.push({
             rule: "ATW-INPUT-TYPE",
             field: [],
             severity: "fatal",
-            message: `A field of the invoice has a value of the wrong type, so some rules could not run (${typeError.message}). The input model expects text as strings, amounts as numbers, and lists as arrays.`,
+            message: "A field of the invoice has a value of the wrong type, so some rules could not run. The input model expects text as strings, amounts as numbers, and lists as arrays.",
             fix: "Check the invoice object against the InvoiceInput type, for example by building it in TypeScript. A value parsed from JSON or a form is the usual cause: \"19\" where 19 is expected, or a number where text is.",
             docsUrl: rules_LIMITS_DOCS,
         });
@@ -77188,6 +77355,14 @@ function runInputRules(inv) {
  *
  * Extraction only. The container is read; it is still never built. See the
  * module doc-comment in `facturx-pdf.ts` for why that asymmetry is deliberate.
+ */
+
+/**
+ * One call for an existing file — new in 0.10.0.
+ *
+ * XML (UBL or CII, any declared encoding) or a Factur-X / ZUGFeRD PDF in, the
+ * same findings as `validateInput` out, each with the line and column of the
+ * element in the caller's file. Never throws for anything about the document.
  */
 
 /**
@@ -77654,9 +77829,11 @@ function toSarif(findings, provenance) {
             message: { text: f.message },
         };
         // An XPath is a location in the document's logical structure, not a byte
-        // offset, and SARIF has a slot for exactly that. Emitting it as a physical
-        // location with a fabricated line number would be a lie a UI would then
-        // draw an underline at.
+        // offset, and SARIF has a slot for exactly that. A line and column go in
+        // the physical location only when `validate` read them off the file: a
+        // finding from `validateInput` has none, and inventing one would be a lie
+        // a UI would then draw an underline at. Nor when the XML came out of a PDF,
+        // whose line 12 is not the attachment's line 12.
         const location = {};
         if (f.xpath) {
             location.logicalLocations = [
@@ -77664,7 +77841,11 @@ function toSarif(findings, provenance) {
             ];
         }
         if (artifactLocation) {
-            location.physicalLocation = { artifactLocation };
+            const at = f.location;
+            location.physicalLocation =
+                at && at.attachment === undefined
+                    ? { artifactLocation, region: { startLine: at.line, startColumn: at.column } }
+                    : { artifactLocation };
         }
         if (Object.keys(location).length > 0)
             result.locations = [location];
@@ -78044,7 +78225,7 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * `test/version.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.9.0";
+const ENGINE_VERSION = "0.10.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";
