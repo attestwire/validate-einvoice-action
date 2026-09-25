@@ -1,6 +1,6 @@
 {
   "name": "validate-einvoice-action",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "GitHub Action that validates EN 16931 e-invoices (UBL, CII, Factur-X PDF) in CI.",
   "type": "module",
@@ -22,7 +22,7 @@
   "dependencies": {
     "@actions/core": "1.11.1",
     "@actions/glob": "^0.7.0",
-    "@attestwire/en16931": "0.10.0"
+    "@attestwire/en16931": "0.11.0"
   },
   "devDependencies": {
     "@vercel/ncc": "^0.45.0"

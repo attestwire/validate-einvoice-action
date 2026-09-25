@@ -63755,6 +63755,19 @@ function taxTotalNode(totals, currency) {
  * BR-CO arithmetic rejection cannot originate here. Use `validateInput` first if
  * you want to know whether your own accounting figures agree with ours
  * (BR-CO-10 through BR-CO-16).
+ *
+ * **It does not validate.** An invoice with fatal findings — no buyer
+ * reference, a missing VAT identifier — still comes out as well-formed XML
+ * that a receiver will reject. Check first and generate only what passes:
+ *
+ * ```ts
+ * const result = validateInput(invoice);
+ * if (!result.valid) throw new Error(result.errors.map((e) => e.rule).join(", "));
+ * const xml = generateXRechnungUBL(invoice);
+ * ```
+ *
+ * The check is separate so that a caller who only generates does not ship the
+ * whole rule set: this function alone bundles to a few kilobytes.
  */
 function generateXRechnungUBL(inv, options = {}) {
     // Refuse before doing any work: a wrong syntax is not something the rest of
@@ -64518,6 +64531,10 @@ function invoicedObjectNode(identifier) {
  * payload. The PDF/A-3 container that makes it a Factur-X *file* is read
  * (extraction) as of 0.7.0 via `extractFacturX`; it is still never built, so
  * nothing in this module writes one.
+ *
+ * **It does not validate**, for the same reason as `generateXRechnungUBL`: an
+ * invoice with fatal findings still comes out as well-formed XML. Call
+ * `validateInput` first and generate only when `result.valid` is true.
  */
 function generateCii(inv, options = {}) {
     if (!CII_GENERATABLE_PROFILES.includes(inv?.profile)) {
@@ -69707,6 +69724,35 @@ const CATEGORY_RULE_INFIX = {
  * services the Canarian regime relieves without moving them out of the tax.
  */
 const RATED_CATEGORIES = ["S", "L", "M"];
+/**
+ * True for a rate that is almost certainly a fraction passed where a
+ * percentage belongs: category S or L, and strictly between 0 and 1 once
+ * written at BT-152's two decimals.
+ *
+ * Every rate term in EN 16931 (BT-96, BT-103, BT-119, BT-152) is a percentage,
+ * so a system that keeps 19% as 0.19 and passes it through states 0.19%. No
+ * rule of the regulation forbids that — BR-S-05 asks only for more than zero —
+ * and no EU VAT rate or IGIC band is below 1%. M is left out on purpose: IPSI
+ * rates are set by Ceuta's and Melilla's own ordinances and go down to 0.5%.
+ * Judged as written, so 0.004 is BR-S-05's zero and not this.
+ */
+const looksLikeFractionRate = (category, rate) => {
+    if (category !== "S" && category !== "L")
+        return false;
+    if (typeof rate !== "number" || !Number.isFinite(rate))
+        return false;
+    const written = roundTo(rate, VAT_RATE_DECIMALS);
+    return written > 0 && written < 1;
+};
+/** The percentage a fraction stands for: 0.19 → 19, without 19.000000000000004. */
+const percentFromFraction = (rate) => roundTo(rate * 100, VAT_RATE_DECIMALS);
+/** The tax a rated category's rate is for: IGIC for L, VAT otherwise. */
+const taxNameOf = (category) => (category === "L" ? "IGIC" : "VAT");
+/**
+ * Why a rate between 0 and 1 reads as a fraction, in the one wording every
+ * finding that says so uses (ATW-VAT-RATE-FRACTION and both BR-CO-17s).
+ */
+const fractionReason = (category) => `${taxNameOf(category)} rates are percentages and no ${category === "L" ? "IGIC band" : "EU VAT rate"} is below 1%`;
 /**
  * The invoice lines, always as a real array.
  *
@@ -76083,6 +76129,91 @@ const vatRules = [
         }
         return out;
     },
+    // --- ATW-VAT-RATE-FRACTION: a rate passed as a fraction, not a percent ----
+    //
+    // A system that keeps 19% as 0.19 and passes it through states 0.19%. Until
+    // this rule that invoice validated clean and was generated with a hundredth
+    // of its VAT (0.29 on a 150.00 line instead of 28.50), and on a larger group
+    // BR-CO-17 fired instead, for a reason — its integer rounding of BT-119 —
+    // that pointed away from the mistake. `looksLikeFractionRate` has the bound
+    // and the reason M is left out.
+    //
+    // A warning, not an error: the regulation allows the value, KoSIT accepts
+    // it, and the generators write it faithfully. What is wrong is almost
+    // certainly the caller's unit, and only the caller can confirm that. One
+    // finding per category and rate, naming every place it appears, because the
+    // slip is one missing conversion in the caller's code, not one per line.
+    (inv, ctx) => {
+        const groups = new Map();
+        const note = (category, rate, place) => {
+            if (!looksLikeFractionRate(category, rate))
+                return;
+            // Keyed by the rate as written, which is how the breakdown groups it:
+            // 0.19 and 0.1900001 are one group there, so one finding here.
+            const key = `${category}|${roundTo(rate, VAT_RATE_DECIMALS)}`;
+            const group = groups.get(key) ?? { category: category, rate, places: [] };
+            group.places.push(place);
+            groups.set(key, group);
+        };
+        for (const [index, line] of linesOf(inv).entries()) {
+            note(line?.vatCategory, line?.vatRate, {
+                path: `lines[${index}]`,
+                term: "BT-152",
+                xpath: `/ubl:Invoice/cac:InvoiceLine[${index + 1}]/cac:Item/cac:ClassifiedTaxCategory/cbc:Percent`,
+                net: () => lineNetAmount(line),
+            });
+        }
+        for (const tagged of allowanceChargesOf(inv, ctx)) {
+            note(tagged.entry.vatCategory, tagged.entry.vatRate, {
+                path: allowanceChargePath(tagged),
+                term: tagged.isCharge ? "BT-103" : "BT-96",
+                xpath: `${tagged.xpath}/cac:TaxCategory/cbc:Percent`,
+                net: () => (tagged.isCharge ? 1 : -1) * Number(tagged.entry.amount),
+            });
+        }
+        if (groups.size === 0)
+            return null;
+        const currency = typeof inv.currency === "string" && !blank(inv.currency) ? ` ${inv.currency}` : "";
+        // A document that was read names its rates by element, not by the model's
+        // field paths, which its sender has no way to set.
+        const read = Boolean(inv.declaredTotals?.syntax);
+        const out = [];
+        for (const { category, rate, places } of groups.values()) {
+            const written = roundTo(rate, VAT_RATE_DECIMALS);
+            const meant = percentFromFraction(rate);
+            const tax = taxNameOf(category);
+            const paths = places.map((p) => p.path);
+            const subject = places.length === 1
+                ? `${paths[0]} has`
+                : `${places.length} entries (${paths.slice(0, 5).join(", ")}${places.length > 5 ? ", …" : ""}) have`;
+            // What the slip costs, in the caller's own figures. Skipped when the
+            // amounts cannot be totalled: BR-22 / BR-24 / BR-26 report those.
+            let cost = "";
+            try {
+                // Magnitudes: an allowance nets negative, and "charges -0.02 of VAT"
+                // reads as nonsense whichever way round it is.
+                const base = Math.abs(places.reduce((sum, p) => round2(sum + p.net()), 0));
+                if (base !== 0) {
+                    cost = ` On ${base.toFixed(2)}${currency} that is ${round2((base * written) / 100).toFixed(2)} of ${tax}; at ${meant}% it would be ${round2((base * meant) / 100).toFixed(2)}.`;
+                }
+            }
+            catch {
+                // an amount that is missing or not finite
+            }
+            const terms = [...new Set(places.map((p) => p.term))];
+            out.push({
+                rule: "ATW-VAT-RATE-FRACTION",
+                field: terms.length === 1 ? terms[0] : terms,
+                severity: "warning",
+                message: `${subject} ${tax === "IGIC" ? "an" : "a"} ${tax} rate of ${rate} in category ${rules_vat_describe(category)}, which the invoice states as ${written}%. ${fractionReason(category)}, so this is usually a rate kept as a fraction and passed through unconverted: as a percentage, ${rate} is ${meant}%.${cost}`,
+                fix: `If you meant ${meant}%, set ${read ? "the rate" : places.length === 1 ? `${paths[0]}.vatRate` : "vatRate"} to ${meant}: multiply a rate your system stores as a fraction by 100 before it reaches the invoice${places.length > 1 ? ", which corrects every entry above at once" : ""}. If ${written}% really is the rate, leave it; this is a warning, and the regulation allows the value.`,
+                example: `"vatCategory": "${category}", "vatRate": ${meant}`,
+                xpath: places[0].xpath,
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
     // --- BR-45 / BR-46 / BR-47 / BR-48: every breakdown group is complete ----
     (inv, ctx) => {
         const totals = totalsOf(inv, ctx);
@@ -76236,16 +76367,28 @@ const vatRules = [
                 }
             }
             const expected = round2((subtotal.taxableAmount * (rate ?? 0)) / 100);
+            const subHalf = rate !== undefined && rate !== 0 && Math.round(rate) === 0;
+            // In S or L a rate this small is usually a fraction (ATW-VAT-RATE-FRACTION),
+            // and "nothing in your data is wrong" sent that caller the wrong way.
+            // Lead with the unit; the schematron's rounding defect is still the
+            // answer when the rate is meant.
+            const fraction = subHalf && looksLikeFractionRate(subtotal.category, rate);
+            const meant = fraction ? percentFromFraction(rate) : undefined;
+            const tax = taxNameOf(subtotal.category);
             out.push(err({
                 rule: "BR-CO-17",
                 field: "BT-117",
                 severity: "fatal",
-                message: `In the VAT breakdown group for category ${subtotal.category}${rate === undefined ? "" : ` at ${rate}%`}, the VAT category tax amount (BT-117) is ${subtotal.taxAmount.toFixed(2)} ${inv.currency}. BR-CO-17 requires BT-117 = BT-116 x (BT-119 / 100), rounded to two decimals — here ${subtotal.taxableAmount.toFixed(2)} x ${rate ?? 0}% = ${expected.toFixed(2)}.${rate !== undefined && rate !== 0 && Math.round(rate) === 0
-                    ? ` The arithmetic is right; the *rule* is what rejects it. BR-CO-17's first branch is written as round(BT-119) = 0, using XPath's round-to-nearest-integer — so any rate below 0.5% rounds to zero and the rule then demands that the tax amount round to zero as well. At ${rate}% on a taxable amount of ${subtotal.taxableAmount.toFixed(2)} it does not. This is a known defect in the reference schematron, not in your invoice: a genuine sub-1% rate on a base large enough to yield half a unit of currency cannot satisfy BR-CO-17 at all.`
+                message: `In the VAT breakdown group for category ${subtotal.category}${rate === undefined ? "" : ` at ${rate}%`}, the VAT category tax amount (BT-117) is ${subtotal.taxAmount.toFixed(2)} ${inv.currency}. BR-CO-17 requires BT-117 = BT-116 x (BT-119 / 100), rounded to two decimals — here ${subtotal.taxableAmount.toFixed(2)} x ${rate ?? 0}% = ${expected.toFixed(2)}.${subHalf
+                    ? ` The arithmetic is right; the *rule* is what rejects it. BR-CO-17's first branch is written as round(BT-119) = 0, using XPath's round-to-nearest-integer — so any rate below 0.5% rounds to zero and the rule then demands that the tax amount round to zero as well. At ${rate}% on a taxable amount of ${subtotal.taxableAmount.toFixed(2)} it does not. ${fraction
+                        ? `That rounding is a known defect in the reference schematron, but it is rarely what went wrong: ${fractionReason(subtotal.category)}, so a rate this small is usually a fraction passed through unconverted — as a percentage, ${rate} is ${meant}%, at which this group's ${tax} would be ${round2((subtotal.taxableAmount * meant) / 100).toFixed(2)}.`
+                        : "This is a known defect in the reference schematron, not in your invoice: a genuine sub-1% rate on a base large enough to yield half a unit of currency cannot satisfy BR-CO-17 at all."}`
                     : " Where the rate rounds to zero, the tax amount must round to zero too. Note the direction of the arithmetic: VAT is computed on the *group* taxable amount, not summed from per-line VAT amounts, which is why EN 16931 rounds once per group rather than once per line."}`,
-                fix: rate !== undefined && rate !== 0 && Math.round(rate) === 0
-                    ? `Nothing in your data is wrong, and the library cannot compute its way out of this: any BT-119 below 0.5% trips BR-CO-17's integer rounding. If the rate is a rounding of a real one, state the real one (0.5 or above passes). If ${rate}% is genuinely the rate, the receiving validator will raise BR-CO-17 too — take it up with the recipient, or split the supply so the group taxable amount stays small enough that the tax amount rounds to zero.`
-                    : "This amount is computed by the library from the VAT rate you supplied, so unless the rate is one you meant to change, a mismatch here indicates a defect in the library's arithmetic. Please report it with the invoice payload.",
+                fix: fraction
+                    ? `If you meant ${meant}%, set the rate to ${meant}: rates are percentages, so multiply a rate your system stores as a fraction by 100 before it reaches the invoice. ATW-VAT-RATE-FRACTION names every line, allowance and charge that carries it. If ${rate}% really is the rate, nothing in your data is wrong and the library cannot compute its way out of this: any BT-119 below 0.5% trips BR-CO-17's integer rounding, and the receiving validator will raise it too — take it up with the recipient, or split the supply so the group taxable amount stays small enough that the tax amount rounds to zero.`
+                    : subHalf
+                        ? `Nothing in your data is wrong, and the library cannot compute its way out of this: any BT-119 below 0.5% trips BR-CO-17's integer rounding. If the rate is a rounding of a real one, state the real one (0.5 or above passes). If ${rate}% is genuinely the rate, the receiving validator will raise BR-CO-17 too — take it up with the recipient, or split the supply so the group taxable amount stays small enough that the tax amount rounds to zero.`
+                        : "This amount is computed by the library from the VAT rate you supplied, so unless the rate is one you meant to change, a mismatch here indicates a defect in the library's arithmetic. Please report it with the invoice payload.",
                 xpath: `/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal[${index + 1}]/cbc:TaxAmount`,
                 docsUrl: `${DOCS}/BR-CO-17`,
             }));
@@ -76647,7 +76790,10 @@ const baseInputRules = [
                 field: "BT-2",
                 severity: "fatal",
                 message: `The issue date (BT-2) must be a plain ISO 8601 calendar date, but "${inv.issueDate}" is not in YYYY-MM-DD form. UBL types this element as xs:date, so a timestamp, a locale format such as 09.08.2026, or a trailing "Z" all fail schema validation before any business rule runs.`,
-                fix: "Convert the value to YYYY-MM-DD before assigning it — e.g. new Date(x).toISOString().slice(0, 10).",
+                // Until 2026-09-24 this suggested new Date(x).toISOString().slice(0, 10),
+                // which converts to UTC first: a Date built at midnight in Berlin comes
+                // out as the day before. The calendar-date finding already warned of it.
+                fix: "Write the date as YYYY-MM-DD before assigning it. From a JavaScript Date, build it from the date's own calendar fields (getFullYear(), getMonth() + 1 and getDate(), each zero-padded) rather than with toISOString(), which converts to UTC first and can move the date back a day.",
                 example: `"issueDate": "2026-08-09"`,
                 xpath: "/ubl:Invoice/cbc:IssueDate",
                 docsUrl: `${rules_DOCS}/BR-03`,
@@ -77532,7 +77678,9 @@ const baseInputRules = [
                             field: "BT-117",
                             severity: "fatal",
                             message: `BR-CO-17 requires the VAT category tax amount (BT-117) to equal BT-116 × (BT-119 / 100). This group states ${round2(stated.taxAmount).toFixed(2)} against a stated taxable amount of ${round2(stated.taxableAmount).toFixed(2)} at ${stated.rate}%, which is ${signed.toFixed(2)} ${inv.currency}. The rule's tolerance is a whole unit of currency, exclusive, so this is outside it.`,
-                            fix: `Compute BT-117 from the group's own BT-116 and BT-119, rounded half-up to two decimals. A rate carrying more decimals than BT-119 is written to is the usual cause: normalise the rate first, then compute the amount from the normalised rate, so the two come from one number.`,
+                            fix: `${looksLikeFractionRate(stated.category, stated.rate)
+                                ? `${fractionReason(stated.category)}: if ${stated.rate} is a rate kept as a fraction, the percentage is ${percentFromFraction(stated.rate)}, so correct the rate (BT-119 here, and BT-152 on any line that carries it too) rather than the amount. Otherwise, compute`
+                                : "Compute"} BT-117 from the group's own BT-116 and BT-119, rounded half-up to two decimals. A rate carrying more decimals than BT-119 is written to is the usual cause: normalise the rate first, then compute the amount from the normalised rate, so the two come from one number.`,
                             example: `"vatRate": ${stated.rate}`,
                             xpath: "/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxAmount",
                             docsUrl: `${rules_DOCS}/BR-CO-17`,
@@ -77876,7 +78024,49 @@ const baseInputRules = [
  * `rules-extended.ts` — not by growing the array above.
  */
 const inputRules = [...baseInputRules, ...extendedRules];
+/**
+ * One finding for input that is not an invoice object at all, or null when it is one.
+ *
+ * `validateInput` is the entry point for payloads that never met a type
+ * checker, and the ones that are not an object failed worst: `undefined`, which
+ * is what an Express route without a body parser passes, took the run down with
+ * a TypeError from inside a rule, and the XML text of a file came back as nine
+ * findings about fields a string was never going to have. Each is now one
+ * finding that says what arrived and which function wanted it.
+ */
+function notAnInvoiceObject(inv) {
+    const bytes = ArrayBuffer.isView(inv) || inv instanceof ArrayBuffer;
+    if (inv !== null && typeof inv === "object" && !Array.isArray(inv) && !bytes)
+        return null;
+    const document = bytes || (typeof inv === "string" && /^\s*(?:<|%PDF)/.test(inv));
+    const what = inv === undefined || inv === null
+        ? String(inv)
+        : Array.isArray(inv)
+            ? "an array"
+            : bytes
+                ? "the bytes of a file"
+                : typeof inv === "string"
+                    ? document
+                        ? "text that starts like an XML or PDF document"
+                        : "text"
+                    : `${/^[aeiou]/.test(typeof inv) ? "an" : "a"} ${typeof inv}`;
+    return {
+        rule: "ATW-INPUT-TYPE",
+        field: [],
+        severity: "fatal",
+        message: `validateInput() checks an invoice object (InvoiceInput), but it was given ${what}.${document ? " A UBL or CII file, or a Factur-X PDF, is checked with validate() instead." : ""}`,
+        fix: document
+            ? "Call validate(document). It reads UBL, CII and Factur-X / ZUGFeRD PDF, runs the same rules, and gives each finding its line in the file."
+            : inv === undefined
+                ? "Pass the invoice object. In an Express route the usual cause is a missing body parser: add app.use(express.json()) so that req.body is the parsed invoice."
+                : "Pass the invoice as a plain object with the InvoiceInput fields. If it arrived as JSON text, parse it first.",
+        docsUrl: rules_LIMITS_DOCS,
+    };
+}
 function runInputRules(inv) {
+    const notAnObject = notAnInvoiceObject(inv);
+    if (notAnObject)
+        return [notAnObject];
     // One pass, one set of totals. See `RuleContext` in rule-kit.ts for why this
     // is built here — at the top of a single run, thrown away at the bottom of it
     // — rather than keyed on `inv` in a WeakMap that would outlive the caller's
@@ -77957,6 +78147,28 @@ function runInputRules(inv) {
 
 
 /**
+ * The message for a programming error: something that is not a document at all.
+ *
+ * The two mistakes worth naming are the other entry point's input (an invoice
+ * object, which `validateInput` checks) and a browser `File` or `Blob`, whose
+ * bytes have to be read before this synchronous function can see them.
+ */
+function notADocument(value) {
+    const accepted = "validate() takes the document as a string, a Uint8Array or an ArrayBuffer.";
+    if (typeof Blob !== "undefined" && value instanceof Blob) {
+        return `${accepted} This is a File or Blob: pass new Uint8Array(await file.arrayBuffer()).`;
+    }
+    // Bytes in another view (a DataView, a Uint16Array) are still a file's
+    // bytes, not an invoice object: say how to view them as a Uint8Array.
+    if (ArrayBuffer.isView(value)) {
+        return `${accepted} This is a ${value.constructor?.name ?? "typed array"}: pass new Uint8Array(view.buffer, view.byteOffset, view.byteLength).`;
+    }
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        return `${accepted} This is an object: to check an invoice object (InvoiceInput), call validateInput(invoice).`;
+    }
+    return accepted;
+}
+/**
  * Validate an e-invoice as a file: UBL or CII XML, or a Factur-X / ZUGFeRD PDF.
  *
  * Pass the bytes (a `Uint8Array`, which a Node `Buffer` is) when you have a
@@ -77984,7 +78196,7 @@ function validate(document, options = {}) {
         else if (document instanceof ArrayBuffer)
             bytes = new Uint8Array(document);
         else
-            throw new TypeError("validate() takes the document as a string, a Uint8Array or an ArrayBuffer.");
+            throw new TypeError(notADocument(document));
         // A PDF is recognised by its first bytes, not its name: a Factur-X saved as
         // .xml by a mail client is still a Factur-X.
         if (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) {
@@ -78073,6 +78285,7 @@ function validate(document, options = {}) {
         invoice,
         unmapped: parsed.unmapped,
         customizationId: parsed.customizationId,
+        profileId: parsed.profileId,
     };
 }
 // ---------------------------------------------------------------------------
@@ -79117,7 +79330,7 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * `test/version.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.10.0";
+const ENGINE_VERSION = "0.11.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";
