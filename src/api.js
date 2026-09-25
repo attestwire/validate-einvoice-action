@@ -141,11 +141,16 @@ export async function validateFileViaApi(
     };
   }
 
+  // The validator locates each finding at a line of what it was sent. For a
+  // PDF that was the XML payload alone, so the line is the attachment's, and
+  // saying so keeps it off the PDF in the annotations and the SARIF regions.
+  const inPayload = (f) =>
+    container !== null && f?.location ? { ...f, location: { ...f.location, attachment: container } } : f;
   const findings = [
     ...(body?.errors ?? []),
     ...(body?.warnings ?? []),
     ...(body?.information ?? []),
-  ];
+  ].map(inPayload);
 
   // `profile` is echoed from the engine's own result, not from our input, for
   // the same reason the API echoes it: a document that declared nothing was

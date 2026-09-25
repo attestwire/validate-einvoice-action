@@ -1,31 +1,24 @@
 /**
  * One document in, one verdict out — locally, in the runner.
  *
- * This module owns the two decisions the rest of the action does not want to
- * make: which reader an XML file goes to, and what a file we could not read at
- * all looks like once it reaches the report. The second one matters more than
- * it sounds. A pipeline that silently skips the invoice it could not parse is
- * worse than one that has no validation in it, because it reports green for a
- * file nobody has ever looked at. Every failure path here therefore produces a
- * FINDING, in the same shape as a rule violation, and that finding is fatal.
+ * The engine's `validate(bytes)` makes every decision about the file: whether
+ * it is a Factur-X / ZUGFeRD PDF (by its first bytes, not its name), which
+ * encoding the XML declares, whether it is UBL or CII, and which profile it
+ * claims. It is the same call the engine's command line and the hosted API
+ * make, so the three cannot disagree about a file. What it adds over the older
+ * parse-then-`validateInput` path is where each finding is: a `location` with
+ * the line of the element in the file, and an `xpath` in the file's own syntax
+ * (CII paths for a CII file, not the UBL paths the rules are written in).
  *
- * The syntax probe mirrors `apps/api/src/xml-document.js` deliberately: the
- * root element is read once by the library's own parser and compared by
- * namespace, rather than the reader being guessed from the file extension or
- * from a substring search. A file named `.xml` that turns out to be HTML is
- * then refused by `parseUbl` with the library's own message, naming the root it
- * found, instead of by a regex here with a worse one.
+ * What stays here is the part the engine cannot see: a file the runner could
+ * not read at all. That, like every other failure, becomes a FINDING in the
+ * same shape as a rule violation, and it is fatal. A pipeline that silently
+ * skips the invoice it could not open is worse than one that has no validation
+ * in it, because it reports green for a file nobody has ever looked at.
  */
 
 import { readFile } from "node:fs/promises";
-import {
-  CII_NAMESPACES,
-  extractFacturX,
-  parseCiiInvoice,
-  parseUblInvoice,
-  parseXml,
-  validateInput,
-} from "@attestwire/en16931";
+import { validate } from "@attestwire/en16931";
 
 /** Profiles the `profile` input may name. Rejected early, with the list. */
 export const PROFILES = Object.freeze([
@@ -39,44 +32,26 @@ export const PROFILES = Object.freeze([
 /**
  * A finding for something that went wrong before any rule could run.
  *
- * Same shape as a `TeachingError`, so the SARIF writer, the annotation writer
- * and the summary table need no special case. `docsUrl` is deliberately absent:
- * there is no rule page for "your file is not an invoice", and inventing a link
- * that 404s would be worse than having none.
+ * Same shape as the engine's own `AW-` findings, so the SARIF writer, the
+ * annotation writer and the summary table need no special case. `docsUrl` is
+ * deliberately absent: there is no rule page for "your file is not an
+ * invoice", and inventing a link that 404s would be worse than having none.
  */
 export function unreadable(rule, message, fix) {
   return { rule, field: "document", severity: "fatal", message, fix };
 }
 
-/** Is this a `ParseError` from the engine, including across module realms? */
-function isParseFailure(err) {
-  return /^(xml_|unsupported_|pdf_|facturx_)/.test(String(err?.code ?? ""));
-}
-
-/** CII is the narrow case; everything else goes to the UBL reader. */
-function syntaxOf(xml, limits) {
-  const root = parseXml(xml, limits);
-  return root.namespace === CII_NAMESPACES.rsm &&
-    root.local === "CrossIndustryInvoice"
-    ? "cii"
-    : "ubl";
-}
-
 /**
- * Read a file into XML, unwrapping a Factur-X / ZUGFeRD PDF when it is one.
- *
- * The PDF branch is chosen by extension rather than by sniffing bytes, because
- * a `.pdf` that is not a PDF should be told so in those words. `extractFacturX`
- * pulls the embedded CII payload out; validating that payload is not validating
- * the PDF container, and the summary says as much.
+ * The engine's fix for an oversized document names its own `limits` option.
+ * In this action that limit is the `max-characters` input, so say that; the
+ * other size limits (element count, PDF streams) have no input here, and the
+ * engine's sentence is left as it is.
  */
-async function readDocument(file) {
-  const bytes = await readFile(file);
-  if (/\.pdf$/i.test(file)) {
-    const { xml, attachmentName } = extractFacturX(new Uint8Array(bytes));
-    return { xml, container: attachmentName ?? "embedded XML" };
+function inActionTerms(finding, error) {
+  if (finding.rule === "AW-SIZE" && error?.code === "xml_too_large") {
+    return { ...finding, fix: "If a document this size is expected, raise the max-characters input." };
   }
-  return { xml: bytes.toString("utf8"), container: null };
+  return finding;
 }
 
 /**
@@ -85,33 +60,19 @@ async function readDocument(file) {
  * `profile` overrides the profile the document declares. That is an override
  * and not a filter: with it set, a Peppol document is judged against, say,
  * XRechnung rules and will fail rules it was never meant to satisfy. Off by
- * default for exactly that reason.
+ * default for exactly that reason. A profile of the other syntax draws the
+ * engine's `AW-PROFILE-SYNTAX` warning.
  *
  * @returns {Promise<{file: string, syntax: string|null, profile: string|null,
  *   container: string|null, findings: object[]}>}
  */
 export async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
-  const base = { file, syntax: null, profile: null, container: null };
-  const limits = maxCharacters ? { maxCharacters } : undefined;
-
-  let xml, container;
+  let bytes;
   try {
-    ({ xml, container } = await readDocument(file));
+    bytes = await readFile(file);
   } catch (err) {
-    if (isParseFailure(err)) {
-      return {
-        ...base,
-        findings: [
-          unreadable(
-            "AW-PDF",
-            `${file} could not be read as a Factur-X / ZUGFeRD PDF: ${err.message}`,
-            "Check the file is a PDF/A-3 with an EN 16931 CII attachment, or validate the XML payload directly.",
-          ),
-        ],
-      };
-    }
     return {
-      ...base,
+      file, syntax: null, profile: null, container: null,
       findings: [
         unreadable(
           "AW-IO",
@@ -122,37 +83,17 @@ export async function validateFile(file, { profile = "", maxCharacters = null } 
     };
   }
 
-  let syntax, parsed;
-  try {
-    syntax = syntaxOf(xml, limits);
-    parsed =
-      syntax === "cii"
-        ? parseCiiInvoice(xml, limits)
-        : parseUblInvoice(xml, limits);
-  } catch (err) {
-    if (!isParseFailure(err)) throw err;
-    return {
-      ...base,
-      container,
-      findings: [
-        unreadable(
-          "AW-PARSE",
-          `${file} is not a document this validator can read: ${err.message}`,
-          "Supply a UBL 2.1 Invoice/CreditNote or a UN/CEFACT CrossIndustryInvoice. " +
-            "If the file is large, raise max-characters.",
-        ),
-      ],
-    };
-  }
-
-  const invoice = profile ? { ...parsed.invoice, profile } : parsed.invoice;
-  const result = validateInput(invoice);
+  const result = validate(bytes, {
+    ...(profile ? { profile } : {}),
+    ...(maxCharacters ? { limits: { maxCharacters } } : {}),
+  });
 
   return {
     file,
-    syntax,
-    container,
+    syntax: result.syntax,
+    container: result.container,
     profile: result.profile,
-    findings: [...result.errors, ...result.warnings, ...result.information],
+    findings: [...result.errors, ...result.warnings, ...result.information]
+      .map((f) => inActionTerms(f, result.error)),
   };
 }

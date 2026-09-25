@@ -95,15 +95,36 @@ test("every declared output is set by the code, and every output set is declared
   assert.deepEqual([...declared].filter((o) => !set.has(o)), []);
 });
 
+/** The lines of one input's block in action.yml, up to the next input. */
+function inputBlock(yaml, name) {
+  const lines = yaml.split("\n");
+  const start = lines.indexOf(`  ${name}:`);
+  assert.notEqual(start, -1, `action.yml declares no input ${name}`);
+  const end = lines.findIndex((l, i) => i > start && /^ {0,2}\S/.test(l));
+  return lines.slice(start + 1, end).join("\n");
+}
+
 test("defaults in action.yml match the fallbacks the code applies", async () => {
   const yaml = await read("action.yml");
   const run = await read("src", "run.js");
-  for (const [input, value] of [["files", "**/*.xml"], ["fail-on", "error"], ["api-url", "https://api.attestwire.com"]]) {
-    assert.ok(yaml.includes(`default: "${value}"`), `action.yml default for ${input}`);
+  for (const [input, value] of [["fail-on", "error"], ["api-url", "https://api.attestwire.com"]]) {
+    assert.match(inputBlock(yaml, input), new RegExp(`default: "${value.replace(/[.*/]/g, "\\$&")}"`),
+      `action.yml default for ${input}`);
     assert.ok(run.includes(`"${value}"`), `src/run.js fallback for ${input}`);
   }
-  assert.match(yaml, /default: "true"/, "summary and annotations default on");
-  assert.match(yaml, /default: "false"/, "record defaults off");
+  assert.match(inputBlock(yaml, "summary"), /default: "true"/);
+  assert.match(inputBlock(yaml, "annotations"), /default: "true"/);
+  assert.match(inputBlock(yaml, "record"), /default: "false"/);
+});
+
+test("files is required and has no default, in action.yml and in the code", async () => {
+  // A default here is a guess at where invoices live, and a wrong guess fails
+  // the build on pom.xml. The runner does not enforce `required: true`, so the
+  // code must refuse a missing `files` itself — run.test.js checks that it does.
+  const files = inputBlock(await read("action.yml"), "files");
+  assert.match(files, /^ {4}required: true$/m);
+  assert.doesNotMatch(files, /^ {4}default:/m);
+  assert.doesNotMatch(await read("src", "run.js"), /getInput\("files"\) \|\| "[^"]/, "no fallback glob in the code");
 });
 
 test("the README documents every input and every output", async () => {

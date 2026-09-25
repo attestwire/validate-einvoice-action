@@ -24,6 +24,8 @@ export function ruleUrl(rule) {
 const isFatal = (f) => f.severity === "fatal";
 const isWarning = (f) => f.severity === "warning";
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 /** Business terms as one string — `field` is a term or a list of them. */
 export function terms(field) {
   return Array.isArray(field) ? field.join(", ") : String(field ?? "");
@@ -56,35 +58,153 @@ export function shouldFail(counts, failOn) {
     : counts.errors > 0;
 }
 
+// --- where a finding is ------------------------------------------------------
+
+/**
+ * The line of the file a finding is on, or null.
+ *
+ * The engine's `validate` reads each finding's line and column off the file
+ * it was given. For a Factur-X / ZUGFeRD PDF that is the XML attachment inside
+ * it, which `location.attachment` names, and line 117 of `factur-x.xml` is not
+ * line 117 of the PDF, so no line of the PDF is claimed. The engine's `toSarif`
+ * draws the same line for its regions. A finding about the whole file (it
+ * could not be read, or is not an invoice) has no location at all.
+ */
+export function lineInFile(f) {
+  const at = f.location;
+  return at && at.attachment === undefined ? at.line : null;
+}
+
+/**
+ * Where a finding is, in the engine command line's words: the element's path
+ * and line or, when the element is missing (`exact: false`), where it belongs
+ * and the nearest element that is there.
+ */
+export function whereText(f) {
+  const at = f.location;
+  if (!at) return f.xpath ?? "";
+  const inside = at.attachment === undefined ? "" : ` of ${at.attachment}`;
+  if (at.exact) return `line ${at.line}${inside}, ${f.xpath ?? at.path}`;
+  const nearest = at.path.split("/").pop().replace(/\[\d+\]$/, "");
+  const near = `nearest element in the file: <${nearest}>, line ${at.line}${inside}`;
+  return f.xpath ? `${f.xpath} (${near})` : `(${near})`;
+}
+
 // --- annotations -------------------------------------------------------------
 
 /**
- * `::error` / `::warning` per finding, attributed to the file.
- *
- * NO LINE NUMBERS, DELIBERATELY. A finding carries an XPath — a location in the
- * document's logical structure — and GitHub's annotation model wants a line.
- * Fabricating one would draw a red underline at a line chosen by arithmetic
- * rather than by evidence, which is worse than an annotation that points at the
- * file and names the XPath in its text. The same reasoning governs the SARIF
- * writer in the library itself.
+ * GitHub makes annotations of the first ten `::error` and the first ten
+ * `::warning` lines a step prints, only logs the rest, and cuts each message
+ * at 4,096 characters (`_maxCountPerIssueType` and `_maxIssueMessageLength` in
+ * actions/runner).
  */
-export function emitAnnotations(results, core) {
+export const ANNOTATIONS_PER_STEP = 10;
+const MESSAGE_LIMIT = 4096;
+
+/** The first sentence of a message, for a one-line mention of a finding. */
+function firstSentence(message) {
+  const m = /^(.+?[.!?])(\s|$)/.exec(message);
+  const sentence = (m ? m[1] : message).trim();
+  return sentence.length > 160 ? `${sentence.slice(0, 157)}...` : sentence;
+}
+
+/** "BR-CL-14 (BT-40), line 24: The country code ..." — one finding, one line. */
+function mention(f) {
+  const at = f.location;
+  const inside = at?.attachment === undefined ? "" : ` of ${at.attachment}`;
+  const line = at ? `, ${at.exact ? "line" : "near line"} ${at.line}${inside}` : "";
+  return `- ${f.rule} (${terms(f.field)})${line}: ${firstSentence(f.message)}`;
+}
+
+/** As many lines as fit in `budget` characters, then how many did not. */
+function within(lines, budget) {
+  const out = [];
+  let used = 0;
+  for (const [i, line] of lines.entries()) {
+    const rest = lines.length - i;
+    const reserve = rest > 1 ? `- and ${rest - 1} more`.length + 1 : 0;
+    if (used + line.length + 1 + reserve > budget) {
+      out.push(`- and ${rest} more`);
+      break;
+    }
+    out.push(line);
+    used += line.length + 1;
+  }
+  return out;
+}
+
+/**
+ * The one annotation a file gets, or null when it has nothing above
+ * informational.
+ *
+ * Its level is the file's worst finding, its line the line of the first
+ * finding at that level (`lineInFile`), and its title that finding's rule and
+ * how many more the file has. The message is that finding in full — what, the
+ * fix, where — and then one line for each other finding: rule, line, and the
+ * first sentence of its message. "First" is the engine's order, which puts a
+ * finding that explains the others ahead of them: on a Factur-X MINIMUM file,
+ * `AW-PROFILE-SUBSET` before the four rules that profile cannot satisfy.
+ */
+export function fileAnnotation(r, { summary = true } = {}) {
+  const errors = r.findings.filter(isFatal);
+  const warnings = r.findings.filter(isWarning);
+  const [lead, ...others] = [...errors, ...warnings];
+  if (!lead) return null;
+
+  const counts = [
+    errors.length > 0 ? plural(errors.length, "error") : "",
+    warnings.length > 0 ? plural(warnings.length, "warning") : "",
+  ].filter(Boolean).join(", ");
+  const title = `${lead.rule} (${terms(lead.field)})` +
+    (others.length > 0 ? ` and ${others.length} more: ${counts}` : "");
+
+  const where = whereText(lead);
+  let message = [lead.message, lead.fix ? `Fix: ${lead.fix}` : "", where ? `At: ${where}` : ""]
+    .filter(Boolean)
+    .join(" ");
+  if (others.length > 0) {
+    const tail = summary ? "The job summary lists every finding with its fix." : "";
+    const head = `${message}\nAlso in this file:`;
+    const list = within(others.map(mention), MESSAGE_LIMIT - head.length - tail.length - 2);
+    message = [head, ...list, tail].filter(Boolean).join("\n");
+  }
+
+  const properties = { title, file: r.file };
+  const line = lineInFile(lead);
+  if (line !== null) properties.startLine = line;
+  return { level: errors.length > 0 ? "error" : "warning", message, properties };
+}
+
+/**
+ * One `::error` or `::warning` per file, not one per finding.
+ *
+ * One per finding printed a hundred lines for a few hundred invoices, of which
+ * GitHub showed the first ten, and not the step's own failure message. So a
+ * file gets one annotation (see `fileAnnotation`), and at most nine files get
+ * an error annotation: a step with one always fails, and its failure message is
+ * the tenth error. Warnings have all ten. A file past that is logged as a plain
+ * line in the same words, and counted, so the step can say how many there were.
+ *
+ * @returns {{annotated: number, notAnnotated: number}} files annotated, and
+ *   files logged instead because GitHub would not have shown them.
+ */
+export function emitAnnotations(results, core, { summary = true } = {}) {
+  const room = { error: ANNOTATIONS_PER_STEP - 1, warning: ANNOTATIONS_PER_STEP };
+  let annotated = 0, notAnnotated = 0;
   for (const r of results) {
-    for (const f of r.findings) {
-      if (f.severity === "information") continue;
-      const emit = isFatal(f) ? core.error : core.warning;
-      // The engine's rules state locations as UBL paths; on a CII document
-      // they point at nothing, so they are left out rather than shown wrong.
-      const at = f.xpath && !(r.syntax === "cii" && f.xpath.startsWith("/ubl:")) ? f.xpath : "";
-      const detail = [f.message, f.fix ? `Fix: ${f.fix}` : "", at ? `At: ${at}` : ""]
-        .filter(Boolean)
-        .join(" ");
-      emit.call(core, detail, {
-        title: `${f.rule} (${terms(f.field)})`,
-        file: r.file,
-      });
+    const a = fileAnnotation(r, { summary });
+    if (!a) continue;
+    if (room[a.level] > 0) {
+      room[a.level]--;
+      annotated++;
+      (a.level === "error" ? core.error : core.warning).call(core, a.message, a.properties);
+    } else {
+      notAnnotated++;
+      const at = a.properties.startLine === undefined ? "" : `:${a.properties.startLine}`;
+      core.info(`${a.level}: ${a.properties.file}${at}: ${a.properties.title}`);
     }
   }
+  return { annotated, notAnnotated };
 }
 
 // --- job summary -------------------------------------------------------------
@@ -190,36 +310,70 @@ export function summaryMarkdown(results, { mode, engineVersion, failOn, provenan
 // --- SARIF -------------------------------------------------------------------
 
 /**
- * One SARIF log for the whole run, one run per document.
+ * A repository-relative path as a SARIF URI reference: every segment
+ * percent-encoded, the slashes kept. `Rechnung 2026-01.xml` is not a valid
+ * URI, and upload-sarif decodes each URI before it reads the file, which
+ * throws on a bare `%`.
+ */
+export function fileUri(file) {
+  return file.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * One SARIF log for the whole invocation, as ONE run over every document.
  *
- * The library's `toSarif` produces a complete single-run log; a run over many
- * invoices needs those runs merged rather than the last one winning. Merging at
- * the `runs` level rather than concatenating results keeps each document's
- * `artifacts` and rule descriptors attached to the document they came from,
- * which is what makes GitHub attribute a finding to a file.
+ * GitHub's code scanning refuses a file holding two runs of the same tool and
+ * category ("A delivery cannot contain multiple runs with the same category",
+ * since July 2025) and takes at most 20 runs per file, so the run per document
+ * this action wrote until 1.4.0 failed the upload for any repository with two
+ * invoices. The run has:
  *
- * Files with no findings still get a run. An empty run is how SARIF says "this
- * file was examined and was clean" — drop it and re-running with a fixed
- * invoice leaves the old alert open, because code scanning only resolves alerts
- * for artefacts the new upload mentions.
+ *   - `artifacts`: every document examined, the clean ones included, so the
+ *     log says what was looked at and not only what failed;
+ *   - `results`: each pointing at its document by URI and artifact index, with
+ *     a region (line and column) wherever the engine read one off that file;
+ *   - `tool.driver.rules`: every rule that fired anywhere, once, which each
+ *     result refers to by `ruleIndex`.
+ *
+ * The per-document work (levels, messages, logical locations, regions, rule
+ * descriptors) is the engine's `toSarif`, called once per document; this only
+ * merges what it returns. There is no `automationDetails`: an id in the file
+ * takes precedence over upload-sarif's `category` input, and an id without a
+ * slash is an empty category, so leaving it out is what lets a workflow name
+ * its own category, or get one per job by default.
  */
 export function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {}) {
-  const runs = [];
-  for (const r of results) {
-    const log = toSarif(r.findings, {
-      engineVersion: engineVersion ?? "unknown",
-      profile: r.profile ?? undefined,
-      documentUri: r.file,
-      generatedAt,
-      rulesetVersions,
-      suiteName: "validate-einvoice-action",
-    });
-    runs.push(...log.runs);
-  }
-  return {
-    $schema:
-      "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
-    version: "2.1.0",
-    runs,
-  };
+  const log = toSarif([], { engineVersion: engineVersion ?? "unknown", generatedAt, rulesetVersions });
+  const [run] = log.runs;
+  delete run.automationDetails;
+
+  const rules = [];
+  const ruleIndex = new Map();
+  const artifacts = [];
+  const found = [];
+  results.forEach((r, index) => {
+    const uri = fileUri(r.file);
+    const artifact = { location: { uri }, roles: ["analysisTarget"] };
+    const facts = Object.entries({ syntax: r.syntax, profile: r.profile, container: r.container })
+      .filter(([, value]) => value);
+    if (facts.length > 0) artifact.properties = Object.fromEntries(facts);
+    artifacts.push(artifact);
+
+    const [own] = toSarif(r.findings, { engineVersion: engineVersion ?? "unknown", documentUri: uri }).runs;
+    for (const result of own.results) {
+      if (!ruleIndex.has(result.ruleId)) {
+        ruleIndex.set(result.ruleId, rules.length);
+        rules.push(own.tool.driver.rules[result.ruleIndex]);
+      }
+      result.ruleIndex = ruleIndex.get(result.ruleId);
+      const physical = result.locations?.[0]?.physicalLocation;
+      if (physical) physical.artifactLocation = { uri, index };
+      found.push(result);
+    }
+  });
+
+  run.tool.driver.rules = rules;
+  run.artifacts = artifacts;
+  run.results = found;
+  return log;
 }

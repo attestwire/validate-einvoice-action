@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { FIXTURES, HERE } from "./helpers.js";
+import { uploadErrors } from "./sarif-check.js";
 import { ENGINE_VERSION } from "../src/version.js";
 
 const run = promisify(execFile);
@@ -75,45 +76,64 @@ test("the bundle passes a conformant invoice with exit code 0", async () => {
   assert.equal(r.outputs["file-count"], "1");
 });
 
-test("the bundle fails a non-conformant invoice with exit code 1 and a ::error line", async () => {
+test("the bundle fails a non-conformant invoice with exit code 1 and a ::error on its line", async () => {
   const r = await runAction({ files: path.join(FIXTURES, "xrechnung-ubl-missing-buyer-reference.xml") });
   assert.equal(r.code, 1);
   assert.equal(r.outputs.valid, "false");
   assert.equal(r.outputs["error-count"], "1");
-  assert.match(r.stdout, /::error /);
-  assert.match(r.stdout, /BR-DE-15/);
+  assert.match(r.stdout, /^::error title=BR-DE-15 \(BT-10\),file=[^,]+missing-buyer-reference\.xml,line=2::/m);
   assert.match(r.stdout, /::error::1 error/, "the step failure names the count");
 });
 
-test("the bundle writes a SARIF log a code-scanning upload would accept", async () => {
+test("the bundle writes ONE SARIF run for many documents, which upload-sarif's checks accept", async () => {
   const sarif = path.join(await mkdtemp(path.join(tmpdir(), "einvoice-sarif-")), "einvoice.sarif");
   const r = await runAction({
-    files: path.join(FIXTURES, "xrechnung-ubl-missing-buyer-reference.xml"),
+    files: [path.join(FIXTURES, "*.xml"), path.join(FIXTURES, "*.pdf")].join("\n"),
     sarif,
   });
   assert.equal(r.code, 1);
   assert.equal(r.outputs["sarif-path"], sarif);
+  assert.equal(r.outputs["file-count"], "8");
 
   const log = JSON.parse(await readFile(sarif, "utf8"));
   assert.equal(log.version, "2.1.0");
   assert.match(log.$schema, /sarif-schema-2\.1\.0\.json$/);
-  assert.equal(log.runs.length, 1);
+  assert.equal(log.runs.length, 1, "a run per document is what upload-sarif rejects");
+  assert.deepEqual(uploadErrors(log), []);
 
   const [runLog] = log.runs;
   assert.equal(runLog.tool.driver.name, "@attestwire/en16931");
   assert.equal(runLog.tool.driver.version, ENGINE_VERSION);
-  assert.ok(Array.isArray(runLog.tool.driver.rules));
-  assert.equal(runLog.tool.driver.rules[0].id, "BR-DE-15");
-  assert.equal(runLog.tool.driver.rules[0].helpUri, "https://attestwire.com/rules/BR-DE-15");
-
-  assert.equal(runLog.results.length, 1);
-  const [finding] = runLog.results;
-  assert.equal(finding.ruleId, "BR-DE-15");
-  assert.equal(finding.ruleIndex, 0);
-  assert.equal(finding.level, "error");
-  assert.ok(finding.message.text.length > 0);
-  assert.match(finding.locations[0].physicalLocation.artifactLocation.uri, /\.xml$/);
+  assert.equal(runLog.automationDetails, undefined, "the upload's category input decides the category");
+  assert.equal(runLog.artifacts.length, 8);
   assert.equal(runLog.invocations[0].executionSuccessful, true);
+
+  const at = (uri) => runLog.results.filter((x) => x.locations[0].physicalLocation.artifactLocation.uri.endsWith(uri));
+  const [ubl] = at("xrechnung-ubl-missing-buyer-reference.xml");
+  assert.equal(ubl.ruleId, "BR-DE-15");
+  assert.equal(runLog.tool.driver.rules[ubl.ruleIndex].helpUri, "https://attestwire.com/rules/BR-DE-15");
+  assert.deepEqual(ubl.locations[0].physicalLocation.region, { startLine: 2, startColumn: 1 });
+  assert.deepEqual(at("xrechnung-cii-missing-buyer-reference.xml")[0].locations[0].physicalLocation.region,
+    { startLine: 72, startColumn: 5 });
+  const pdf = at("facturx-minimum-rechnung.pdf");
+  assert.deepEqual(pdf.map((x) => x.ruleId), ["AW-PROFILE-SUBSET", "BR-10", "BR-11", "BR-16", "BR-12"]);
+  assert.ok(pdf.every((x) => x.locations[0].physicalLocation.region === undefined), "no line of a PDF is claimed");
+});
+
+test("the bundle prints one annotation per file, and a PDF's claims no line", async () => {
+  const r = await runAction({ files: path.join(FIXTURES, "facturx-minimum-rechnung.pdf") });
+  assert.equal(r.code, 1);
+  assert.equal(r.outputs["error-count"], "5");
+  const annotations = r.stdout.split("\n").filter((l) => /^::error [^:]/.test(l));
+  assert.equal(annotations.length, 1);
+  // `:` in a workflow-command property is escaped as %3A; the runner unescapes it.
+  assert.match(annotations[0], /^::error title=AW-PROFILE-SUBSET \(BT-24\) and 4 more%3A 5 errors,file=[^,:]+\.pdf::/);
+});
+
+test("the bundle refuses to run without files, and says what to write", async () => {
+  const r = await runAction({});
+  assert.equal(r.code, 1);
+  assert.match(r.stdout, /::error::files: is required\./);
 });
 
 test("the bundle writes the job summary with linked rule ids", async () => {

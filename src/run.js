@@ -23,6 +23,8 @@ const bool = (value, fallback = false) => {
   return v === "true" || v === "1" || v === "yes";
 };
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 /**
  * Read and CHECK every input before a single file is opened.
  *
@@ -30,9 +32,23 @@ const bool = (value, fallback = false) => {
  * build for a reason nobody could see. Every enumerated input is therefore
  * refused with the list of what it accepts, and refused up front — before the
  * work, so the failure is cheap and unambiguous.
+ *
+ * `files` has no default. Until 1.4.0 it defaulted to every `.xml` file in the
+ * repository, which in an ordinary one includes `pom.xml` and
+ * `.idea/workspace.xml`, and each of those failed the build as a document that
+ * is not an invoice. Only the workflow knows where its invoices are, so it has
+ * to say. (`required: true` in action.yml is documentation only; the runner
+ * does not enforce it, so this does.)
  */
 export function readInputs(core) {
-  const files = core.getInput("files") || "**/*.xml";
+  const files = (core.getInput("files") || "").trim();
+  if (!files) {
+    throw new Error(
+      "files: is required. Name your invoices, one glob per line, for example `invoices/**/*.xml` and " +
+        "`invoices/**/*.pdf`. There is no default: a repository-wide `**/*.xml` also matches pom.xml, " +
+        "IDE settings and every other XML file, and each of those would fail the build as not an invoice.",
+    );
+  }
   const profile = (core.getInput("profile") || "").trim();
   const failOn = (core.getInput("fail-on") || "error").trim().toLowerCase();
   const apiKey = (core.getInput("api-key") || "").trim();
@@ -146,7 +162,9 @@ export async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {})
   const counts = tally(results);
   const provenance = results.find((r) => r.provenance)?.provenance ?? null;
 
-  if (inputs.annotations) emitAnnotations(results, core);
+  const shown = inputs.annotations
+    ? emitAnnotations(results, core, { summary: inputs.summary })
+    : { annotated: 0, notAnnotated: 0 };
 
   let sarifPath = "";
   if (inputs.sarif) {
@@ -185,16 +203,25 @@ export async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {})
   core.setOutput("sarif-path", sarifPath);
   core.setOutput("record-urls", recordUrls.join("\n"));
 
+  // GitHub shows ten annotations of each kind per step; the files past that
+  // were logged instead, and the closing line says so rather than letting
+  // them disappear from the pull request without a word.
+  const unshown = shown.notAnnotated > 0
+    ? ` ${plural(shown.notAnnotated, "more file")} with findings ${shown.notAnnotated === 1 ? "is" : "are"} ` +
+      "listed in the log, not annotated: GitHub shows ten annotations of each kind per step." +
+      (inputs.summary ? " The job summary has every finding." : "")
+    : "";
+
   if (shouldFail(counts, inputs.failOn)) {
     core.setFailed(
       `${counts.errors} error${counts.errors === 1 ? "" : "s"} and ${counts.warnings} ` +
         `warning${counts.warnings === 1 ? "" : "s"} across ${counts.files} document` +
-        `${counts.files === 1 ? "" : "s"} (fail-on: ${inputs.failOn}).`,
+        `${counts.files === 1 ? "" : "s"} (fail-on: ${inputs.failOn}).${unshown}`,
     );
   } else {
     core.info(
       `All ${counts.files} document${counts.files === 1 ? "" : "s"} pass (${counts.warnings} warning` +
-        `${counts.warnings === 1 ? "" : "s"}, ${counts.information} informational).`,
+        `${counts.warnings === 1 ? "" : "s"}, ${counts.information} informational).${unshown}`,
     );
   }
 

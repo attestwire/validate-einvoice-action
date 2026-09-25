@@ -60,6 +60,10 @@ jobs:
   self-test:
     name: the action validates its own fixtures
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For the SARIF upload below, the check this job skipped until 1.4.0.
+      security-events: write
     steps:
       - uses: actions/checkout@v7
 
@@ -72,14 +76,30 @@ jobs:
             test/fixtures/*.xml
             test/fixtures/*.pdf
             !test/fixtures/not-an-invoice.xml
-            !test/fixtures/xrechnung-ubl-missing-buyer-reference.xml
+            !test/fixtures/*-missing-buyer-reference.xml
+            !test/fixtures/facturx-minimum-rechnung.pdf
           sarif: einvoice.sarif
 
-      - name: A clean fixture set must report valid with zero errors
+      - name: A clean fixture set must report valid with zero errors, in one SARIF run
         run: |
           test "${{ steps.clean.outputs.valid }}" = "true"
           test "${{ steps.clean.outputs.error-count }}" = "0"
           test "${{ steps.clean.outputs.file-count }}" = "4"
+          test "$(jq '.runs | length' einvoice.sarif)" = "1"
+          test "$(jq '.runs[0].artifacts | length' einvoice.sarif)" = "4"
+
+      # This workflow wrote SARIF and never uploaded it, so nothing noticed when
+      # upload-sarif began refusing a file with several runs of one tool and
+      # category (July 2025), which is what the action wrote for two or more
+      # documents. The upload is the check. A pull request from a fork gets no
+      # security-events permission and skips it; the suite's upload checks in
+      # test/sarif-check.js run there instead.
+      - name: GitHub code scanning accepts the SARIF
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: einvoice.sarif
+          category: self-test
 
       # And the negative control: the broken fixture must fail the step. Without
       # this, a build of the action that found nothing at all would pass above.
@@ -88,9 +108,11 @@ jobs:
         uses: ./
         with:
           files: test/fixtures/xrechnung-ubl-missing-buyer-reference.xml
+          sarif: broken.sarif
 
-      - name: The broken fixture must fail the step
+      - name: The broken fixture must fail the step, and be located on its line
         run: |
           test "${{ steps.broken.outcome }}" = "failure"
           test "${{ steps.broken.outputs.valid }}" = "false"
           test "${{ steps.broken.outputs.error-count }}" = "1"
+          test "$(jq '.runs[0].results[0].locations[0].physicalLocation.region.startLine' broken.sarif)" = "2"

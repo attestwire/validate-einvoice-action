@@ -61921,34 +61921,84 @@ function glob_hashFiles(patterns_1) {
     });
 }
 //# sourceMappingURL=glob.js.map
-;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-parse.js
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/facturx-pdf.js
 /**
- * Minimal, hardened XML reader for the UBL subset.
+ * Reading the Factur-X / ZUGFeRD PDF container.
  *
- * This package ships with zero runtime dependencies, so it cannot pull in a
- * general XML parser — and it should not want to. A general parser accepts far
- * more than UBL needs (DTDs, entities, mixed content, notations), and every one
- * of those features is an attack surface when the document comes from a third
- * party.
+ * **This reverses a documented invariant, deliberately and by half.** Every
+ * previous release of this package said the PDF/A-3 container was neither read
+ * nor built, and the generator doc-comments still say — correctly — that
+ * `generateCii` emits the XML half only. As of 0.7.0 the container is *read*:
+ * `extractFacturX` pulls the invoice XML out of a Factur-X, ZUGFeRD or
+ * XRechnung-CII PDF so it can be parsed and validated by the rest of this
+ * package. **It is still never built.** Writing a PDF/A-3 means font
+ * embedding, colour profiles, XMP metadata and a conformance claim that a
+ * validator will check, and shipping a half-conformant writer would produce
+ * files that look like Factur-X and are not. Extraction has no such failure
+ * mode: either the attachment is there and comes out byte-identical, or it is
+ * not and this throws.
  *
- * What this reader accepts:
- *   - one root element, with nested elements, attributes and text
- *   - namespace declarations (`xmlns` and `xmlns:prefix`), resolved to URIs
- *   - the five predefined entities (`&amp; &lt; &gt; &quot; &apos;`) and
- *     numeric character references
- *   - CDATA sections, comments and processing instructions
+ * ## Zero dependencies, including the decompressor
  *
- * What it refuses, loudly:
- *   - any document containing `<!DOCTYPE` or `<!ENTITY`
- *   - any entity reference that is not one of the five predefined ones
- *   - documents deeper, longer or larger than the limits below
- *   - mixed content: an element with both child elements and text
+ * The obvious implementation reaches for `DecompressionStream`, which exists in
+ * Node 18+ and every modern browser. It is not used here, and the reason is the
+ * signature: `DecompressionStream` is asynchronous, every other entry point in
+ * this package is synchronous, and making the one PDF function `async` would
+ * push a promise through every caller — `validateInput(await extract(...))` —
+ * for an operation that is pure CPU over a buffer already in memory. So RFC
+ * 1951 DEFLATE is implemented below, in about two hundred lines. It has no
+ * feature-detection hole, works identically in Node, Bun, Deno, Workers and
+ * browsers, and keeps the whole package callable from synchronous code.
  *
- * Refusing is deliberate. A parser that guesses at a construct it does not
- * understand produces a wrong invoice, and a wrong invoice is a tax problem.
+ * ## What it parses
+ *
+ * Enough PDF to find an attachment, and no more: classic cross-reference
+ * tables, cross-reference streams (PDF 1.5+), object streams, `/Prev` chains,
+ * and the `FlateDecode` filter with PNG predictors. It does not render, does
+ * not decrypt, and does not implement `LZWDecode`, `/Crypt` or any of the image
+ * filters — it names them and refuses instead, because a wrong answer about the
+ * contents of a tax document is worse than no answer.
+ *
+ * ## Hostile input
+ *
+ * The bytes come from someone else, so every loop here is bounded: output size
+ * and compression ratio per stream *and summed across the document* (a flate
+ * bomb inflates to a cap and throws), object count, parsed-value count,
+ * `/Prev` chain length, name-tree depth *and node count*, and object streams,
+ * which may not contain object streams. Malformed input produces a named error
+ * with a stable `code` and a byte offset where one is known; it never hangs and
+ * never throws a bare `TypeError` from inside the parser.
+ *
+ * Two of those bounds exist because the obvious ones are not sufficient, and
+ * the reasoning is worth keeping:
+ *
+ * - **Depth does not bound a tree.** Thirty name-tree dictionaries, each naming
+ *   the next one twice in `/Kids`, never exceed depth thirty and describe 2³⁰
+ *   paths. Object caching makes the file about a kilobyte. `maxNameTreeNodes`
+ *   is what terminates it; `maxNameTreeDepth` never fires.
+ * - **Bytes do not bound memory.** Four megabytes of `0 0 0 …` inside one
+ *   object stream is a four-kilobyte PDF that costs roughly seventy megabytes
+ *   of JavaScript heap once parsed, because a parsed value is much larger than
+ *   the byte it came from. `maxObjectNodes` is the cap that corresponds to what
+ *   a Cloudflare Worker actually runs out of.
  */
-/** Base class for every failure this reader and the UBL mapper raise. */
-class ParseError extends Error {
+const DEFAULT_PDF_LIMITS = {
+    maxStreamBytes: 32 * 1024 * 1024,
+    maxTotalInflatedBytes: 64 * 1024 * 1024,
+    maxAttachmentBytes: 16 * 1024 * 1024,
+    maxCompressionRatio: 2000,
+    maxObjects: 50_000,
+    maxXrefSections: 64,
+    maxNameTreeDepth: 64,
+    maxNameTreeNodes: 10_000,
+    maxObjectDepth: 64,
+    // The three FeRD sample files need 44, 646 and 646. Half a million leaves
+    // three orders of magnitude of headroom for a genuinely large document while
+    // still bounding the parse at roughly twenty megabytes of heap.
+    maxObjectNodes: 500_000,
+};
+/** Base class for everything this module throws, so one `catch` covers it. */
+class PdfError extends Error {
     code;
     constructor(code, message) {
         super(message);
@@ -61956,552 +62006,1394 @@ class ParseError extends Error {
         this.code = code;
     }
 }
-/** The document is not well-formed XML, or uses a construct outside the subset. */
-class XmlSyntaxError extends ParseError {
+/** The bytes are not a PDF we can read: bad syntax, broken offsets, missing objects. */
+class PdfParseError extends PdfError {
 }
-/**
- * The document tripped one of the limits that exist to stop a hostile file
- * from exhausting memory or CPU. Never a comment on the invoice itself.
- */
-class XmlSecurityError extends ParseError {
+/** A limit in `PdfLimits` was hit. Distinct from a syntax error: the file may be valid and simply too big. */
+class PdfSecurityError extends PdfError {
 }
-const DEFAULT_XML_LIMITS = {
-    maxCharacters: 8_000_000,
-    maxDepth: 100,
-    maxElements: 50_000,
-    maxAttributes: 256,
-};
-/** Attribute lookup by namespace and local name. */
-function attr(el, local, namespace = "") {
-    for (const a of el.attributes) {
-        if (a.local === local && a.namespace === namespace)
-            return a.value;
+/** The PDF parsed, and carries no XML attachment we can return. */
+class FacturXNotFoundError extends PdfError {
+    constructor(message) {
+        super("facturx_no_xml_attachment", message);
     }
-    return undefined;
 }
-const NAME_START = /[A-Za-z_]/;
-const NAME_CHAR = /[A-Za-z0-9._\-]/;
-/**
- * Characters XML 1.0 does not permit at all. They cannot be escaped, so a
- * document containing one is not well-formed however it was produced. Checked
- * on decoded text and attribute values, which is also where a numeric
- * character reference to a control character would land.
- */
-// eslint-disable-next-line no-control-regex
-const ILLEGAL_XML_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/;
-const XMLNS_URI = "http://www.w3.org/2000/xmlns/";
-const XML_URI = "http://www.w3.org/XML/1998/namespace";
-/** A namespace map with no prototype at all — see {@link Frame.nsMap}. */
-function emptyNsMap() {
-    const map = Object.create(null);
-    map[""] = "";
-    map["xml"] = XML_URI;
-    return map;
+/** A filter we do not implement — named rather than guessed at. */
+class PdfUnsupportedFilterError extends PdfError {
+    filter;
+    constructor(filter, extra = "") {
+        super("pdf_unsupported_filter", `This PDF uses the ${filter} filter, which this reader does not implement.${extra ? ` ${extra}` : ""} ` +
+            `Only FlateDecode (with PNG predictors) is supported: it is what every Factur-X and ` +
+            `ZUGFeRD producer uses for embedded files. Re-save the document without ${filter}, or ` +
+            `extract the attachment with a full PDF library.`);
+        this.filter = filter;
+    }
+}
+// ---------------------------------------------------------------------------
+// DEFLATE (RFC 1951) and zlib (RFC 1950)
+// ---------------------------------------------------------------------------
+const LENGTH_BASE = new Uint16Array([
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67,
+    83, 99, 115, 131, 163, 195, 227, 258,
+]);
+const LENGTH_EXTRA = new Uint8Array([
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
+    5, 5, 0,
+]);
+const DIST_BASE = new Uint16Array([
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+]);
+const DIST_EXTRA = new Uint8Array([
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
+    11, 12, 12, 13, 13,
+]);
+const CODE_LENGTH_ORDER = new Uint8Array([
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+]);
+function buildHuffman(lengths) {
+    const counts = new Int32Array(16);
+    for (let i = 0; i < lengths.length; i++) {
+        const len = lengths[i];
+        counts[len] = counts[len] + 1;
+    }
+    counts[0] = 0;
+    const offsets = new Int32Array(16);
+    for (let i = 1; i < 16; i++) {
+        offsets[i] = offsets[i - 1] + counts[i - 1];
+    }
+    const symbols = new Int32Array(lengths.length);
+    for (let sym = 0; sym < lengths.length; sym++) {
+        const len = lengths[sym];
+        if (len === 0)
+            continue;
+        const at = offsets[len];
+        symbols[at] = sym;
+        offsets[len] = at + 1;
+    }
+    return { counts, symbols };
+}
+class BitReader {
+    data;
+    pos = 0;
+    bitBuf = 0;
+    bitCount = 0;
+    constructor(data) {
+        this.data = data;
+    }
+    bits(need) {
+        while (this.bitCount < need) {
+            if (this.pos >= this.data.length) {
+                throw new PdfParseError("pdf_flate_truncated", "A compressed stream ended in the middle of a DEFLATE block. The PDF is truncated or corrupt.");
+            }
+            this.bitBuf |= this.data[this.pos++] << this.bitCount;
+            this.bitCount += 8;
+        }
+        const value = this.bitBuf & ((1 << need) - 1);
+        this.bitBuf >>>= need;
+        this.bitCount -= need;
+        return value;
+    }
+    decode(table) {
+        let code = 0;
+        let first = 0;
+        let index = 0;
+        for (let len = 1; len < 16; len++) {
+            code |= this.bits(1);
+            const count = table.counts[len];
+            if (code - first < count) {
+                return table.symbols[index + (code - first)];
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        throw new PdfParseError("pdf_flate_bad_code", "A compressed stream contains a Huffman code no table defines. The PDF is corrupt.");
+    }
+    alignToByte() {
+        this.bitBuf = 0;
+        this.bitCount = 0;
+    }
+    get bytePos() {
+        return this.pos;
+    }
+    set bytePos(v) {
+        this.pos = v;
+    }
 }
 /**
- * Parse a UBL-shaped XML document into a tree.
+ * Raw DEFLATE, capped.
  *
- * @throws {XmlSecurityError} on a DOCTYPE, a non-predefined entity, or a
- *   document over any of the limits.
- * @throws {XmlSyntaxError} on anything that is not well-formed, or that uses a
- *   construct outside the accepted subset.
+ * `maxOutput` is checked as the window grows rather than at the end, so a
+ * stream that would inflate to a gigabyte is stopped after the first megabyte
+ * instead of after the allocation.
  */
-function parseXml(source, limits = {}) {
-    const lim = { ...DEFAULT_XML_LIMITS, ...limits };
-    if (typeof source !== "string") {
-        throw new XmlSyntaxError("xml_not_a_string", "Expected the XML document as a string.");
-    }
-    // Defence: input size cap. Refuses a hostile or accidental upload before any
-    // allocation, rather than running out of memory building the tree.
-    if (source.length > lim.maxCharacters) {
-        throw new XmlSecurityError("xml_too_large", `The document is ${source.length} characters, over the ${lim.maxCharacters} ` +
-            `character limit. Raise it with the maxCharacters option if you really do ` +
-            `need to parse a document this size, or check that you are not passing a ` +
-            `whole archive where one invoice was expected.`);
-    }
-    // Defence against XXE and against billion-laughs style entity expansion: no
-    // DTD is processed at all, and a document that carries one is refused rather
-    // than parsed with the declarations ignored. Ignoring them would silently
-    // change the meaning of every entity reference in the body. The check runs on
-    // the raw text, so it also fires for a DOCTYPE hidden inside a CDATA section
-    // — a false positive we accept, because no invoice needs one.
-    const doctypeAt = source.indexOf("<!DOCTYPE");
-    if (doctypeAt >= 0) {
-        throw new XmlSecurityError("xml_doctype_forbidden", "This document contains a DOCTYPE declaration, which this parser refuses to " +
-            "process. A DTD can declare external entities (the XXE attack, which reads " +
-            "local files or makes network requests) and nested internal entities (the " +
-            "billion-laughs attack, which exhausts memory). No EN 16931 invoice needs a " +
-            "DOCTYPE. Remove the declaration and parse the document again.");
-    }
-    const entityAt = source.indexOf("<!ENTITY");
-    if (entityAt >= 0) {
-        throw new XmlSecurityError("xml_entity_declaration_forbidden", "This document declares an XML entity. Custom entities are never expanded by " +
-            "this parser, because entity expansion is how the billion-laughs denial of " +
-            "service works. Remove the declaration.");
-    }
-    let i = 0;
-    // A byte order mark is legal and invisible; drop it rather than treating it
-    // as text before the root element.
-    if (source.charCodeAt(0) === 0xfeff)
-        i = 1;
-    const stack = [];
-    let root;
-    let elementCount = 0;
-    // Line and column of an offset. Elements are met in document order, so the
-    // scan only ever moves forward and the whole document is walked once: O(n)
-    // in total, not O(n) per element. A line ends at LF, CRLF or a lone CR, as
-    // XML 1.0 section 2.11 and every editor have it: a file saved with classic
-    // Mac line endings is not one long line.
-    let scanned = i;
-    let lineNo = 1;
-    let lineStart = i;
-    const position = (at) => {
-        for (; scanned < at; scanned += 1) {
-            const ch = source.charCodeAt(scanned);
-            if (ch === 10 || (ch === 13 && source.charCodeAt(scanned + 1) !== 10)) {
-                lineNo += 1;
-                lineStart = scanned + 1;
+function inflateRaw(data, maxOutput) {
+    const reader = new BitReader(data);
+    let out = new Uint8Array(Math.min(maxOutput, Math.max(1024, data.length * 4)));
+    let length = 0;
+    const ensure = (extra) => {
+        if (length + extra > maxOutput) {
+            throw new PdfSecurityError("pdf_stream_too_large", `A compressed stream inflated past the ${maxOutput}-byte limit. This is the ` +
+                `decompression-bomb guard; raise maxStreamBytes if the document really is this large.`);
+        }
+        if (length + extra <= out.length)
+            return;
+        let size = out.length * 2;
+        while (size < length + extra)
+            size *= 2;
+        const bigger = new Uint8Array(Math.min(size, maxOutput));
+        bigger.set(out.subarray(0, length));
+        out = bigger;
+    };
+    let fixedLit;
+    let fixedDist;
+    for (;;) {
+        const last = reader.bits(1);
+        const type = reader.bits(2);
+        if (type === 0) {
+            reader.alignToByte();
+            const pos = reader.bytePos;
+            if (pos + 4 > data.length) {
+                throw new PdfParseError("pdf_flate_truncated", "A stored DEFLATE block header runs past the end of the stream.");
             }
-        }
-        return [lineNo, at - lineStart + 1];
-    };
-    const fail = (code, message) => {
-        throw new XmlSyntaxError(code, `${message} (at character ${i})`);
-    };
-    const readName = () => {
-        const start = i;
-        if (i >= source.length || !NAME_START.test(source[i])) {
-            fail("xml_bad_name", "Expected an element or attribute name");
-        }
-        i += 1;
-        let colons = 0;
-        while (i < source.length) {
-            const ch = source[i];
-            if (ch === ":") {
-                colons += 1;
-                if (colons > 1) {
-                    fail("xml_bad_name", "A qualified name may contain at most one colon");
-                }
-                i += 1;
-                if (i >= source.length || !NAME_START.test(source[i])) {
-                    fail("xml_bad_name", "Expected a local name after the namespace prefix");
-                }
-                i += 1;
-                continue;
+            const len = data[pos] | (data[pos + 1] << 8);
+            const nlen = data[pos + 2] | (data[pos + 3] << 8);
+            if ((len ^ 0xffff) !== nlen) {
+                throw new PdfParseError("pdf_flate_bad_stored_block", "A stored DEFLATE block's length and its complement disagree. The stream is corrupt.");
             }
-            if (!NAME_CHAR.test(ch))
-                break;
-            i += 1;
-        }
-        return source.slice(start, i);
-    };
-    const skipSpace = () => {
-        while (i < source.length && /[\s]/.test(source[i]))
-            i += 1;
-    };
-    const decode = (raw, where) => {
-        const decoded = raw.includes("&") ? decodeEntities(raw, where) : raw;
-        if (ILLEGAL_XML_CHARS.test(decoded)) {
-            throw new XmlSyntaxError("xml_illegal_character", `${where} contains a control character that XML 1.0 does not permit. ` +
-                `Such a character cannot be escaped: the document is not well-formed.`);
-        }
-        return decoded;
-    };
-    const current = () => stack[stack.length - 1];
-    while (i < source.length) {
-        const lt = source.indexOf("<", i);
-        if (lt < 0) {
-            // Trailing text after the last tag.
-            const rest = source.slice(i);
-            if (rest.trim() !== "") {
-                fail("xml_text_outside_root", "Text after the root element");
+            if (pos + 4 + len > data.length) {
+                throw new PdfParseError("pdf_flate_truncated", "A stored DEFLATE block runs past the end of the stream.");
             }
-            break;
+            ensure(len);
+            out.set(data.subarray(pos + 4, pos + 4 + len), length);
+            length += len;
+            reader.bytePos = pos + 4 + len;
         }
-        if (lt > i) {
-            const raw = source.slice(i, lt);
-            const frame = current();
-            if (!frame) {
-                if (raw.trim() !== "") {
-                    fail("xml_text_outside_root", "Text outside the root element");
+        else if (type === 1 || type === 2) {
+            let lit;
+            let dist;
+            if (type === 1) {
+                if (!fixedLit) {
+                    const litLengths = new Uint8Array(288);
+                    litLengths.fill(8, 0, 144);
+                    litLengths.fill(9, 144, 256);
+                    litLengths.fill(7, 256, 280);
+                    litLengths.fill(8, 280, 288);
+                    fixedLit = buildHuffman(litLengths);
+                    fixedDist = buildHuffman(new Uint8Array(30).fill(5));
                 }
+                lit = fixedLit;
+                dist = fixedDist;
             }
             else {
-                frame.text.push(decode(raw, `The content of <${frame.el.qname}>`));
-            }
-            i = lt;
-        }
-        // --- comment ------------------------------------------------------------
-        if (source.startsWith("<!--", i)) {
-            const end = source.indexOf("-->", i + 4);
-            if (end < 0)
-                fail("xml_unterminated_comment", "Unterminated comment");
-            // XML 1.0 forbids the literal string "--" anywhere inside a comment.
-            // "-->" is the only terminator there is, so a comment carrying "--" has
-            // no single reading: a writer who meant it as text and a reader who takes
-            // it as the start of the terminator disagree about where the comment ends
-            // — and therefore about how much of the document is markup. Refusing is
-            // the only answer that cannot silently drop or resurrect content.
-            const body = source.slice(i + 4, end);
-            const dashes = body.indexOf("--");
-            if (dashes >= 0) {
-                fail("xml_bad_comment", `A comment contains "--" ${dashes + 4} characters in, which XML 1.0 does ` +
-                    `not permit anywhere inside a comment`);
-            }
-            // The same rule seen from the other end: a comment may not finish with a
-            // hyphen, because that writes the close as "--->". Single hyphens
-            // separated by other characters are legal and stay legal — "<!-- a- -b -->"
-            // parses.
-            if (body.endsWith("-")) {
-                fail("xml_bad_comment", `A comment ends "--->" ${body.length + 4} characters in; a comment may not ` +
-                    `end with a hyphen`);
-            }
-            // The Char production covers comments too: a control character here is
-            // as ill-formed as one in text, and a reader that skips it would accept a
-            // file that every schema validator refuses.
-            if (ILLEGAL_XML_CHARS.test(body)) {
-                fail("xml_illegal_character", "A comment contains a control character that XML 1.0 does not permit");
-            }
-            i = end + 3;
-            continue;
-        }
-        // --- CDATA --------------------------------------------------------------
-        if (source.startsWith("<![CDATA[", i)) {
-            const end = source.indexOf("]]>", i + 9);
-            if (end < 0)
-                fail("xml_unterminated_cdata", "Unterminated CDATA section");
-            const frame = current();
-            const raw = source.slice(i + 9, end);
-            if (!frame) {
-                fail("xml_text_outside_root", "CDATA outside the root element");
-            }
-            else {
-                // No entity decoding inside CDATA — that is what CDATA means.
-                if (ILLEGAL_XML_CHARS.test(raw)) {
-                    throw new XmlSyntaxError("xml_illegal_character", "A CDATA section contains a control character that XML 1.0 does not permit.");
+                const hlit = reader.bits(5) + 257;
+                const hdist = reader.bits(5) + 1;
+                const hclen = reader.bits(4) + 4;
+                const codeLengths = new Uint8Array(19);
+                for (let i = 0; i < hclen; i++) {
+                    codeLengths[CODE_LENGTH_ORDER[i]] = reader.bits(3);
                 }
-                frame.text.push(raw);
+                const codeTable = buildHuffman(codeLengths);
+                const lengths = new Uint8Array(hlit + hdist);
+                for (let i = 0; i < lengths.length;) {
+                    const symbol = reader.decode(codeTable);
+                    if (symbol < 16) {
+                        lengths[i++] = symbol;
+                    }
+                    else if (symbol === 16) {
+                        if (i === 0) {
+                            throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE code-length table repeats a symbol before defining one.");
+                        }
+                        const prev = lengths[i - 1];
+                        let repeat = 3 + reader.bits(2);
+                        while (repeat-- > 0 && i < lengths.length)
+                            lengths[i++] = prev;
+                    }
+                    else if (symbol === 17) {
+                        let repeat = 3 + reader.bits(3);
+                        while (repeat-- > 0 && i < lengths.length)
+                            lengths[i++] = 0;
+                    }
+                    else {
+                        let repeat = 11 + reader.bits(7);
+                        while (repeat-- > 0 && i < lengths.length)
+                            lengths[i++] = 0;
+                    }
+                }
+                lit = buildHuffman(lengths.subarray(0, hlit));
+                dist = buildHuffman(lengths.subarray(hlit));
             }
-            i = end + 3;
-            continue;
-        }
-        // --- processing instruction (including the XML declaration) -------------
-        if (source.startsWith("<?", i)) {
-            const end = source.indexOf("?>", i + 2);
-            if (end < 0) {
-                fail("xml_unterminated_pi", "Unterminated processing instruction");
+            for (;;) {
+                const symbol = reader.decode(lit);
+                if (symbol === 256)
+                    break;
+                if (symbol < 256) {
+                    ensure(1);
+                    out[length++] = symbol;
+                    continue;
+                }
+                const lengthIndex = symbol - 257;
+                if (lengthIndex >= LENGTH_BASE.length) {
+                    throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE length symbol is outside the defined range.");
+                }
+                const copyLength = LENGTH_BASE[lengthIndex] +
+                    reader.bits(LENGTH_EXTRA[lengthIndex]);
+                const distSymbol = reader.decode(dist);
+                if (distSymbol >= DIST_BASE.length) {
+                    throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE distance symbol is outside the defined range.");
+                }
+                const distance = DIST_BASE[distSymbol] +
+                    reader.bits(DIST_EXTRA[distSymbol]);
+                if (distance > length) {
+                    throw new PdfParseError("pdf_flate_bad_distance", "A DEFLATE back-reference points before the start of the output. The stream is corrupt.");
+                }
+                ensure(copyLength);
+                let from = length - distance;
+                for (let i = 0; i < copyLength; i++)
+                    out[length++] = out[from++];
             }
-            // Processing instructions are skipped, never acted on. A stylesheet PI in
-            // particular must not cause this library to fetch anything. Skipped is
-            // not unchecked: the same characters are forbidden here as in text.
-            if (ILLEGAL_XML_CHARS.test(source.slice(i + 2, end))) {
-                fail("xml_illegal_character", "A processing instruction contains a control character that XML 1.0 does not permit");
-            }
-            i = end + 2;
-            continue;
-        }
-        // --- other declarations -------------------------------------------------
-        if (source.startsWith("<!", i)) {
-            fail("xml_unsupported_declaration", "Unsupported markup declaration; only comments and CDATA sections are accepted");
-        }
-        // --- end tag ------------------------------------------------------------
-        if (source.startsWith("</", i)) {
-            i += 2;
-            const qname = readName();
-            skipSpace();
-            if (source[i] !== ">")
-                fail("xml_bad_end_tag", "Expected '>' to close an end tag");
-            i += 1;
-            const frame = stack.pop();
-            if (!frame)
-                fail("xml_unbalanced", `Stray end tag </${qname}>`);
-            if (frame.el.qname !== qname) {
-                fail("xml_unbalanced", `End tag </${qname}> does not match the open element <${frame.el.qname}>`);
-            }
-            closeFrame(frame);
-            continue;
-        }
-        // --- start tag ----------------------------------------------------------
-        const [line, column] = position(i);
-        i += 1;
-        const qname = readName();
-        elementCount += 1;
-        // Defence: element-count cap. A flat document of millions of empty
-        // elements passes the depth check and can still exhaust memory.
-        if (elementCount > lim.maxElements) {
-            throw new XmlSecurityError("xml_too_many_elements", `The document has more than ${lim.maxElements} elements. Raise the ` +
-                `maxElements option if a document this large is genuinely expected.`);
-        }
-        const parent = current();
-        const rawAttrs = [];
-        let selfClosing = false;
-        for (;;) {
-            skipSpace();
-            if (i >= source.length)
-                fail("xml_unterminated_tag", "Unterminated start tag");
-            if (source[i] === ">") {
-                i += 1;
-                break;
-            }
-            if (source.startsWith("/>", i)) {
-                selfClosing = true;
-                i += 2;
-                break;
-            }
-            const aname = readName();
-            skipSpace();
-            if (source[i] !== "=") {
-                fail("xml_bad_attribute", `Attribute ${aname} has no value`);
-            }
-            i += 1;
-            skipSpace();
-            const quote = source[i];
-            if (quote !== '"' && quote !== "'") {
-                fail("xml_bad_attribute", `The value of ${aname} is not quoted`);
-            }
-            const end = source.indexOf(quote, i + 1);
-            if (end < 0)
-                fail("xml_bad_attribute", `Unterminated value for ${aname}`);
-            const raw = source.slice(i + 1, end);
-            if (raw.includes("<")) {
-                fail("xml_bad_attribute", `The value of ${aname} contains an unescaped '<'`);
-            }
-            rawAttrs.push({ qname: aname, value: decode(raw, `The value of ${aname}`) });
-            // Defence: per-element attribute cap. Namespace declarations are
-            // attributes, and an element carrying tens of thousands of them builds a
-            // namespace map that every descendant lookup has to walk.
-            if (rawAttrs.length > lim.maxAttributes) {
-                throw new XmlSecurityError("xml_too_many_attributes", `<${qname}> carries more than ${lim.maxAttributes} attributes. Raise the ` +
-                    `maxAttributes option only if a document this unusual is genuinely ` +
-                    `expected; an EN 16931 element carries a handful.`);
-            }
-            i = end + 1;
-        }
-        // Namespace declarations first: an element's own prefix may be declared on
-        // the element itself.
-        let nsMap = parent ? parent.nsMap : emptyNsMap();
-        let declared = false;
-        for (const a of rawAttrs) {
-            const isDefault = a.qname === "xmlns";
-            const isPrefixed = a.qname.startsWith("xmlns:");
-            if (!isDefault && !isPrefixed)
-                continue;
-            if (!declared) {
-                // Chain, do not copy: copying the inherited map on every element that
-                // declares a prefix is quadratic in the number of declarations in
-                // scope. `Object.create` is O(1) and lookups still find inherited
-                // prefixes, because the whole chain is ours and bottoms out at a
-                // null-prototype map.
-                nsMap = Object.create(nsMap);
-                declared = true;
-            }
-            const prefix = isDefault ? "" : a.qname.slice(6);
-            if (isPrefixed && a.value === "") {
-                fail("xml_bad_namespace", `Cannot undeclare the prefix ${prefix}`);
-            }
-            nsMap[prefix] = a.value;
-        }
-        const resolve = (name, forAttribute) => {
-            const colon = name.indexOf(":");
-            if (colon < 0) {
-                // An unprefixed attribute is in no namespace; an unprefixed element is
-                // in the default namespace.
-                return [forAttribute ? "" : (nsMap[""] ?? ""), name];
-            }
-            const prefix = name.slice(0, colon);
-            const local = name.slice(colon + 1);
-            if (prefix === "xmlns")
-                return [XMLNS_URI, local];
-            const uri = nsMap[prefix];
-            if (uri === undefined) {
-                fail("xml_unbound_prefix", `The namespace prefix "${prefix}" is used but never declared`);
-            }
-            return [uri, local];
-        };
-        const [ns, local] = resolve(qname, false);
-        const attributes = rawAttrs.map((a) => {
-            const [ans, alocal] = resolve(a.qname, true);
-            return { namespace: ans, local: alocal, qname: a.qname, value: a.value };
-        });
-        // XML 1.0 well-formedness: no element may carry the same attribute twice.
-        // "The same" is the expanded name — namespace URI plus local name — not the
-        // text as written, so `a:x` and `b:x` are one attribute written twice when
-        // both prefixes are bound to one URI, while the same local name under two
-        // genuinely different namespaces is legal and stays accepted. That is why
-        // this runs here rather than over `rawAttrs`: only after `resolve` is the
-        // namespace context of this element known.
-        //
-        // Accepting a duplicate is not a cosmetic fault. `attr()` returns the first
-        // match, so a document stating two different @currencyID or @schemeID values
-        // on one element would be read by position, and whichever value lost is
-        // gone from the invoice with nothing raised.
-        const seen = new Map();
-        for (const a of attributes) {
-            // NUL separates the two halves unambiguously: it is refused as an illegal
-            // character everywhere else, so it cannot be smuggled into a namespace URI
-            // to forge or hide a collision.
-            const key = `${a.namespace}\u0000${a.local}`;
-            const first = seen.get(key);
-            if (first !== undefined) {
-                fail("xml_duplicate_attribute", first === a.qname
-                    ? `<${qname}> carries the attribute ${a.qname} twice`
-                    : `<${qname}> carries both ${first} and ${a.qname}, which are the same ` +
-                        `attribute once their prefixes are resolved`);
-            }
-            seen.set(key, a.qname);
-        }
-        // The `[n]` index counts preceding siblings of the same name. Counting them
-        // by rescanning `parent.el.children` is O(siblings) per element and so
-        // quadratic over the document: a flat 200,000-element file took over two
-        // minutes, entirely inside this one line, and no cap bounded it because
-        // maxElements is only checked once the element is already being built.
-        // A per-frame tally is O(1) and produces byte-identical paths.
-        let sameName = 0;
-        if (parent) {
-            sameName = parent.counts.get(qname) ?? 0;
-            parent.counts.set(qname, sameName + 1);
-        }
-        const step = sameName > 0 ? `${qname}[${sameName + 1}]` : qname;
-        const path = parent ? `${parent.el.path}/${step}` : `/${qname}`;
-        const el = {
-            namespace: ns,
-            local,
-            qname,
-            path,
-            line,
-            column,
-            attributes,
-            children: [],
-            text: "",
-        };
-        if (parent) {
-            parent.el.children.push(el);
-        }
-        else if (root) {
-            fail("xml_multiple_roots", "A document may have only one root element");
         }
         else {
-            root = el;
+            throw new PdfParseError("pdf_flate_bad_block_type", "A DEFLATE block declares reserved type 3. The stream is corrupt.");
         }
-        if (selfClosing) {
+        if (last)
+            break;
+    }
+    return out.subarray(0, length);
+}
+/** zlib wrapper if present, raw DEFLATE otherwise. */
+function inflate(data, maxOutput) {
+    if (data.length === 0)
+        return data;
+    const cmf = data[0];
+    const flg = data[1];
+    const looksZlib = data.length > 2 && (cmf & 0x0f) === 8 && ((cmf << 8) | flg) % 31 === 0;
+    if (looksZlib) {
+        try {
+            return inflateRaw(data.subarray(2), maxOutput);
+        }
+        catch (error) {
+            if (error instanceof PdfSecurityError)
+                throw error;
+            // Some producers write a raw stream whose first two bytes happen to pass
+            // the zlib check. Falling back costs one retry and rescues those.
+            return inflateRaw(data, maxOutput);
+        }
+    }
+    return inflateRaw(data, maxOutput);
+}
+// ---------------------------------------------------------------------------
+// PDF object model
+// ---------------------------------------------------------------------------
+class PdfName {
+    name;
+    constructor(name) {
+        this.name = name;
+    }
+}
+class PdfRef {
+    num;
+    gen;
+    constructor(num, gen) {
+        this.num = num;
+        this.gen = gen;
+    }
+}
+class PdfStream {
+    dict;
+    raw;
+    constructor(dict, raw) {
+        this.dict = dict;
+        this.raw = raw;
+    }
+}
+const WHITESPACE = new Set([0x00, 0x09, 0x0a, 0x0c, 0x0d, 0x20]);
+const DELIMITERS = new Set([
+    0x28, 0x29, 0x3c, 0x3e, 0x5b, 0x5d, 0x7b, 0x7d, 0x2f, 0x25,
+]);
+function isRegular(byte) {
+    return !WHITESPACE.has(byte) && !DELIMITERS.has(byte);
+}
+/** Latin-1 decode — PDF names and keywords are ASCII, and this never throws on a stray byte. */
+function latin1(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) {
+        s += String.fromCharCode(bytes[i]);
+    }
+    return s;
+}
+class Lexer {
+    data;
+    limits;
+    budget;
+    pos = 0;
+    constructor(data, limits, 
+    /**
+     * Shared across every lexer in one document, so the budget is on the
+     * extraction rather than on each object separately.
+     */
+    budget = { nodes: 0 }) {
+        this.data = data;
+        this.limits = limits;
+        this.budget = budget;
+    }
+    /**
+     * One byte, or `-1` past the end.
+     *
+     * Every read goes through here so that running off the end of the buffer is a
+     * value the comparisons below already handle rather than an `undefined` that
+     * turns into a `NaN` three lines later. `-1` is not a byte, so no equality
+     * test against a real character can accidentally match it.
+     */
+    byte(at) {
+        const value = this.data[at];
+        return value === undefined ? -1 : value;
+    }
+    fail(code, message) {
+        throw new PdfParseError(code, `${message} (at byte ${this.pos})`);
+    }
+    skipWhitespace() {
+        for (;;) {
+            while (this.pos < this.data.length && WHITESPACE.has(this.byte(this.pos))) {
+                this.pos++;
+            }
+            if (this.byte(this.pos) === 0x25) {
+                // comment to end of line
+                while (this.pos < this.data.length &&
+                    this.byte(this.pos) !== 0x0a &&
+                    this.byte(this.pos) !== 0x0d) {
+                    this.pos++;
+                }
+                continue;
+            }
+            return;
+        }
+    }
+    readToken() {
+        this.skipWhitespace();
+        const start = this.pos;
+        while (this.pos < this.data.length && isRegular(this.byte(this.pos))) {
+            this.pos++;
+        }
+        if (this.pos === start) {
+            this.fail("pdf_unexpected_byte", "Expected a PDF token (a number, keyword, name or delimiter) and found a " +
+                "delimiter or end of input instead. This usually means an offset in the " +
+                "cross-reference table points somewhere that is not the start of an object");
+        }
+        return latin1(this.data.subarray(start, this.pos));
+    }
+    peekByte() {
+        this.skipWhitespace();
+        return this.byte(this.pos);
+    }
+    /** Parse one object. `depth` bounds array/dict nesting. */
+    parseObject(depth = 0) {
+        if (++this.budget.nodes > this.limits.maxObjectNodes) {
+            throw new PdfSecurityError("pdf_too_many_object_nodes", `Parsing this document produced more than ${this.limits.maxObjectNodes} values ` +
+                `(array elements, dictionary entries, numbers). A byte cap does not bound this: ` +
+                `four megabytes of "0 0 0 …" inside one object stream costs tens of megabytes of ` +
+                `heap once parsed, because a parsed value is far larger than the byte it came from.`);
+        }
+        if (depth > this.limits.maxObjectDepth) {
+            throw new PdfSecurityError("pdf_object_too_deep", `Arrays and dictionaries nest more than ${this.limits.maxObjectDepth} deep. ` +
+                `Refusing rather than recursing.`);
+        }
+        this.skipWhitespace();
+        if (this.pos >= this.data.length) {
+            this.fail("pdf_truncated", "The file ends where an indirect object was expected. It was truncated in " +
+                "transit, or the cross-reference table points past the end of the data");
+        }
+        const byte = this.byte(this.pos);
+        if (byte === 0x2f)
+            return this.parseName();
+        if (byte === 0x28)
+            return this.parseLiteralString();
+        if (byte === 0x5b)
+            return this.parseArray(depth);
+        if (byte === 0x3c) {
+            if (this.byte(this.pos + 1) === 0x3c)
+                return this.parseDictOrStream(depth);
+            return this.parseHexString();
+        }
+        if (byte === 0x5d || byte === 0x3e) {
+            this.fail("pdf_unexpected_byte", "Found an array or dictionary close with no matching open. The object " +
+                "structure is corrupt, or an offset points into the middle of one");
+        }
+        const token = this.readToken();
+        if (token === "true")
+            return true;
+        if (token === "false")
+            return false;
+        if (token === "null")
+            return null;
+        if (/^[+-]?[\d.]+$/.test(token)) {
+            // Possible "N G R" indirect reference — look ahead, and rewind if not.
+            if (/^\d+$/.test(token)) {
+                const save = this.pos;
+                this.skipWhitespace();
+                const genStart = this.pos;
+                if (this.pos < this.data.length && /\d/.test(String.fromCharCode(this.byte(this.pos)))) {
+                    const gen = this.readToken();
+                    this.skipWhitespace();
+                    if (/^\d+$/.test(gen) && this.byte(this.pos) === 0x52 /* R */) {
+                        this.pos++;
+                        return new PdfRef(Number(token), Number(gen));
+                    }
+                }
+                this.pos = save;
+                void genStart;
+            }
+            const value = Number(token);
+            if (Number.isNaN(value)) {
+                this.fail("pdf_bad_number", `"${token}" appears where a number was expected and cannot be read as one`);
+            }
+            return value;
+        }
+        this.fail("pdf_unexpected_token", `Unexpected token "${token}". This is not a PDF object: the reader expected a ` +
+            `number, name, string, array, dictionary, or one of true/false/null`);
+    }
+    parseName() {
+        this.pos++; // slash
+        let name = "";
+        while (this.pos < this.data.length && isRegular(this.byte(this.pos))) {
+            const byte = this.byte(this.pos);
+            if (byte === 0x23 && this.pos + 2 < this.data.length) {
+                const hex = latin1(this.data.subarray(this.pos + 1, this.pos + 3));
+                if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+                    name += String.fromCharCode(parseInt(hex, 16));
+                    this.pos += 3;
+                    continue;
+                }
+            }
+            name += String.fromCharCode(byte);
+            this.pos++;
+        }
+        return new PdfName(name);
+    }
+    parseLiteralString() {
+        this.pos++; // (
+        let depth = 1;
+        let out = "";
+        while (this.pos < this.data.length) {
+            const byte = this.byte(this.pos++);
+            if (byte === 0x5c) {
+                const next = this.byte(this.pos++);
+                switch (next) {
+                    case 0x6e:
+                        out += "\n";
+                        break;
+                    case 0x72:
+                        out += "\r";
+                        break;
+                    case 0x74:
+                        out += "\t";
+                        break;
+                    case 0x62:
+                        out += "\b";
+                        break;
+                    case 0x66:
+                        out += "\f";
+                        break;
+                    case 0x0a: break;
+                    case 0x0d:
+                        if (this.byte(this.pos) === 0x0a)
+                            this.pos++;
+                        break;
+                    default:
+                        if (next >= 0x30 && next <= 0x37) {
+                            let octal = String.fromCharCode(next);
+                            for (let i = 0; i < 2; i++) {
+                                const d = this.byte(this.pos);
+                                if (d >= 0x30 && d <= 0x37) {
+                                    octal += String.fromCharCode(d);
+                                    this.pos++;
+                                }
+                            }
+                            out += String.fromCharCode(parseInt(octal, 8) & 0xff);
+                        }
+                        else {
+                            out += String.fromCharCode(next);
+                        }
+                }
+                continue;
+            }
+            if (byte === 0x28)
+                depth++;
+            if (byte === 0x29) {
+                depth--;
+                if (depth === 0)
+                    return out;
+            }
+            out += String.fromCharCode(byte);
+        }
+        this.fail("pdf_truncated", "A literal string is never closed");
+    }
+    parseHexString() {
+        this.pos++; // <
+        let hex = "";
+        while (this.pos < this.data.length && this.byte(this.pos) !== 0x3e) {
+            const ch = String.fromCharCode(this.byte(this.pos++));
+            if (/[0-9a-fA-F]/.test(ch))
+                hex += ch;
+        }
+        if (this.pos >= this.data.length) {
+            this.fail("pdf_truncated", "A hexadecimal <…> string is opened and never closed before the end of the file");
+        }
+        this.pos++; // >
+        if (hex.length % 2 === 1)
+            hex += "0";
+        let out = "";
+        for (let i = 0; i < hex.length; i += 2) {
+            out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+        }
+        return out;
+    }
+    parseArray(depth) {
+        this.pos++; // [
+        const items = [];
+        for (;;) {
+            this.skipWhitespace();
+            if (this.pos >= this.data.length) {
+                this.fail("pdf_truncated", "An array is opened and never closed before the end of the file");
+            }
+            if (this.byte(this.pos) === 0x5d) {
+                this.pos++;
+                return items;
+            }
+            items.push(this.parseObject(depth + 1));
+        }
+    }
+    parseDictOrStream(depth) {
+        this.pos += 2; // <<
+        const dict = new Map();
+        for (;;) {
+            this.skipWhitespace();
+            if (this.pos + 1 < this.data.length && this.byte(this.pos) === 0x3e && this.byte(this.pos + 1) === 0x3e) {
+                this.pos += 2;
+                break;
+            }
+            if (this.pos >= this.data.length) {
+                this.fail("pdf_truncated", "A dictionary is opened and never closed before the end of the file");
+            }
+            if (this.byte(this.pos) !== 0x2f) {
+                this.fail("pdf_bad_dict_key", "A dictionary key is not a /Name. Every key in a PDF dictionary must begin " +
+                    "with a slash, so the bytes here are not a dictionary");
+            }
+            const key = this.parseName().name;
+            dict.set(key, this.parseObject(depth + 1));
+        }
+        const save = this.pos;
+        this.skipWhitespace();
+        if (latin1(this.data.subarray(this.pos, this.pos + 6)) === "stream") {
+            this.pos += 6;
+            if (this.byte(this.pos) === 0x0d)
+                this.pos++;
+            if (this.byte(this.pos) === 0x0a)
+                this.pos++;
+            const start = this.pos;
+            const declared = dict.get("Length");
+            let end;
+            if (typeof declared === "number" && start + declared <= this.data.length) {
+                end = start + declared;
+                // Trust but verify: `endstream` should follow. Producers get Length
+                // wrong often enough that scanning is the safer primary.
+                const after = latin1(this.data.subarray(end, end + 20));
+                if (!/^\s*endstream/.test(after)) {
+                    end = this.findEndstream(start);
+                }
+            }
+            else {
+                end = this.findEndstream(start);
+            }
+            this.pos = end;
+            this.skipWhitespace();
+            if (latin1(this.data.subarray(this.pos, this.pos + 9)) === "endstream") {
+                this.pos += 9;
+            }
+            return new PdfStream(dict, this.data.subarray(start, end));
+        }
+        this.pos = save;
+        return dict;
+    }
+    findEndstream(start) {
+        const needle = "endstream";
+        for (let i = start; i <= this.data.length - needle.length; i++) {
+            if (this.byte(i) !== 0x65)
+                continue;
+            if (latin1(this.data.subarray(i, i + needle.length)) === needle) {
+                let end = i;
+                if (end > start && this.byte(end - 1) === 0x0a)
+                    end--;
+                if (end > start && this.byte(end - 1) === 0x0d)
+                    end--;
+                return end;
+            }
+        }
+        throw new PdfParseError("pdf_truncated", `A stream beginning at byte ${start} is never terminated by "endstream".`);
+    }
+}
+class PdfDocument {
+    data;
+    limits;
+    entries = new Map();
+    cache = new Map();
+    objStmCache = new Map();
+    resolvedCount = 0;
+    inflatedTotal = 0;
+    /** Every xref offset already read, shared by the /Prev loop and /XRefStm. */
+    seenXrefOffsets = new Set();
+    /** One parsed-value budget for the whole document, shared by every lexer. */
+    nodeBudget = { nodes: 0 };
+    trailer = new Map();
+    constructor(data, limits) {
+        this.data = data;
+        this.limits = limits;
+        this.readXrefChain();
+    }
+    /**
+     * One byte, or `-1` past the end.
+     *
+     * Every read goes through here so that running off the end of the buffer is a
+     * value the comparisons below already handle rather than an `undefined` that
+     * turns into a `NaN` three lines later. `-1` is not a byte, so no equality
+     * test against a real character can accidentally match it.
+     */
+    byte(at) {
+        const value = this.data[at];
+        return value === undefined ? -1 : value;
+    }
+    lexer(at) {
+        const lexer = new Lexer(this.data, this.limits, this.nodeBudget);
+        lexer.pos = at;
+        return lexer;
+    }
+    readXrefChain() {
+        const tail = latin1(this.data.subarray(Math.max(0, this.data.length - 2048)));
+        const marker = tail.lastIndexOf("startxref");
+        if (marker === -1) {
+            throw new PdfParseError("pdf_no_startxref", "No `startxref` keyword in the last 2 KiB of the file. Either this is not a PDF, " +
+                "or it was truncated in transit — a complete PDF always ends with startxref and %%EOF.");
+        }
+        const offsetText = /startxref\s+(\d+)/.exec(tail.slice(marker));
+        if (!offsetText) {
+            throw new PdfParseError("pdf_bad_startxref", "The `startxref` keyword is not followed by a byte offset.");
+        }
+        let next = Number(offsetText[1]);
+        const seen = this.seenXrefOffsets;
+        let sections = 0;
+        while (next !== undefined) {
+            if (seen.has(next)) {
+                throw new PdfParseError("pdf_xref_loop", `The cross-reference chain revisits byte ${next}, so it is a loop. ` +
+                    `Refusing rather than following it forever.`);
+            }
+            seen.add(next);
+            if (++sections > this.limits.maxXrefSections) {
+                throw new PdfSecurityError("pdf_xref_chain_too_long", `The cross-reference chain is longer than ${this.limits.maxXrefSections} sections.`);
+            }
+            if (next < 0 || next >= this.data.length) {
+                throw new PdfParseError("pdf_bad_xref_offset", `A cross-reference section claims to start at byte ${next}, outside a ` +
+                    `${this.data.length}-byte file.`);
+            }
+            next = this.readXrefSection(next);
+        }
+        if (!this.trailer.has("Root")) {
+            throw new PdfParseError("pdf_no_root", "No /Root entry in any trailer, so the document catalog cannot be found.");
+        }
+    }
+    /** Reads one section and returns its `/Prev` offset, if any. */
+    readXrefSection(offset) {
+        const lexer = this.lexer(offset);
+        lexer.skipWhitespace();
+        if (latin1(this.data.subarray(lexer.pos, lexer.pos + 4)) === "xref") {
+            lexer.pos += 4;
+            // Classic table: repeated "start count" subsections of 20-byte entries.
+            for (;;) {
+                lexer.skipWhitespace();
+                if (latin1(this.data.subarray(lexer.pos, lexer.pos + 7)) === "trailer") {
+                    lexer.pos += 7;
+                    break;
+                }
+                const start = lexer.readToken();
+                const count = lexer.readToken();
+                if (!/^\d+$/.test(start) || !/^\d+$/.test(count)) {
+                    throw new PdfParseError("pdf_bad_xref_table", `A cross-reference subsection header reads "${start} ${count}", which is not two integers.`);
+                }
+                const first = Number(start);
+                const total = Number(count);
+                if (total > this.limits.maxObjects) {
+                    throw new PdfSecurityError("pdf_too_many_objects", `A cross-reference subsection declares ${total} entries, over the ` +
+                        `${this.limits.maxObjects} limit.`);
+                }
+                for (let i = 0; i < total; i++) {
+                    lexer.skipWhitespace();
+                    const entryStart = lexer.pos;
+                    const entry = latin1(this.data.subarray(entryStart, entryStart + 20));
+                    const match = /^(\d{10})\s(\d{5})\s([nf])/.exec(entry);
+                    if (!match) {
+                        throw new PdfParseError("pdf_bad_xref_table", `Cross-reference entry ${first + i} at byte ${entryStart} is malformed.`);
+                    }
+                    lexer.pos = entryStart + (entry[19] === "\n" || entry[19] === "\r" ? 20 : 19);
+                    if (match[3] === "n" && !this.entries.has(first + i)) {
+                        this.entries.set(first + i, { offset: Number(match[1]) });
+                    }
+                }
+            }
+            const trailer = lexer.parseObject();
+            if (!(trailer instanceof Map)) {
+                throw new PdfParseError("pdf_bad_trailer", "The `trailer` keyword is not followed by a dictionary.");
+            }
+            for (const [key, value] of trailer) {
+                if (!this.trailer.has(key))
+                    this.trailer.set(key, value);
+            }
+            // A hybrid file points at a parallel xref stream; read it for the
+            // entries the table omits.
+            // A hybrid file's /XRefStm is followed by a direct recursive call, so it
+            // does not pass through the loop guard in readXrefChain. Without its own
+            // check, a table whose /XRefStm names its own offset recurses until the
+            // stack gives out — caught below, but only by accident, and only after
+            // re-parsing the whole table once per frame.
+            const xrefStm = trailer.get("XRefStm");
+            if (typeof xrefStm === "number" &&
+                !this.seenXrefOffsets.has(xrefStm) &&
+                xrefStm >= 0 &&
+                xrefStm < this.data.length) {
+                this.seenXrefOffsets.add(xrefStm);
+                try {
+                    this.readXrefSection(xrefStm);
+                }
+                catch {
+                    // A broken /XRefStm in a hybrid file is recoverable: the classic
+                    // table we just read is authoritative for every object it lists.
+                }
+            }
+            const prev = trailer.get("Prev");
+            return typeof prev === "number" ? prev : undefined;
+        }
+        // Cross-reference stream: "N G obj <<...>> stream".
+        lexer.readToken(); // object number
+        lexer.readToken(); // generation
+        const keyword = lexer.readToken();
+        if (keyword !== "obj") {
+            throw new PdfParseError("pdf_bad_xref_offset", `Byte ${offset} is neither an \`xref\` table nor an indirect object, so it ` +
+                `cannot be a cross-reference section.`);
+        }
+        const stream = lexer.parseObject();
+        if (!(stream instanceof PdfStream)) {
+            throw new PdfParseError("pdf_bad_xref_stream", `The object at byte ${offset} is not a stream, so it cannot be a cross-reference stream.`);
+        }
+        this.readXrefStream(stream);
+        for (const [key, value] of stream.dict) {
+            if (!this.trailer.has(key))
+                this.trailer.set(key, value);
+        }
+        const prev = stream.dict.get("Prev");
+        return typeof prev === "number" ? prev : undefined;
+    }
+    readXrefStream(stream) {
+        const data = this.decodeStream(stream);
+        const w = stream.dict.get("W");
+        if (!Array.isArray(w) || w.length < 3) {
+            throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream has no usable /W field-width array.");
+        }
+        const widths = w.map((n) => (typeof n === "number" ? n : 0));
+        const rowLength = widths.reduce((a, b) => a + b, 0);
+        if (rowLength === 0) {
+            throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream declares zero-width fields.");
+        }
+        const size = stream.dict.get("Size");
+        let index = stream.dict.get("Index");
+        if (!Array.isArray(index)) {
+            index = [0, typeof size === "number" ? size : 0];
+        }
+        let pos = 0;
+        for (let pair = 0; pair + 1 < index.length; pair += 2) {
+            const first = Number(index[pair]);
+            const count = Number(index[pair + 1]);
+            if (!Number.isFinite(first) || !Number.isFinite(count) || count < 0) {
+                throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream's /Index is not a list of integer pairs.");
+            }
+            if (count > this.limits.maxObjects) {
+                throw new PdfSecurityError("pdf_too_many_objects", `A cross-reference stream declares ${count} entries, over the ${this.limits.maxObjects} limit.`);
+            }
+            for (let i = 0; i < count; i++) {
+                if (pos + rowLength > data.length)
+                    return; // truncated tail: keep what parsed
+                const fields = [];
+                for (const width of widths) {
+                    let value = 0;
+                    for (let b = 0; b < width; b++) {
+                        value = value * 256 + data[pos++];
+                    }
+                    fields.push(value);
+                }
+                const type = widths[0] === 0 ? 1 : fields[0];
+                const num = first + i;
+                if (this.entries.has(num))
+                    continue;
+                if (type === 1) {
+                    this.entries.set(num, { offset: fields[1] });
+                }
+                else if (type === 2) {
+                    this.entries.set(num, {
+                        objStm: { num: fields[1], index: fields[2] },
+                    });
+                }
+            }
+        }
+    }
+    /** Applies filters. Only FlateDecode (optionally PNG-predicted) is implemented. */
+    decodeStream(stream) {
+        const filter = this.resolve(stream.dict.get("Filter") ?? null);
+        const filters = filter instanceof PdfName
+            ? [filter]
+            : Array.isArray(filter)
+                ? filter.filter((f) => f instanceof PdfName)
+                : [];
+        let data = stream.raw;
+        for (const f of filters) {
+            if (f.name === "FlateDecode" || f.name === "Fl") {
+                // The document-wide budget is folded into the per-stream cap rather
+                // than checked afterwards, so a stream that would exhaust it stops
+                // inflating at the boundary instead of allocating past it first.
+                const remaining = Math.max(0, this.limits.maxTotalInflatedBytes - this.inflatedTotal);
+                const perStream = Math.min(this.limits.maxStreamBytes, Math.max(4096, data.length * this.limits.maxCompressionRatio));
+                const cap = Math.min(perStream, remaining);
+                const budgetBound = remaining < perStream;
+                const exhausted = () => {
+                    throw new PdfSecurityError("pdf_total_inflated_too_large", `The streams in this document inflate to more than the ` +
+                        `${this.limits.maxTotalInflatedBytes}-byte document-wide limit. One stream may sit ` +
+                        `under maxStreamBytes and a hundred of them still not; raise ` +
+                        `maxTotalInflatedBytes if the document really is this large.`);
+                };
+                if (cap === 0)
+                    exhausted();
+                try {
+                    data = inflate(data, cap);
+                }
+                catch (error) {
+                    if (budgetBound &&
+                        error instanceof PdfSecurityError &&
+                        error.code === "pdf_stream_too_large") {
+                        exhausted();
+                    }
+                    throw error;
+                }
+                this.inflatedTotal += data.length;
+            }
+            else if (f.name === "Crypt") {
+                throw new PdfUnsupportedFilterError("Crypt", "The document appears to be encrypted.");
+            }
+            else {
+                throw new PdfUnsupportedFilterError(f.name);
+            }
+        }
+        const parms = this.resolve(stream.dict.get("DecodeParms") ?? stream.dict.get("DP") ?? null);
+        // `find` returns the *element*, which in an array-valued /DecodeParms is
+        // routinely an indirect reference. Resolving after the search — as this
+        // used to — hands a PdfRef to code that then calls `.get` on it.
+        const parmDict = parms instanceof Map
+            ? parms
+            : Array.isArray(parms)
+                ? parms
+                    .map((p) => this.resolve(p))
+                    .find((p) => p instanceof Map)
+                : undefined;
+        if (parmDict) {
+            const predictor = Number(this.resolve(parmDict.get("Predictor") ?? 1));
+            if (predictor >= 10) {
+                data = applyPngPredictor(data, Number(this.resolve(parmDict.get("Colors") ?? 1)) || 1, Number(this.resolve(parmDict.get("BitsPerComponent") ?? 8)) || 8, Number(this.resolve(parmDict.get("Columns") ?? 1)) || 1);
+            }
+            else if (predictor === 2) {
+                throw new PdfUnsupportedFilterError("TIFF predictor 2", "It does not occur in Factur-X files.");
+            }
+        }
+        return data;
+    }
+    /** One dereference step. Non-references pass through. */
+    resolve(object) {
+        let current = object;
+        let hops = 0;
+        while (current instanceof PdfRef) {
+            if (++hops > 32) {
+                throw new PdfParseError("pdf_reference_loop", "An indirect reference chain is more than 32 hops long, so it is a loop.");
+            }
+            current = this.getObject(current.num);
+        }
+        return current;
+    }
+    getObject(num) {
+        const cached = this.cache.get(num);
+        if (cached !== undefined)
+            return cached;
+        if (++this.resolvedCount > this.limits.maxObjects) {
+            throw new PdfSecurityError("pdf_too_many_objects", `Resolving this document needed more than ${this.limits.maxObjects} objects.`);
+        }
+        const entry = this.entries.get(num);
+        if (!entry) {
+            throw new PdfParseError("pdf_missing_object", `Object ${num} is referenced but the cross-reference table does not list it.`);
+        }
+        let value;
+        if (entry.objStm) {
+            value = this.getFromObjectStream(entry.objStm.num, entry.objStm.index, num);
+        }
+        else {
+            const offset = entry.offset ?? -1;
+            if (offset < 0 || offset >= this.data.length) {
+                throw new PdfParseError("pdf_bad_object_offset", `Object ${num} is listed at byte ${offset}, outside a ${this.data.length}-byte file.`);
+            }
+            const lexer = this.lexer(offset);
+            const declaredNum = lexer.readToken();
+            lexer.readToken();
+            const keyword = lexer.readToken();
+            if (keyword !== "obj") {
+                throw new PdfParseError("pdf_bad_object_header", `Byte ${offset} should begin object ${num} but reads "${declaredNum} … ${keyword}".`);
+            }
+            value = lexer.parseObject();
+        }
+        this.cache.set(num, value);
+        return value;
+    }
+    getFromObjectStream(stmNum, index, wantedNum) {
+        let parsed = this.objStmCache.get(stmNum);
+        if (!parsed) {
+            const entry = this.entries.get(stmNum);
+            if (entry?.objStm) {
+                // An object stream inside an object stream is forbidden by the spec
+                // (ISO 32000-1 §7.5.7) and is the shape a recursive-decompression
+                // attack takes, so it is refused by name rather than by depth counter.
+                throw new PdfParseError("pdf_nested_object_stream", `Object stream ${stmNum} is itself stored inside an object stream. The PDF ` +
+                    `specification forbids that, and following it is how a decompression loop starts.`);
+            }
+            const stream = this.resolve(new PdfRef(stmNum, 0));
+            if (!(stream instanceof PdfStream)) {
+                throw new PdfParseError("pdf_bad_object_stream", `Object ${stmNum} is referenced as an object stream but is not a stream.`);
+            }
+            const data = this.decodeStream(stream);
+            const count = Number(this.resolve(stream.dict.get("N") ?? 0));
+            const first = Number(this.resolve(stream.dict.get("First") ?? 0));
+            if (!Number.isFinite(count) || !Number.isFinite(first) || count < 0) {
+                throw new PdfParseError("pdf_bad_object_stream", `Object stream ${stmNum} has no usable /N and /First.`);
+            }
+            if (count > this.limits.maxObjects) {
+                throw new PdfSecurityError("pdf_too_many_objects", `Object stream ${stmNum} declares ${count} objects, over the ${this.limits.maxObjects} limit.`);
+            }
+            const header = new Lexer(data, this.limits, this.nodeBudget);
+            const pairs = [];
+            for (let i = 0; i < count; i++) {
+                const objNum = Number(header.readToken());
+                const objOff = Number(header.readToken());
+                if (!Number.isFinite(objNum) || !Number.isFinite(objOff)) {
+                    throw new PdfParseError("pdf_bad_object_stream", `Object stream ${stmNum} has a malformed offset table.`);
+                }
+                pairs.push([objNum, objOff]);
+            }
+            parsed = new Map();
+            for (const [objNum, objOff] of pairs) {
+                const at = first + objOff;
+                if (at < 0 || at >= data.length)
+                    continue;
+                const lexer = new Lexer(data, this.limits, this.nodeBudget);
+                lexer.pos = at;
+                try {
+                    parsed.set(objNum, lexer.parseObject());
+                }
+                catch (error) {
+                    // One unreadable member does not condemn the rest of the stream —
+                    // but a *limit* is not an unreadable member. Swallowing it here let
+                    // a member large enough to blow the parsed-value budget be retried
+                    // as the next member, and the next, with the budget already spent.
+                    if (error instanceof PdfSecurityError)
+                        throw error;
+                }
+            }
+            this.objStmCache.set(stmNum, parsed);
+        }
+        void index;
+        const value = parsed.get(wantedNum);
+        if (value === undefined) {
+            throw new PdfParseError("pdf_missing_object", `Object ${wantedNum} is listed as living in object stream ${stmNum}, which does not contain it.`);
+        }
+        return value;
+    }
+    dictGet(dict, key) {
+        return this.resolve(dict.get(key) ?? null);
+    }
+}
+/**
+ * Undo the PNG row filters a cross-reference stream is normally written with.
+ *
+ * The three parameters come out of a dictionary an attacker writes, so they are
+ * checked before they reach arithmetic. `/Columns -5` used to produce a
+ * negative row length and a bare `RangeError: Invalid typed array length` from
+ * `new Uint8Array(-25)`, and `/Columns 600000000` used to commit a 600 MB
+ * allocation for a row buffer no byte of the stream could ever fill.
+ */
+function applyPngPredictor(data, colors, bits, columns) {
+    if (data.length === 0)
+        return data;
+    const sane = (value, name, max) => {
+        if (!Number.isInteger(value) || value < 1 || value > max) {
+            throw new PdfParseError("pdf_bad_predictor_parms", `A stream's predictor declares /${name} ${value}, which is not a positive ` +
+                `integer no larger than ${max}. Predictor parameters are read from the ` +
+                `document, so an impossible one is refused rather than turned into an ` +
+                `allocation size.`);
+        }
+        return value;
+    };
+    colors = sane(colors, "Colors", 32);
+    bits = sane(bits, "BitsPerComponent", 32);
+    // A row cannot be longer than the data it is filtered out of: every row costs
+    // at least its own length plus a filter byte, so a larger /Columns describes
+    // rows that cannot exist and must not be allocated for.
+    columns = sane(columns, "Columns", Math.max(1, data.length));
+    const bpp = Math.max(1, Math.ceil((colors * bits) / 8));
+    const rowLength = Math.ceil((colors * bits * columns) / 8);
+    // No complete row fits, so there is nothing to unfilter — and in particular
+    // no reason to allocate a row buffer of that size.
+    if (rowLength + 1 > data.length)
+        return new Uint8Array(0);
+    const rows = Math.floor(data.length / (rowLength + 1));
+    const out = new Uint8Array(rows * rowLength);
+    let prev = new Uint8Array(rowLength);
+    for (let r = 0; r < rows; r++) {
+        const filter = data[r * (rowLength + 1)];
+        const row = data.subarray(r * (rowLength + 1) + 1, r * (rowLength + 1) + 1 + rowLength);
+        const current = new Uint8Array(row);
+        for (let i = 0; i < rowLength; i++) {
+            const left = i >= bpp ? current[i - bpp] : 0;
+            const up = prev[i];
+            const upLeft = i >= bpp ? prev[i - bpp] : 0;
+            switch (filter) {
+                case 0: break;
+                case 1:
+                    current[i] = (current[i] + left) & 0xff;
+                    break;
+                case 2:
+                    current[i] = (current[i] + up) & 0xff;
+                    break;
+                case 3:
+                    current[i] = (current[i] + ((left + up) >> 1)) & 0xff;
+                    break;
+                case 4: {
+                    const p = left + up - upLeft;
+                    const pa = Math.abs(p - left);
+                    const pb = Math.abs(p - up);
+                    const pc = Math.abs(p - upLeft);
+                    const best = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+                    current[i] = (current[i] + best) & 0xff;
+                    break;
+                }
+                default:
+                    throw new PdfParseError("pdf_bad_predictor", `A stream uses PNG row filter ${filter}, which is not one of the five defined.`);
+            }
+        }
+        out.set(current, r * rowLength);
+        prev = current;
+    }
+    return out;
+}
+// ---------------------------------------------------------------------------
+// Finding the attachment
+// ---------------------------------------------------------------------------
+/**
+ * The filenames the standards mandate, best first.
+ *
+ * `factur-x.xml` is the Factur-X / ZUGFeRD 2.x name, `zugferd-invoice.xml` the
+ * ZUGFeRD 1.0 one, and `xrechnung.xml` the name the XRECHNUNG reference profile
+ * uses. Any other `.xml` attachment is accepted with a warning rather than
+ * refused: a file that carries exactly one XML attachment under a house name is
+ * still a file whose invoice we can read, and refusing it would help nobody.
+ */
+const PREFERRED_NAMES = ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"];
+/**
+ * One `/Filespec` → a candidate, or `undefined` if it does not resolve to one.
+ *
+ * Resolution failures are swallowed deliberately. A PDF may list several
+ * attachments, and one dangling reference must not stop the others being
+ * found — the caller's question is "is there an invoice in here", and the
+ * honest answer to a file with one broken entry and one good one is the good
+ * one. When *every* entry fails, the caller gets `FacturXNotFoundError`, which
+ * says what was actually observed, rather than an object-numbering error that
+ * only a PDF implementer could act on.
+ */
+function fileSpecCandidate(doc, spec, source) {
+    try {
+        return fileSpecCandidateStrict(doc, spec, source);
+    }
+    catch (error) {
+        if (error instanceof PdfSecurityError)
+            throw error; // a limit still stops us
+        return undefined;
+    }
+}
+function fileSpecCandidateStrict(doc, spec, source) {
+    const dict = doc.resolve(spec);
+    if (!(dict instanceof Map))
+        return undefined;
+    const ef = doc.dictGet(dict, "EF");
+    if (!(ef instanceof Map))
+        return undefined;
+    // Each key in turn, not the first key that is *present*: a file whose /F is a
+    // dangling reference and whose /UF is good is a file whose attachment we can
+    // still return, and stopping at /F would have thrown that away.
+    let stream = null;
+    for (const key of ["F", "UF", "DOS", "Mac", "Unix"]) {
+        if (!ef.has(key))
+            continue;
+        let resolved;
+        try {
+            resolved = doc.resolve(ef.get(key) ?? null);
+        }
+        catch (error) {
+            if (error instanceof PdfSecurityError)
+                throw error;
             continue;
         }
-        const frame = { el, nsMap, counts: new Map(), text: [] };
-        stack.push(frame);
-        // Defence: nesting depth cap. Without it, a few kilobytes of open tags
-        // build a tree hundreds of thousands of levels deep and any recursive
-        // consumer of it overflows the stack.
-        if (stack.length > lim.maxDepth) {
-            throw new XmlSecurityError("xml_too_deep", `The document nests more than ${lim.maxDepth} elements deep. A UBL invoice ` +
-                `nests about eight levels; a document this deep is either broken or ` +
-                `hostile. Raise the maxDepth option only if you know why it is that deep.`);
+        if (resolved instanceof PdfStream) {
+            stream = resolved;
+            break;
         }
     }
-    if (stack.length > 0) {
-        throw new XmlSyntaxError("xml_unbalanced", `The document ends while <${stack[stack.length - 1].el.qname}> is still open.`);
-    }
-    if (!root) {
-        throw new XmlSyntaxError("xml_no_root", "The document contains no root element.");
-    }
-    return root;
+    if (!(stream instanceof PdfStream))
+        return undefined;
+    // /UF first — it is the Unicode one, and the one PDF 2.0 prefers — but fall
+    // through to /F when /UF is absent or is not a string at all.
+    const rawName = [doc.dictGet(dict, "UF"), doc.dictGet(dict, "F")].find((v) => typeof v === "string");
+    const name = rawName === undefined ? undefined : decodePdfTextString(rawName);
+    const relationship = doc.dictGet(dict, "AFRelationship");
+    const subtype = doc.dictGet(stream.dict, "Subtype");
+    return {
+        name: (name ?? "").replace(/^.*[\\/]/, ""),
+        stream,
+        source,
+        relationship: relationship instanceof PdfName ? relationship.name : undefined,
+        subtype: subtype instanceof PdfName ? subtype.name : undefined,
+    };
 }
-function closeFrame(frame) {
-    const text = frame.text.join("");
-    if (frame.el.children.length > 0) {
-        if (text.trim() !== "") {
-            throw new XmlSyntaxError("xml_mixed_content", `<${frame.el.qname}> holds both child elements and text ("${text.trim().slice(0, 40)}"). ` +
-                `UBL never mixes the two, so this parser refuses the document rather than ` +
-                `guessing which of the two carries the value.`);
-        }
-        frame.el.text = "";
+/**
+ * Walk the EmbeddedFiles name tree, bounded in depth *and* in total nodes.
+ *
+ * The depth cap alone is not a bound. Thirty dictionaries in a chain, each
+ * naming the next one twice in its `/Kids`, never exceed depth thirty and
+ * describe 2³⁰ paths; because `getObject` caches, the file that says so is
+ * about a kilobyte. Measured before this counter existed, depth 28 took 13.5
+ * seconds and depth 40 would not have finished. `visited` handles the honest
+ * half of the same shape — a diamond, where one node is legitimately reachable
+ * by two routes — and the counter catches everything else.
+ */
+function walkNameTree(doc, node, out, depth, state = { nodes: 0, visited: new Set(), path: new Set() }) {
+    if (depth > doc.limits.maxNameTreeDepth) {
+        throw new PdfSecurityError("pdf_name_tree_too_deep", `The EmbeddedFiles name tree nests more than ${doc.limits.maxNameTreeDepth} levels deep.`);
+    }
+    if (++state.nodes > doc.limits.maxNameTreeNodes) {
+        throw new PdfSecurityError("pdf_name_tree_too_large", `The EmbeddedFiles name tree has more than ${doc.limits.maxNameTreeNodes} nodes. ` +
+            `A tree whose /Kids revisit each other describes exponentially many paths ` +
+            `through very few objects, so the node count is what bounds the walk, not the depth.`);
+    }
+    const dict = doc.resolve(node);
+    if (!(dict instanceof Map))
         return;
+    // Reached again from a *different* branch — a diamond. Its subtree is already
+    // collected, so walking it again can only duplicate candidates and multiply
+    // the work; this is the prune that turns 2^30 paths back into 30 nodes.
+    //
+    // Reached again from *within itself* is a different thing: a cycle, which is
+    // a corrupt file rather than a redundant one. That case deliberately falls
+    // through to the depth counter, so it is still reported as the structural
+    // defect it is instead of being quietly read as an empty tree.
+    if (state.visited.has(dict) && !state.path.has(dict))
+        return;
+    state.visited.add(dict);
+    state.path.add(dict);
+    const names = doc.dictGet(dict, "Names");
+    if (Array.isArray(names)) {
+        for (let i = 0; i + 1 < names.length; i += 2) {
+            const key = doc.resolve(names[i]);
+            const candidate = fileSpecCandidate(doc, names[i + 1], "name-tree");
+            if (candidate) {
+                if (!candidate.name && typeof key === "string") {
+                    candidate.name = decodePdfTextString(key);
+                }
+                out.push(candidate);
+            }
+        }
     }
-    frame.el.text = text;
+    const kids = doc.dictGet(dict, "Kids");
+    if (Array.isArray(kids)) {
+        for (const kid of kids)
+            walkNameTree(doc, kid, out, depth + 1, state);
+    }
+    state.path.delete(dict);
+}
+function utf8(bytes) {
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 /**
- * The five predefined entities, and nothing else.
+ * Decode a PDF *text string* into real characters.
  *
- * Null-prototype on purpose. As an object literal this table also answered to
- * every member of `Object.prototype`: `&constructor;` resolved to the `Object`
- * constructor and was substituted into the document as the string
- * `"function Object() { [native code] }"`, so an invoice number written
- * `&constructor;` parsed, validated and was billed for without a single
- * finding. `&toString;`, `&valueOf;` and `&__proto__;` did the same. Every one
- * of those names is short enough to pass the length guard in `decodeEntities`.
+ * The lexer hands strings back one byte per code unit, which is right for the
+ * byte strings PDF uses for things like `/F`, and wrong for the text strings it
+ * uses for `/UF`. ISO 32000-1 §7.9.2.2 says a text string is either
+ * PDFDocEncoded or UTF-16BE introduced by a `FE FF` byte-order mark, and
+ * §7.9.2.2.1 of PDF 2.0 adds UTF-8 behind `EF BB BF`. Every Factur-X producer
+ * writes `/UF (þÿ\0f\0a\0c…)`, so skipping this step made the attachment name
+ * come back as `þÿ f a c t u r - x . x m l` — which does not match `/\.xml$/`,
+ * and the extractor reported a conformant file as carrying no XML at all.
+ *
+ * A string with no BOM is left alone: PDFDocEncoding agrees with Latin-1 over
+ * every character a filename realistically uses, and guessing beyond that would
+ * corrupt names this already reads correctly.
  */
-const PREDEFINED = Object.assign(Object.create(null), {
-    amp: "&",
-    lt: "<",
-    gt: ">",
-    quot: '"',
-    apos: "'",
-});
+function decodePdfTextString(value) {
+    if (value.charCodeAt(0) === 0xfe && value.charCodeAt(1) === 0xff) {
+        let out = "";
+        for (let i = 2; i + 1 < value.length; i += 2) {
+            out += String.fromCharCode((value.charCodeAt(i) << 8) | value.charCodeAt(i + 1));
+        }
+        return out;
+    }
+    // Not in the specification, but written by enough producers to be worth
+    // reading: the little-endian mark. Nothing legitimate starts `ÿþ` otherwise.
+    if (value.charCodeAt(0) === 0xff && value.charCodeAt(1) === 0xfe) {
+        let out = "";
+        for (let i = 2; i + 1 < value.length; i += 2) {
+            out += String.fromCharCode((value.charCodeAt(i + 1) << 8) | value.charCodeAt(i));
+        }
+        return out;
+    }
+    if (value.charCodeAt(0) === 0xef &&
+        value.charCodeAt(1) === 0xbb &&
+        value.charCodeAt(2) === 0xbf) {
+        const raw = new Uint8Array(value.length - 3);
+        for (let i = 3; i < value.length; i++)
+            raw[i - 3] = value.charCodeAt(i) & 0xff;
+        return utf8(raw);
+    }
+    return value;
+}
 /**
- * Decode the five predefined entities and numeric character references.
+ * Pull the invoice XML out of a Factur-X / ZUGFeRD / XRechnung-CII PDF.
  *
- * Every other entity reference is refused. Custom entities are what the
- * billion-laughs attack expands, and external entities are what XXE
- * dereferences; neither is decoded here, and neither is quietly dropped —
- * dropping one would change the text of a tax document without saying so.
+ * Extraction only — this never writes a PDF. The returned `xml` is the
+ * attachment's bytes decoded as UTF-8 and is suitable input for
+ * `parseCiiInvoice`.
  *
- * Numeric character references are safe to expand: each produces exactly one
- * character and cannot refer to another reference, so there is no expansion to
- * run away.
+ * Throws `FacturXNotFoundError` when the document carries no XML attachment,
+ * `PdfParseError` when the bytes are not a readable PDF, `PdfSecurityError`
+ * when a limit in `PdfLimits` is hit, and `PdfUnsupportedFilterError` for a
+ * compression filter this reader does not implement. It does not return a
+ * partial result and it does not throw anything else.
  */
-function decodeEntities(raw, where) {
-    let out = "";
-    let i = 0;
-    for (;;) {
-        const amp = raw.indexOf("&", i);
-        if (amp < 0) {
-            out += raw.slice(i);
-            return out;
-        }
-        out += raw.slice(i, amp);
-        const semi = raw.indexOf(";", amp + 1);
-        // A reference longer than this is not one of ours and not a code point.
-        if (semi < 0 || semi - amp > 12) {
-            throw new XmlSyntaxError("xml_bare_ampersand", `${where} contains a bare "&". In XML it must be written "&amp;".`);
-        }
-        const name = raw.slice(amp + 1, semi);
-        out += resolveEntity(name, where);
-        i = semi + 1;
+function extractFacturX(bytes, limits = {}) {
+    const lim = { ...DEFAULT_PDF_LIMITS, ...limits };
+    if (!(bytes instanceof Uint8Array)) {
+        throw new PdfParseError("pdf_not_bytes", "extractFacturX expects the PDF as a Uint8Array.");
     }
-}
-function resolveEntity(name, where) {
-    // Own-property check as well as the null prototype: two independent guards,
-    // because getting this wrong substitutes attacker-chosen text into a tax
-    // document without raising anything.
-    if (Object.hasOwn(PREDEFINED, name))
-        return PREDEFINED[name];
-    if (name.startsWith("#")) {
-        const hex = name[1] === "x" || name[1] === "X";
-        const digits = hex ? name.slice(2) : name.slice(1);
-        if (digits === "" || !/^[0-9a-fA-F]+$/.test(digits) || (!hex && !/^[0-9]+$/.test(digits))) {
-            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the malformed character reference "&${name};".`);
-        }
-        const code = Number.parseInt(digits, hex ? 16 : 10);
-        if (!Number.isFinite(code) ||
-            code > 0x10ffff ||
-            (code >= 0xd800 && code <= 0xdfff)) {
-            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the character reference "&${name};", which is not a ` +
-                `valid Unicode code point.`);
-        }
-        return String.fromCodePoint(code);
+    if (bytes.length === 0) {
+        throw new PdfParseError("pdf_empty", "The input is zero bytes long, so there is no PDF to read.");
     }
-    throw new XmlSecurityError("xml_entity_forbidden", `${where} refers to the entity "&${name};". Only the five predefined entities ` +
-        `(&amp; &lt; &gt; &quot; &apos;) and numeric character references are decoded. ` +
-        `Custom entities are refused because expanding them is how the billion-laughs ` +
-        `denial of service works, and because an external entity would read a local ` +
-        `file or make a network request (the XXE attack).`);
-}
-/** First child element with this namespace and local name. */
-function firstChild(el, namespace, local) {
-    return el.children.find((c) => c.local === local && c.namespace === namespace);
-}
-/** Every child element with this namespace and local name, in document order. */
-function childrenNamed(el, namespace, local) {
-    return el.children.filter((c) => c.local === local && c.namespace === namespace);
+    const header = latin1(bytes.subarray(0, 1024));
+    if (!header.startsWith("%PDF-") && !header.includes("%PDF-")) {
+        throw new PdfParseError("pdf_no_header", "The input does not begin with %PDF-. A Factur-X file is a PDF; if you have the " +
+            "XML on its own, pass it to parseCiiInvoice instead of this function.");
+    }
+    const warnings = [];
+    const doc = new PdfDocument(bytes, lim);
+    const root = doc.resolve(doc.trailer.get("Root") ?? null);
+    if (!(root instanceof Map)) {
+        throw new PdfParseError("pdf_no_catalog", "The /Root entry does not resolve to a document catalog dictionary.");
+    }
+    const candidates = [];
+    // 1. /Names /EmbeddedFiles — where the attachment is registered.
+    const names = doc.dictGet(root, "Names");
+    if (names instanceof Map) {
+        const embedded = doc.dictGet(names, "EmbeddedFiles");
+        if (embedded instanceof Map)
+            walkNameTree(doc, embedded, candidates, 0);
+    }
+    // 2. /AF — the PDF/A-3 associated-files array. Factur-X requires both, and
+    // a file that has only one of them still opens, so both are read.
+    const af = doc.dictGet(root, "AF");
+    if (Array.isArray(af)) {
+        for (const spec of af) {
+            const candidate = fileSpecCandidate(doc, spec, "AF");
+            if (candidate)
+                candidates.push(candidate);
+        }
+    }
+    if (candidates.length === 0) {
+        throw new FacturXNotFoundError("This PDF has no embedded files: neither a /Names /EmbeddedFiles name tree nor an " +
+            "/AF array names one. It is an ordinary PDF, not a Factur-X or ZUGFeRD file — " +
+            "the XML invoice is what makes it one, and there is no XML here.");
+    }
+    // Deduplicate: the same stream normally appears in both the name tree and
+    // /AF, which is correct and not worth a warning. Two *different* streams
+    // under one name is worth one.
+    const unique = [];
+    for (const candidate of candidates) {
+        const twin = unique.find((u) => u.name.toLowerCase() === candidate.name.toLowerCase());
+        if (!twin) {
+            unique.push(candidate);
+            continue;
+        }
+        if (twin.stream !== candidate.stream) {
+            warnings.push(`The name tree and the /AF array both name "${candidate.name}" but point at different ` +
+                `embedded streams. The name-tree copy was used. A conformant file has one attachment ` +
+                `referenced from both places.`);
+        }
+    }
+    const xmlCandidates = unique.filter((c) => /\.xml$/i.test(c.name));
+    if (xmlCandidates.length === 0) {
+        throw new FacturXNotFoundError(`This PDF has ${unique.length} embedded file(s) — ${unique
+            .map((c) => `"${c.name}"`)
+            .join(", ")} — and none of them is an .xml file. Factur-X and ZUGFeRD carry the ` +
+            `invoice as XML attached under factur-x.xml, zugferd-invoice.xml or xrechnung.xml.`);
+    }
+    const ranked = [...xmlCandidates].sort((a, b) => {
+        const ai = PREFERRED_NAMES.indexOf(a.name.toLowerCase());
+        const bi = PREFERRED_NAMES.indexOf(b.name.toLowerCase());
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    const chosen = ranked[0];
+    if (ranked.length > 1) {
+        warnings.push(`This PDF carries ${ranked.length} XML attachments (${ranked
+            .map((c) => `"${c.name}"`)
+            .join(", ")}). "${chosen.name}" was returned. A conformant Factur-X file has exactly one.`);
+    }
+    if (!PREFERRED_NAMES.includes(chosen.name.toLowerCase())) {
+        warnings.push(`The XML is attached as "${chosen.name}", which is not one of the standard names ` +
+            `(${PREFERRED_NAMES.join(", ")}). The XML was returned anyway, but a receiver that ` +
+            `looks the attachment up by name — as Factur-X readers are entitled to — will not find it.`);
+    }
+    if (chosen.relationship === undefined) {
+        warnings.push(`The attachment declares no /AFRelationship. PDF/A-3 requires one, and Germany requires ` +
+            `"Alternative" for the BASIC, EN 16931, EXTENDED and XRECHNUNG profiles.`);
+    }
+    else if (!["Alternative", "Data", "Source"].includes(chosen.relationship)) {
+        warnings.push(`The attachment declares /AFRelationship "${chosen.relationship}". Factur-X expects ` +
+            `"Alternative" (the XML and the page image are the same invoice).`);
+    }
+    if (chosen.subtype && !/xml/i.test(chosen.subtype)) {
+        warnings.push(`The embedded file's /Subtype is "${chosen.subtype}" rather than an XML media type.`);
+    }
+    const raw = doc.decodeStream(chosen.stream);
+    if (raw.length > lim.maxAttachmentBytes) {
+        throw new PdfSecurityError("pdf_attachment_too_large", `The embedded XML is ${raw.length} bytes, over the ${lim.maxAttachmentBytes}-byte limit. ` +
+            `Raise maxAttachmentBytes if an invoice this size is expected.`);
+    }
+    const xml = utf8(raw).replace(/^﻿/, "");
+    if (!/<[^>]*CrossIndustryInvoice/i.test(xml) && !/<\?xml/i.test(xml)) {
+        warnings.push(`The attachment "${chosen.name}" does not begin with an XML declaration and contains no ` +
+            `CrossIndustryInvoice element, so it may not be an invoice at all. It was returned ` +
+            `unchanged for you to inspect.`);
+    }
+    else if (!/CrossIndustryInvoice/i.test(xml)) {
+        warnings.push(`The attachment is XML but has no rsm:CrossIndustryInvoice root. Factur-X and ZUGFeRD 2.x ` +
+            `carry UN/CEFACT CII; this may be a ZUGFeRD 1.0 document or another syntax entirely.`);
+    }
+    return { xml, attachmentName: chosen.name, warnings };
 }
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/generate.js
@@ -64095,1480 +64987,592 @@ function generateCii(inv, options = {}) {
     return document(root, indent);
 }
 
-;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/facturx-pdf.js
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/locate.js
 /**
- * Reading the Factur-X / ZUGFeRD PDF container.
+ * Pointing a finding at the element in the caller's own file.
  *
- * **This reverses a documented invariant, deliberately and by half.** Every
- * previous release of this package said the PDF/A-3 container was neither read
- * nor built, and the generator doc-comments still say — correctly — that
- * `generateCii` emits the XML half only. As of 0.7.0 the container is *read*:
- * `extractFacturX` pulls the invoice XML out of a Factur-X, ZUGFeRD or
- * XRechnung-CII PDF so it can be parsed and validated by the rest of this
- * package. **It is still never built.** Writing a PDF/A-3 means font
- * embedding, colour profiles, XMP metadata and a conformance claim that a
- * validator will check, and shipping a half-conformant writer would produce
- * files that look like Factur-X and are not. Extraction has no such failure
- * mode: either the attachment is there and comes out byte-identical, or it is
- * not and this throws.
+ * The rules run over the input model, not over XML, so the `xpath` a rule
+ * writes is where the element sits in the document THIS LIBRARY would
+ * generate from that model: always UBL, always `ubl:`/`cac:`/`cbc:`, and with
+ * `[n]` counted the way the generator counts. That is a good address for "where
+ * does this go" and a poor one for "where is it in my file", in three ways:
  *
- * ## Zero dependencies, including the decompressor
+ *   1. A CII document has no `cac:` anything. Every UBL path on a Factur-X or
+ *      XRechnung CII finding pointed at nothing, and the command line dropped
+ *      them rather than print them wrong.
+ *   2. The generator writes a document's allowances before its charges. A file
+ *      that states a charge first has its allowance at `AllowanceCharge[2]`,
+ *      and the rule, counting the model, says `[1]`.
+ *   3. A path is not a line number, and an editor, a code review and a CI
+ *      annotation all want a line number.
  *
- * The obvious implementation reaches for `DecompressionStream`, which exists in
- * Node 18+ and every modern browser. It is not used here, and the reason is the
- * signature: `DecompressionStream` is asynchronous, every other entry point in
- * this package is synchronous, and making the one PDF function `async` would
- * push a promise through every caller — `validateInput(await extract(...))` —
- * for an operation that is pure CPU over a buffer already in memory. So RFC
- * 1951 DEFLATE is implemented below, in about two hundred lines. It has no
- * feature-detection hole, works identically in Node, Bun, Deno, Workers and
- * browsers, and keeps the whole package callable from synchronous code.
+ * So `locateFinding` walks the rule's path through the tree the caller's file
+ * was parsed into (translating it to CII first where the file is CII) and
+ * reports the element it lands on, with its line and column.
  *
- * ## What it parses
- *
- * Enough PDF to find an attachment, and no more: classic cross-reference
- * tables, cross-reference streams (PDF 1.5+), object streams, `/Prev` chains,
- * and the `FlateDecode` filter with PNG predictors. It does not render, does
- * not decrypt, and does not implement `LZWDecode`, `/Crypt` or any of the image
- * filters — it names them and refuses instead, because a wrong answer about the
- * contents of a tax document is worse than no answer.
- *
- * ## Hostile input
- *
- * The bytes come from someone else, so every loop here is bounded: output size
- * and compression ratio per stream *and summed across the document* (a flate
- * bomb inflates to a cap and throws), object count, parsed-value count,
- * `/Prev` chain length, name-tree depth *and node count*, and object streams,
- * which may not contain object streams. Malformed input produces a named error
- * with a stable `code` and a byte offset where one is known; it never hangs and
- * never throws a bare `TypeError` from inside the parser.
- *
- * Two of those bounds exist because the obvious ones are not sufficient, and
- * the reasoning is worth keeping:
- *
- * - **Depth does not bound a tree.** Thirty name-tree dictionaries, each naming
- *   the next one twice in `/Kids`, never exceed depth thirty and describe 2³⁰
- *   paths. Object caching makes the file about a kilobyte. `maxNameTreeNodes`
- *   is what terminates it; `maxNameTreeDepth` never fires.
- * - **Bytes do not bound memory.** Four megabytes of `0 0 0 …` inside one
- *   object stream is a four-kilobyte PDF that costs roughly seventy megabytes
- *   of JavaScript heap once parsed, because a parsed value is much larger than
- *   the byte it came from. `maxObjectNodes` is the cap that corresponds to what
- *   a Cloudflare Worker actually runs out of.
+ * WHEN IT CANNOT TELL, IT SAYS SO. A missing element has no line, so the
+ * location falls back to the nearest ancestor that does exist, which is where
+ * the missing element would go, and `exact` is false. The same happens when
+ * the file holds several elements the path could mean and nothing says which:
+ * several `cac:TaxSubtotal`s, which the rules count sometimes in the file's
+ * order and sometimes in the order the engine computes them, or several
+ * `cbc:Note`s under a path with no index. Pointing at the parent is less
+ * useful than pointing at the right child, and much more useful than pointing
+ * confidently at the wrong one.
  */
-const DEFAULT_PDF_LIMITS = {
-    maxStreamBytes: 32 * 1024 * 1024,
-    maxTotalInflatedBytes: 64 * 1024 * 1024,
-    maxAttachmentBytes: 16 * 1024 * 1024,
-    maxCompressionRatio: 2000,
-    maxObjects: 50_000,
-    maxXrefSections: 64,
-    maxNameTreeDepth: 64,
-    maxNameTreeNodes: 10_000,
-    maxObjectDepth: 64,
-    // The three FeRD sample files need 44, 646 and 646. Half a million leaves
-    // three orders of magnitude of headroom for a genuinely large document while
-    // still bounding the parse at roughly twenty megabytes of heap.
-    maxObjectNodes: 500_000,
+
+const UBL_NS = {
+    cbc: "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+    cac: "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
 };
-/** Base class for everything this module throws, so one `catch` covers it. */
-class PdfError extends Error {
-    code;
-    constructor(code, message) {
-        super(message);
-        this.name = new.target.name;
-        this.code = code;
-    }
-}
-/** The bytes are not a PDF we can read: bad syntax, broken offsets, missing objects. */
-class PdfParseError extends PdfError {
-}
-/** A limit in `PdfLimits` was hit. Distinct from a syntax error: the file may be valid and simply too big. */
-class PdfSecurityError extends PdfError {
-}
-/** The PDF parsed, and carries no XML attachment we can return. */
-class FacturXNotFoundError extends PdfError {
-    constructor(message) {
-        super("facturx_no_xml_attachment", message);
-    }
-}
-/** A filter we do not implement — named rather than guessed at. */
-class PdfUnsupportedFilterError extends PdfError {
-    filter;
-    constructor(filter, extra = "") {
-        super("pdf_unsupported_filter", `This PDF uses the ${filter} filter, which this reader does not implement.${extra ? ` ${extra}` : ""} ` +
-            `Only FlateDecode (with PNG predictors) is supported: it is what every Factur-X and ` +
-            `ZUGFeRD producer uses for embedded files. Re-save the document without ${filter}, or ` +
-            `extract the attachment with a full PDF library.`);
-        this.filter = filter;
-    }
-}
-// ---------------------------------------------------------------------------
-// DEFLATE (RFC 1951) and zlib (RFC 1950)
-// ---------------------------------------------------------------------------
-const LENGTH_BASE = new Uint16Array([
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67,
-    83, 99, 115, 131, 163, 195, 227, 258,
-]);
-const LENGTH_EXTRA = new Uint8Array([
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
-    5, 5, 0,
-]);
-const DIST_BASE = new Uint16Array([
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
-    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-]);
-const DIST_EXTRA = new Uint8Array([
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
-    11, 12, 12, 13, 13,
-]);
-const CODE_LENGTH_ORDER = new Uint8Array([
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-]);
-function buildHuffman(lengths) {
-    const counts = new Int32Array(16);
-    for (let i = 0; i < lengths.length; i++) {
-        const len = lengths[i];
-        counts[len] = counts[len] + 1;
-    }
-    counts[0] = 0;
-    const offsets = new Int32Array(16);
-    for (let i = 1; i < 16; i++) {
-        offsets[i] = offsets[i - 1] + counts[i - 1];
-    }
-    const symbols = new Int32Array(lengths.length);
-    for (let sym = 0; sym < lengths.length; sym++) {
-        const len = lengths[sym];
-        if (len === 0)
-            continue;
-        const at = offsets[len];
-        symbols[at] = sym;
-        offsets[len] = at + 1;
-    }
-    return { counts, symbols };
-}
-class BitReader {
-    data;
-    pos = 0;
-    bitBuf = 0;
-    bitCount = 0;
-    constructor(data) {
-        this.data = data;
-    }
-    bits(need) {
-        while (this.bitCount < need) {
-            if (this.pos >= this.data.length) {
-                throw new PdfParseError("pdf_flate_truncated", "A compressed stream ended in the middle of a DEFLATE block. The PDF is truncated or corrupt.");
-            }
-            this.bitBuf |= this.data[this.pos++] << this.bitCount;
-            this.bitCount += 8;
-        }
-        const value = this.bitBuf & ((1 << need) - 1);
-        this.bitBuf >>>= need;
-        this.bitCount -= need;
-        return value;
-    }
-    decode(table) {
-        let code = 0;
-        let first = 0;
-        let index = 0;
-        for (let len = 1; len < 16; len++) {
-            code |= this.bits(1);
-            const count = table.counts[len];
-            if (code - first < count) {
-                return table.symbols[index + (code - first)];
-            }
-            index += count;
-            first = (first + count) << 1;
-            code <<= 1;
-        }
-        throw new PdfParseError("pdf_flate_bad_code", "A compressed stream contains a Huffman code no table defines. The PDF is corrupt.");
-    }
-    alignToByte() {
-        this.bitBuf = 0;
-        this.bitCount = 0;
-    }
-    get bytePos() {
-        return this.pos;
-    }
-    set bytePos(v) {
-        this.pos = v;
-    }
-}
-/**
- * Raw DEFLATE, capped.
- *
- * `maxOutput` is checked as the window grows rather than at the end, so a
- * stream that would inflate to a gigabyte is stopped after the first megabyte
- * instead of after the allocation.
- */
-function inflateRaw(data, maxOutput) {
-    const reader = new BitReader(data);
-    let out = new Uint8Array(Math.min(maxOutput, Math.max(1024, data.length * 4)));
-    let length = 0;
-    const ensure = (extra) => {
-        if (length + extra > maxOutput) {
-            throw new PdfSecurityError("pdf_stream_too_large", `A compressed stream inflated past the ${maxOutput}-byte limit. This is the ` +
-                `decompression-bomb guard; raise maxStreamBytes if the document really is this large.`);
-        }
-        if (length + extra <= out.length)
-            return;
-        let size = out.length * 2;
-        while (size < length + extra)
-            size *= 2;
-        const bigger = new Uint8Array(Math.min(size, maxOutput));
-        bigger.set(out.subarray(0, length));
-        out = bigger;
-    };
-    let fixedLit;
-    let fixedDist;
-    for (;;) {
-        const last = reader.bits(1);
-        const type = reader.bits(2);
-        if (type === 0) {
-            reader.alignToByte();
-            const pos = reader.bytePos;
-            if (pos + 4 > data.length) {
-                throw new PdfParseError("pdf_flate_truncated", "A stored DEFLATE block header runs past the end of the stream.");
-            }
-            const len = data[pos] | (data[pos + 1] << 8);
-            const nlen = data[pos + 2] | (data[pos + 3] << 8);
-            if ((len ^ 0xffff) !== nlen) {
-                throw new PdfParseError("pdf_flate_bad_stored_block", "A stored DEFLATE block's length and its complement disagree. The stream is corrupt.");
-            }
-            if (pos + 4 + len > data.length) {
-                throw new PdfParseError("pdf_flate_truncated", "A stored DEFLATE block runs past the end of the stream.");
-            }
-            ensure(len);
-            out.set(data.subarray(pos + 4, pos + 4 + len), length);
-            length += len;
-            reader.bytePos = pos + 4 + len;
-        }
-        else if (type === 1 || type === 2) {
-            let lit;
-            let dist;
-            if (type === 1) {
-                if (!fixedLit) {
-                    const litLengths = new Uint8Array(288);
-                    litLengths.fill(8, 0, 144);
-                    litLengths.fill(9, 144, 256);
-                    litLengths.fill(7, 256, 280);
-                    litLengths.fill(8, 280, 288);
-                    fixedLit = buildHuffman(litLengths);
-                    fixedDist = buildHuffman(new Uint8Array(30).fill(5));
-                }
-                lit = fixedLit;
-                dist = fixedDist;
-            }
-            else {
-                const hlit = reader.bits(5) + 257;
-                const hdist = reader.bits(5) + 1;
-                const hclen = reader.bits(4) + 4;
-                const codeLengths = new Uint8Array(19);
-                for (let i = 0; i < hclen; i++) {
-                    codeLengths[CODE_LENGTH_ORDER[i]] = reader.bits(3);
-                }
-                const codeTable = buildHuffman(codeLengths);
-                const lengths = new Uint8Array(hlit + hdist);
-                for (let i = 0; i < lengths.length;) {
-                    const symbol = reader.decode(codeTable);
-                    if (symbol < 16) {
-                        lengths[i++] = symbol;
-                    }
-                    else if (symbol === 16) {
-                        if (i === 0) {
-                            throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE code-length table repeats a symbol before defining one.");
-                        }
-                        const prev = lengths[i - 1];
-                        let repeat = 3 + reader.bits(2);
-                        while (repeat-- > 0 && i < lengths.length)
-                            lengths[i++] = prev;
-                    }
-                    else if (symbol === 17) {
-                        let repeat = 3 + reader.bits(3);
-                        while (repeat-- > 0 && i < lengths.length)
-                            lengths[i++] = 0;
-                    }
-                    else {
-                        let repeat = 11 + reader.bits(7);
-                        while (repeat-- > 0 && i < lengths.length)
-                            lengths[i++] = 0;
-                    }
-                }
-                lit = buildHuffman(lengths.subarray(0, hlit));
-                dist = buildHuffman(lengths.subarray(hlit));
-            }
-            for (;;) {
-                const symbol = reader.decode(lit);
-                if (symbol === 256)
-                    break;
-                if (symbol < 256) {
-                    ensure(1);
-                    out[length++] = symbol;
-                    continue;
-                }
-                const lengthIndex = symbol - 257;
-                if (lengthIndex >= LENGTH_BASE.length) {
-                    throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE length symbol is outside the defined range.");
-                }
-                const copyLength = LENGTH_BASE[lengthIndex] +
-                    reader.bits(LENGTH_EXTRA[lengthIndex]);
-                const distSymbol = reader.decode(dist);
-                if (distSymbol >= DIST_BASE.length) {
-                    throw new PdfParseError("pdf_flate_bad_code", "A DEFLATE distance symbol is outside the defined range.");
-                }
-                const distance = DIST_BASE[distSymbol] +
-                    reader.bits(DIST_EXTRA[distSymbol]);
-                if (distance > length) {
-                    throw new PdfParseError("pdf_flate_bad_distance", "A DEFLATE back-reference points before the start of the output. The stream is corrupt.");
-                }
-                ensure(copyLength);
-                let from = length - distance;
-                for (let i = 0; i < copyLength; i++)
-                    out[length++] = out[from++];
-            }
-        }
-        else {
-            throw new PdfParseError("pdf_flate_bad_block_type", "A DEFLATE block declares reserved type 3. The stream is corrupt.");
-        }
-        if (last)
-            break;
-    }
-    return out.subarray(0, length);
-}
-/** zlib wrapper if present, raw DEFLATE otherwise. */
-function inflate(data, maxOutput) {
-    if (data.length === 0)
-        return data;
-    const cmf = data[0];
-    const flg = data[1];
-    const looksZlib = data.length > 2 && (cmf & 0x0f) === 8 && ((cmf << 8) | flg) % 31 === 0;
-    if (looksZlib) {
-        try {
-            return inflateRaw(data.subarray(2), maxOutput);
-        }
-        catch (error) {
-            if (error instanceof PdfSecurityError)
-                throw error;
-            // Some producers write a raw stream whose first two bytes happen to pass
-            // the zlib check. Falling back costs one retry and rescues those.
-            return inflateRaw(data, maxOutput);
-        }
-    }
-    return inflateRaw(data, maxOutput);
-}
-// ---------------------------------------------------------------------------
-// PDF object model
-// ---------------------------------------------------------------------------
-class PdfName {
-    name;
-    constructor(name) {
-        this.name = name;
-    }
-}
-class PdfRef {
-    num;
-    gen;
-    constructor(num, gen) {
-        this.num = num;
-        this.gen = gen;
-    }
-}
-class PdfStream {
-    dict;
-    raw;
-    constructor(dict, raw) {
-        this.dict = dict;
-        this.raw = raw;
-    }
-}
-const WHITESPACE = new Set([0x00, 0x09, 0x0a, 0x0c, 0x0d, 0x20]);
-const DELIMITERS = new Set([
-    0x28, 0x29, 0x3c, 0x3e, 0x5b, 0x5d, 0x7b, 0x7d, 0x2f, 0x25,
-]);
-function isRegular(byte) {
-    return !WHITESPACE.has(byte) && !DELIMITERS.has(byte);
-}
-/** Latin-1 decode — PDF names and keywords are ASCII, and this never throws on a stray byte. */
-function latin1(bytes) {
-    let s = "";
-    for (let i = 0; i < bytes.length; i++) {
-        s += String.fromCharCode(bytes[i]);
-    }
-    return s;
-}
-class Lexer {
-    data;
-    limits;
-    budget;
-    pos = 0;
-    constructor(data, limits, 
-    /**
-     * Shared across every lexer in one document, so the budget is on the
-     * extraction rather than on each object separately.
-     */
-    budget = { nodes: 0 }) {
-        this.data = data;
-        this.limits = limits;
-        this.budget = budget;
-    }
-    /**
-     * One byte, or `-1` past the end.
-     *
-     * Every read goes through here so that running off the end of the buffer is a
-     * value the comparisons below already handle rather than an `undefined` that
-     * turns into a `NaN` three lines later. `-1` is not a byte, so no equality
-     * test against a real character can accidentally match it.
-     */
-    byte(at) {
-        const value = this.data[at];
-        return value === undefined ? -1 : value;
-    }
-    fail(code, message) {
-        throw new PdfParseError(code, `${message} (at byte ${this.pos})`);
-    }
-    skipWhitespace() {
-        for (;;) {
-            while (this.pos < this.data.length && WHITESPACE.has(this.byte(this.pos))) {
-                this.pos++;
-            }
-            if (this.byte(this.pos) === 0x25) {
-                // comment to end of line
-                while (this.pos < this.data.length &&
-                    this.byte(this.pos) !== 0x0a &&
-                    this.byte(this.pos) !== 0x0d) {
-                    this.pos++;
-                }
-                continue;
-            }
-            return;
-        }
-    }
-    readToken() {
-        this.skipWhitespace();
-        const start = this.pos;
-        while (this.pos < this.data.length && isRegular(this.byte(this.pos))) {
-            this.pos++;
-        }
-        if (this.pos === start) {
-            this.fail("pdf_unexpected_byte", "Expected a PDF token (a number, keyword, name or delimiter) and found a " +
-                "delimiter or end of input instead. This usually means an offset in the " +
-                "cross-reference table points somewhere that is not the start of an object");
-        }
-        return latin1(this.data.subarray(start, this.pos));
-    }
-    peekByte() {
-        this.skipWhitespace();
-        return this.byte(this.pos);
-    }
-    /** Parse one object. `depth` bounds array/dict nesting. */
-    parseObject(depth = 0) {
-        if (++this.budget.nodes > this.limits.maxObjectNodes) {
-            throw new PdfSecurityError("pdf_too_many_object_nodes", `Parsing this document produced more than ${this.limits.maxObjectNodes} values ` +
-                `(array elements, dictionary entries, numbers). A byte cap does not bound this: ` +
-                `four megabytes of "0 0 0 …" inside one object stream costs tens of megabytes of ` +
-                `heap once parsed, because a parsed value is far larger than the byte it came from.`);
-        }
-        if (depth > this.limits.maxObjectDepth) {
-            throw new PdfSecurityError("pdf_object_too_deep", `Arrays and dictionaries nest more than ${this.limits.maxObjectDepth} deep. ` +
-                `Refusing rather than recursing.`);
-        }
-        this.skipWhitespace();
-        if (this.pos >= this.data.length) {
-            this.fail("pdf_truncated", "The file ends where an indirect object was expected. It was truncated in " +
-                "transit, or the cross-reference table points past the end of the data");
-        }
-        const byte = this.byte(this.pos);
-        if (byte === 0x2f)
-            return this.parseName();
-        if (byte === 0x28)
-            return this.parseLiteralString();
-        if (byte === 0x5b)
-            return this.parseArray(depth);
-        if (byte === 0x3c) {
-            if (this.byte(this.pos + 1) === 0x3c)
-                return this.parseDictOrStream(depth);
-            return this.parseHexString();
-        }
-        if (byte === 0x5d || byte === 0x3e) {
-            this.fail("pdf_unexpected_byte", "Found an array or dictionary close with no matching open. The object " +
-                "structure is corrupt, or an offset points into the middle of one");
-        }
-        const token = this.readToken();
-        if (token === "true")
-            return true;
-        if (token === "false")
-            return false;
-        if (token === "null")
+const INVOICE_NS = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2";
+const CREDIT_NOTE_NS = "urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2";
+const CII_NS = { ...CII_NAMESPACES };
+const H = "/rsm:SupplyChainTradeTransaction";
+const AGREEMENT = `${H}/ram:ApplicableHeaderTradeAgreement`;
+const DELIVERY = `${H}/ram:ApplicableHeaderTradeDelivery`;
+const SETTLEMENT = `${H}/ram:ApplicableHeaderTradeSettlement`;
+const DUE_DATE = `${SETTLEMENT}/ram:SpecifiedTradePaymentTerms/ram:DueDateDateTime/udt:DateTimeString`;
+const leaf = (to, choose) => ({ to, choose });
+/** An identifier CII writes as ram:ID, or as ram:GlobalID when it has a scheme. */
+const ID_OR_GLOBAL = { to: "ram:ID", choose: "single", or: ["GlobalID"] };
+const ADDRESS = {
+    "cbc:StreetName": leaf("ram:LineOne"),
+    "cbc:AdditionalStreetName": leaf("ram:LineTwo"),
+    "cac:AddressLine": { to: "", kids: { "cbc:Line": leaf("ram:LineThree") } },
+    "cbc:CityName": leaf("ram:CityName"),
+    "cbc:PostalZone": leaf("ram:PostcodeCode"),
+    "cbc:CountrySubentity": leaf("ram:CountrySubDivisionName"),
+    "cac:Country": { to: "", kids: { "cbc:IdentificationCode": leaf("ram:CountryID") } },
+};
+/** The children of a UBL `cac:Party` (or a party that is its own `cac:Party`). */
+const PARTY = {
+    "cbc:EndpointID": leaf("ram:URIUniversalCommunication/ram:URIID"),
+    "cac:PartyIdentification": { to: "", kids: { "cbc:ID": ID_OR_GLOBAL } },
+    // The generator writes the trading name here, falling back to the name, and
+    // the rules that point here are about the name: CII keeps it in ram:Name.
+    "cac:PartyName": { to: "", kids: { "cbc:Name": leaf("ram:Name") } },
+    "cac:PostalAddress": { to: "ram:PostalTradeAddress", kids: ADDRESS },
+    "cac:PartyTaxScheme": {
+        to: "ram:SpecifiedTaxRegistration",
+        choose: "single",
+        kids: { "cbc:CompanyID": leaf("ram:ID") },
+    },
+    "cac:PartyLegalEntity": {
+        to: "ram:SpecifiedLegalOrganization",
+        kids: {
+            "cbc:RegistrationName": leaf("../ram:Name"),
+            "cbc:CompanyID": leaf("ram:ID"),
+            "cbc:CompanyLegalForm": leaf("../ram:Description"),
+        },
+    },
+    "cac:Contact": {
+        to: "ram:DefinedTradeContact",
+        kids: {
+            "cbc:Name": leaf("ram:PersonName"),
+            "cbc:Telephone": leaf("ram:TelephoneUniversalCommunication/ram:CompleteNumber"),
+            "cbc:ElectronicMail": leaf("ram:EmailURIUniversalCommunication/ram:URIID"),
+        },
+    },
+};
+const ALLOWANCE_CHARGE = {
+    "cbc:ChargeIndicator": leaf("ram:ChargeIndicator/udt:Indicator"),
+    "cbc:AllowanceChargeReasonCode": leaf("ram:ReasonCode"),
+    "cbc:AllowanceChargeReason": leaf("ram:Reason"),
+    "cbc:MultiplierFactorNumeric": leaf("ram:CalculationPercent"),
+    "cbc:Amount": leaf("ram:ActualAmount"),
+    "cbc:BaseAmount": leaf("ram:BasisAmount"),
+    "cac:TaxCategory": {
+        to: "ram:CategoryTradeTax",
+        kids: { "cbc:ID": leaf("ram:CategoryCode"), "cbc:Percent": leaf("ram:RateApplicablePercent") },
+    },
+};
+const PERIOD = {
+    "cbc:StartDate": leaf("ram:StartDateTime/udt:DateTimeString"),
+    "cbc:EndDate": leaf("ram:EndDateTime/udt:DateTimeString"),
+    // BT-8 is a code on the VAT breakdown in CII, not on the period.
+    "cbc:DescriptionCode": leaf(`${SETTLEMENT}/ram:ApplicableTradeTax/ram:DueDateTypeCode`),
+};
+const LINE = {
+    to: `${H}/ram:IncludedSupplyChainTradeLineItem`,
+    choose: "position",
+    kids: {
+        "cbc:ID": leaf("ram:AssociatedDocumentLineDocument/ram:LineID"),
+        "cbc:Note": leaf("ram:AssociatedDocumentLineDocument/ram:IncludedNote/ram:Content"),
+        "cbc:InvoicedQuantity": leaf("ram:SpecifiedLineTradeDelivery/ram:BilledQuantity"),
+        "cbc:CreditedQuantity": leaf("ram:SpecifiedLineTradeDelivery/ram:BilledQuantity"),
+        "cbc:LineExtensionAmount": leaf("ram:SpecifiedLineTradeSettlement/ram:SpecifiedTradeSettlementLineMonetarySummation/ram:LineTotalAmount"),
+        "cbc:AccountingCost": leaf("ram:SpecifiedLineTradeSettlement/ram:ReceivableSpecifiedTradeAccountingAccount/ram:ID"),
+        "cac:InvoicePeriod": { to: "ram:SpecifiedLineTradeSettlement/ram:BillingSpecifiedPeriod", kids: PERIOD },
+        "cac:OrderLineReference": {
+            to: "ram:SpecifiedLineTradeAgreement/ram:BuyerOrderReferencedDocument",
+            kids: { "cbc:LineID": leaf("ram:LineID") },
+        },
+        "cac:DocumentReference": {
+            to: "ram:SpecifiedLineTradeSettlement/ram:AdditionalReferencedDocument",
+            kids: { "cbc:ID": leaf("ram:IssuerAssignedID") },
+        },
+        "cac:AllowanceCharge": {
+            to: "ram:SpecifiedLineTradeSettlement/ram:SpecifiedTradeAllowanceCharge",
+            choose: "allowance",
+            kids: ALLOWANCE_CHARGE,
+        },
+        "cac:Item": {
+            to: "ram:SpecifiedTradeProduct",
+            kids: {
+                "cbc:Name": leaf("ram:Name"),
+                "cbc:Description": leaf("ram:Description"),
+                "cac:SellersItemIdentification": { to: "", kids: { "cbc:ID": leaf("ram:SellerAssignedID") } },
+                "cac:BuyersItemIdentification": { to: "", kids: { "cbc:ID": leaf("ram:BuyerAssignedID") } },
+                "cac:StandardItemIdentification": { to: "", kids: { "cbc:ID": leaf("ram:GlobalID") } },
+                "cac:OriginCountry": { to: "ram:OriginTradeCountry", kids: { "cbc:IdentificationCode": leaf("ram:ID") } },
+                "cac:CommodityClassification": {
+                    to: "ram:DesignatedProductClassification",
+                    choose: "position",
+                    kids: { "cbc:ItemClassificationCode": leaf("ram:ClassCode") },
+                },
+                "cac:AdditionalItemProperty": {
+                    to: "ram:ApplicableProductCharacteristic",
+                    choose: "position",
+                    kids: { "cbc:Name": leaf("ram:Description"), "cbc:Value": leaf("ram:Value") },
+                },
+                "cac:ClassifiedTaxCategory": {
+                    to: "../ram:SpecifiedLineTradeSettlement/ram:ApplicableTradeTax",
+                    kids: { "cbc:ID": leaf("ram:CategoryCode"), "cbc:Percent": leaf("ram:RateApplicablePercent") },
+                },
+            },
+        },
+        "cac:Price": {
+            to: "ram:SpecifiedLineTradeAgreement/ram:NetPriceProductTradePrice",
+            kids: {
+                "cbc:PriceAmount": leaf("ram:ChargeAmount"),
+                "cbc:BaseQuantity": leaf("ram:BasisQuantity"),
+                // The price discount sits on the GROSS price in CII, and the gross
+                // price itself (UBL's BaseAmount on it) is that element's ChargeAmount.
+                "cac:AllowanceCharge": {
+                    to: "../ram:GrossPriceProductTradePrice/ram:AppliedTradeAllowanceCharge",
+                    kids: { "cbc:Amount": leaf("ram:ActualAmount"), "cbc:BaseAmount": leaf("../ram:ChargeAmount") },
+                },
+            },
+        },
+    },
+};
+const UBL_TO_CII = {
+    "cbc:CustomizationID": leaf("/rsm:ExchangedDocumentContext/ram:GuidelineSpecifiedDocumentContextParameter/ram:ID"),
+    "cbc:ProfileID": leaf("/rsm:ExchangedDocumentContext/ram:BusinessProcessSpecifiedDocumentContextParameter/ram:ID"),
+    "cbc:ID": leaf("/rsm:ExchangedDocument/ram:ID"),
+    "cbc:IssueDate": leaf("/rsm:ExchangedDocument/ram:IssueDateTime/udt:DateTimeString"),
+    "cbc:DueDate": leaf(DUE_DATE),
+    "cbc:InvoiceTypeCode": leaf("/rsm:ExchangedDocument/ram:TypeCode"),
+    "cbc:CreditNoteTypeCode": leaf("/rsm:ExchangedDocument/ram:TypeCode"),
+    "cbc:Note": leaf("/rsm:ExchangedDocument/ram:IncludedNote", "position"),
+    "cbc:TaxPointDate": leaf(`${SETTLEMENT}/ram:ApplicableTradeTax/ram:TaxPointDate/udt:DateString`),
+    "cbc:DocumentCurrencyCode": leaf(`${SETTLEMENT}/ram:InvoiceCurrencyCode`),
+    "cbc:TaxCurrencyCode": leaf(`${SETTLEMENT}/ram:TaxCurrencyCode`),
+    "cbc:AccountingCost": leaf(`${SETTLEMENT}/ram:ReceivableSpecifiedTradeAccountingAccount/ram:ID`),
+    "cbc:BuyerReference": leaf(`${AGREEMENT}/ram:BuyerReference`),
+    "cac:InvoicePeriod": { to: `${SETTLEMENT}/ram:BillingSpecifiedPeriod`, kids: PERIOD },
+    "cac:OrderReference": {
+        to: "",
+        kids: {
+            "cbc:ID": leaf(`${AGREEMENT}/ram:BuyerOrderReferencedDocument/ram:IssuerAssignedID`),
+            "cbc:SalesOrderID": leaf(`${AGREEMENT}/ram:SellerOrderReferencedDocument/ram:IssuerAssignedID`),
+        },
+    },
+    "cac:BillingReference": {
+        to: `${SETTLEMENT}/ram:InvoiceReferencedDocument`,
+        choose: "position",
+        kids: {
+            "cac:InvoiceDocumentReference": {
+                to: "",
+                kids: {
+                    "cbc:ID": leaf("ram:IssuerAssignedID"),
+                    "cbc:IssueDate": leaf("ram:FormattedIssueDateTime/qdt:DateTimeString"),
+                },
+            },
+        },
+    },
+    "cac:DespatchDocumentReference": {
+        to: `${DELIVERY}/ram:DespatchAdviceReferencedDocument`,
+        kids: { "cbc:ID": leaf("ram:IssuerAssignedID") },
+    },
+    "cac:ReceiptDocumentReference": {
+        to: `${DELIVERY}/ram:ReceivingAdviceReferencedDocument`,
+        kids: { "cbc:ID": leaf("ram:IssuerAssignedID") },
+    },
+    "cac:ContractDocumentReference": {
+        to: `${AGREEMENT}/ram:ContractReferencedDocument`,
+        kids: { "cbc:ID": leaf("ram:IssuerAssignedID") },
+    },
+    "cac:ProjectReference": { to: `${AGREEMENT}/ram:SpecifiedProcuringProject`, kids: { "cbc:ID": leaf("ram:ID") } },
+    // UBL and CII both hold supporting documents, the invoiced object and the
+    // tender reference in this one repeated group, and the two generators do
+    // not order them alike, so a position only counts when there is just one.
+    "cac:AdditionalDocumentReference": {
+        to: `${AGREEMENT}/ram:AdditionalReferencedDocument`,
+        choose: "single",
+        kids: {
+            "cbc:ID": leaf("ram:IssuerAssignedID"),
+            "cac:Attachment": {
+                to: "",
+                kids: {
+                    "cbc:EmbeddedDocumentBinaryObject": leaf("ram:AttachmentBinaryObject"),
+                    "cac:ExternalReference": { to: "", kids: { "cbc:URI": leaf("ram:URIID") } },
+                },
+            },
+        },
+    },
+    "cac:AccountingSupplierParty": {
+        to: `${AGREEMENT}/ram:SellerTradeParty`,
+        kids: { "cac:Party": { to: "", kids: PARTY } },
+    },
+    "cac:AccountingCustomerParty": {
+        to: `${AGREEMENT}/ram:BuyerTradeParty`,
+        kids: { "cac:Party": { to: "", kids: PARTY } },
+    },
+    "cac:PayeeParty": { to: `${SETTLEMENT}/ram:PayeeTradeParty`, kids: PARTY },
+    "cac:TaxRepresentativeParty": { to: `${AGREEMENT}/ram:SellerTaxRepresentativeTradeParty`, kids: PARTY },
+    "cac:Delivery": {
+        to: DELIVERY,
+        kids: {
+            "cbc:ActualDeliveryDate": leaf("ram:ActualDeliverySupplyChainEvent/ram:OccurrenceDateTime/udt:DateTimeString"),
+            "cac:DeliveryLocation": {
+                to: "ram:ShipToTradeParty",
+                kids: { "cbc:ID": ID_OR_GLOBAL, "cac:Address": { to: "ram:PostalTradeAddress", kids: ADDRESS } },
+            },
+            "cac:DeliveryParty": {
+                to: "ram:ShipToTradeParty",
+                kids: { "cac:PartyName": { to: "", kids: { "cbc:Name": leaf("ram:Name") } } },
+            },
+        },
+    },
+    "cac:PaymentMeans": {
+        to: `${SETTLEMENT}/ram:SpecifiedTradeSettlementPaymentMeans`,
+        choose: "position",
+        kids: {
+            "cbc:PaymentMeansCode": leaf("ram:TypeCode"),
+            "cbc:PaymentID": leaf(`${SETTLEMENT}/ram:PaymentReference`),
+            "cbc:PaymentDueDate": leaf(DUE_DATE),
+            "cac:PayeeFinancialAccount": {
+                to: "ram:PayeePartyCreditorFinancialAccount",
+                kids: {
+                    "cbc:ID": leaf("ram:IBANID"),
+                    "cbc:Name": leaf("ram:AccountName"),
+                    "cac:FinancialInstitutionBranch": {
+                        to: "../ram:PayeeSpecifiedCreditorFinancialInstitution",
+                        kids: { "cbc:ID": leaf("ram:BICID") },
+                    },
+                },
+            },
+            "cac:CardAccount": {
+                to: "ram:ApplicableTradeSettlementFinancialCard",
+                kids: { "cbc:PrimaryAccountNumberID": leaf("ram:ID"), "cbc:HolderName": leaf("ram:CardholderName") },
+            },
+            // A mandate is payment terms in CII, and the debited account is on the
+            // payment means beside it.
+            "cac:PaymentMandate": {
+                to: `${SETTLEMENT}/ram:SpecifiedTradePaymentTerms`,
+                kids: {
+                    "cbc:ID": leaf("ram:DirectDebitMandateID"),
+                    "cac:PayerFinancialAccount": {
+                        to: `${SETTLEMENT}/ram:SpecifiedTradeSettlementPaymentMeans/ram:PayerPartyDebtorFinancialAccount`,
+                        kids: { "cbc:ID": leaf("ram:IBANID") },
+                    },
+                },
+            },
+        },
+    },
+    "cac:PaymentTerms": { to: `${SETTLEMENT}/ram:SpecifiedTradePaymentTerms`, kids: { "cbc:Note": leaf("ram:Description") } },
+    "cac:AllowanceCharge": {
+        to: `${SETTLEMENT}/ram:SpecifiedTradeAllowanceCharge`,
+        choose: "allowance",
+        kids: ALLOWANCE_CHARGE,
+    },
+    // UBL's TaxTotal[1]/TaxAmount and TaxTotal[2]/TaxAmount are CII's first and
+    // second TaxTotalAmount; the breakdown under TaxTotal[1] is ApplicableTradeTax.
+    "cac:TaxTotal": {
+        to: SETTLEMENT,
+        carry: true,
+        kids: {
+            "cbc:TaxAmount": leaf("ram:SpecifiedTradeSettlementHeaderMonetarySummation/ram:TaxTotalAmount", "position"),
+            "cac:TaxSubtotal": {
+                to: "ram:ApplicableTradeTax",
+                choose: "single",
+                kids: {
+                    "cbc:TaxableAmount": leaf("ram:BasisAmount"),
+                    "cbc:TaxAmount": leaf("ram:CalculatedAmount"),
+                    "cac:TaxCategory": {
+                        to: "",
+                        kids: {
+                            "cbc:ID": leaf("ram:CategoryCode"),
+                            "cbc:Percent": leaf("ram:RateApplicablePercent"),
+                            "cbc:TaxExemptionReason": leaf("ram:ExemptionReason"),
+                            "cbc:TaxExemptionReasonCode": leaf("ram:ExemptionReasonCode"),
+                        },
+                    },
+                },
+            },
+        },
+    },
+    "cac:LegalMonetaryTotal": {
+        to: `${SETTLEMENT}/ram:SpecifiedTradeSettlementHeaderMonetarySummation`,
+        kids: {
+            "cbc:LineExtensionAmount": leaf("ram:LineTotalAmount"),
+            "cbc:TaxExclusiveAmount": leaf("ram:TaxBasisTotalAmount"),
+            "cbc:TaxInclusiveAmount": leaf("ram:GrandTotalAmount"),
+            "cbc:AllowanceTotalAmount": leaf("ram:AllowanceTotalAmount"),
+            "cbc:ChargeTotalAmount": leaf("ram:ChargeTotalAmount"),
+            "cbc:PrepaidAmount": leaf("ram:TotalPrepaidAmount"),
+            "cbc:PayableRoundingAmount": leaf("ram:RoundingAmount"),
+            "cbc:PayableAmount": leaf("ram:DuePayableAmount"),
+        },
+    },
+    "cac:InvoiceLine": LINE,
+    "cac:CreditNoteLine": LINE,
+};
+/** How each UBL group is counted when the file itself is UBL. */
+const UBL_CHOOSE = {
+    AllowanceCharge: "allowance",
+    TaxTotal: "taxTotal",
+    TaxSubtotal: "single",
+    AdditionalDocumentReference: "single",
+    PartyTaxScheme: "single",
+    PartyIdentification: "single",
+};
+/** The credit-note spelling of an invoice element, and back. */
+const CREDIT_NOTE_NAMES = {
+    InvoiceLine: "CreditNoteLine",
+    InvoicedQuantity: "CreditedQuantity",
+    InvoiceTypeCode: "CreditNoteTypeCode",
+};
+const INVOICE_NAMES = Object.fromEntries(Object.entries(CREDIT_NOTE_NAMES).map(([a, b]) => [b, a]));
+/** `/ubl:Invoice/cac:X[2]/cbc:Y/@attr` → steps and the attribute. Null if it is not a plain path. */
+function splitPath(xpath) {
+    if (!xpath.startsWith("/"))
+        return null;
+    const parts = xpath.slice(1).split("/");
+    let attribute;
+    if (parts.at(-1)?.startsWith("@"))
+        attribute = parts.pop().slice(1);
+    const steps = [];
+    for (const part of parts) {
+        const m = /^([A-Za-z_][\w.-]*):([A-Za-z_][\w.-]*)(?:\[(\d+)\])?$/.exec(part);
+        if (!m)
             return null;
-        if (/^[+-]?[\d.]+$/.test(token)) {
-            // Possible "N G R" indirect reference — look ahead, and rewind if not.
-            if (/^\d+$/.test(token)) {
-                const save = this.pos;
-                this.skipWhitespace();
-                const genStart = this.pos;
-                if (this.pos < this.data.length && /\d/.test(String.fromCharCode(this.byte(this.pos)))) {
-                    const gen = this.readToken();
-                    this.skipWhitespace();
-                    if (/^\d+$/.test(gen) && this.byte(this.pos) === 0x52 /* R */) {
-                        this.pos++;
-                        return new PdfRef(Number(token), Number(gen));
-                    }
-                }
-                this.pos = save;
-                void genStart;
-            }
-            const value = Number(token);
-            if (Number.isNaN(value)) {
-                this.fail("pdf_bad_number", `"${token}" appears where a number was expected and cannot be read as one`);
-            }
-            return value;
-        }
-        this.fail("pdf_unexpected_token", `Unexpected token "${token}". This is not a PDF object: the reader expected a ` +
-            `number, name, string, array, dictionary, or one of true/false/null`);
+        steps.push({ prefix: m[1], local: m[2], index: m[3] ? Number(m[3]) : undefined });
     }
-    parseName() {
-        this.pos++; // slash
-        let name = "";
-        while (this.pos < this.data.length && isRegular(this.byte(this.pos))) {
-            const byte = this.byte(this.pos);
-            if (byte === 0x23 && this.pos + 2 < this.data.length) {
-                const hex = latin1(this.data.subarray(this.pos + 1, this.pos + 3));
-                if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-                    name += String.fromCharCode(parseInt(hex, 16));
-                    this.pos += 3;
-                    continue;
-                }
-            }
-            name += String.fromCharCode(byte);
-            this.pos++;
-        }
-        return new PdfName(name);
-    }
-    parseLiteralString() {
-        this.pos++; // (
-        let depth = 1;
-        let out = "";
-        while (this.pos < this.data.length) {
-            const byte = this.byte(this.pos++);
-            if (byte === 0x5c) {
-                const next = this.byte(this.pos++);
-                switch (next) {
-                    case 0x6e:
-                        out += "\n";
-                        break;
-                    case 0x72:
-                        out += "\r";
-                        break;
-                    case 0x74:
-                        out += "\t";
-                        break;
-                    case 0x62:
-                        out += "\b";
-                        break;
-                    case 0x66:
-                        out += "\f";
-                        break;
-                    case 0x0a: break;
-                    case 0x0d:
-                        if (this.byte(this.pos) === 0x0a)
-                            this.pos++;
-                        break;
-                    default:
-                        if (next >= 0x30 && next <= 0x37) {
-                            let octal = String.fromCharCode(next);
-                            for (let i = 0; i < 2; i++) {
-                                const d = this.byte(this.pos);
-                                if (d >= 0x30 && d <= 0x37) {
-                                    octal += String.fromCharCode(d);
-                                    this.pos++;
-                                }
-                            }
-                            out += String.fromCharCode(parseInt(octal, 8) & 0xff);
-                        }
-                        else {
-                            out += String.fromCharCode(next);
-                        }
-                }
-                continue;
-            }
-            if (byte === 0x28)
-                depth++;
-            if (byte === 0x29) {
-                depth--;
-                if (depth === 0)
-                    return out;
-            }
-            out += String.fromCharCode(byte);
-        }
-        this.fail("pdf_truncated", "A literal string is never closed");
-    }
-    parseHexString() {
-        this.pos++; // <
-        let hex = "";
-        while (this.pos < this.data.length && this.byte(this.pos) !== 0x3e) {
-            const ch = String.fromCharCode(this.byte(this.pos++));
-            if (/[0-9a-fA-F]/.test(ch))
-                hex += ch;
-        }
-        if (this.pos >= this.data.length) {
-            this.fail("pdf_truncated", "A hexadecimal <…> string is opened and never closed before the end of the file");
-        }
-        this.pos++; // >
-        if (hex.length % 2 === 1)
-            hex += "0";
-        let out = "";
-        for (let i = 0; i < hex.length; i += 2) {
-            out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
-        }
-        return out;
-    }
-    parseArray(depth) {
-        this.pos++; // [
-        const items = [];
-        for (;;) {
-            this.skipWhitespace();
-            if (this.pos >= this.data.length) {
-                this.fail("pdf_truncated", "An array is opened and never closed before the end of the file");
-            }
-            if (this.byte(this.pos) === 0x5d) {
-                this.pos++;
-                return items;
-            }
-            items.push(this.parseObject(depth + 1));
-        }
-    }
-    parseDictOrStream(depth) {
-        this.pos += 2; // <<
-        const dict = new Map();
-        for (;;) {
-            this.skipWhitespace();
-            if (this.pos + 1 < this.data.length && this.byte(this.pos) === 0x3e && this.byte(this.pos + 1) === 0x3e) {
-                this.pos += 2;
-                break;
-            }
-            if (this.pos >= this.data.length) {
-                this.fail("pdf_truncated", "A dictionary is opened and never closed before the end of the file");
-            }
-            if (this.byte(this.pos) !== 0x2f) {
-                this.fail("pdf_bad_dict_key", "A dictionary key is not a /Name. Every key in a PDF dictionary must begin " +
-                    "with a slash, so the bytes here are not a dictionary");
-            }
-            const key = this.parseName().name;
-            dict.set(key, this.parseObject(depth + 1));
-        }
-        const save = this.pos;
-        this.skipWhitespace();
-        if (latin1(this.data.subarray(this.pos, this.pos + 6)) === "stream") {
-            this.pos += 6;
-            if (this.byte(this.pos) === 0x0d)
-                this.pos++;
-            if (this.byte(this.pos) === 0x0a)
-                this.pos++;
-            const start = this.pos;
-            const declared = dict.get("Length");
-            let end;
-            if (typeof declared === "number" && start + declared <= this.data.length) {
-                end = start + declared;
-                // Trust but verify: `endstream` should follow. Producers get Length
-                // wrong often enough that scanning is the safer primary.
-                const after = latin1(this.data.subarray(end, end + 20));
-                if (!/^\s*endstream/.test(after)) {
-                    end = this.findEndstream(start);
-                }
-            }
-            else {
-                end = this.findEndstream(start);
-            }
-            this.pos = end;
-            this.skipWhitespace();
-            if (latin1(this.data.subarray(this.pos, this.pos + 9)) === "endstream") {
-                this.pos += 9;
-            }
-            return new PdfStream(dict, this.data.subarray(start, end));
-        }
-        this.pos = save;
-        return dict;
-    }
-    findEndstream(start) {
-        const needle = "endstream";
-        for (let i = start; i <= this.data.length - needle.length; i++) {
-            if (this.byte(i) !== 0x65)
-                continue;
-            if (latin1(this.data.subarray(i, i + needle.length)) === needle) {
-                let end = i;
-                if (end > start && this.byte(end - 1) === 0x0a)
-                    end--;
-                if (end > start && this.byte(end - 1) === 0x0d)
-                    end--;
-                return end;
-            }
-        }
-        throw new PdfParseError("pdf_truncated", `A stream beginning at byte ${start} is never terminated by "endstream".`);
-    }
+    return steps.length > 0 ? { steps, attribute } : null;
 }
-class PdfDocument {
-    data;
-    limits;
-    entries = new Map();
-    cache = new Map();
-    objStmCache = new Map();
-    resolvedCount = 0;
-    inflatedTotal = 0;
-    /** Every xref offset already read, shared by the /Prev loop and /XRefStm. */
-    seenXrefOffsets = new Set();
-    /** One parsed-value budget for the whole document, shared by every lexer. */
-    nodeBudget = { nodes: 0 };
-    trailer = new Map();
-    constructor(data, limits) {
-        this.data = data;
-        this.limits = limits;
-        this.readXrefChain();
-    }
-    /**
-     * One byte, or `-1` past the end.
-     *
-     * Every read goes through here so that running off the end of the buffer is a
-     * value the comparisons below already handle rather than an `undefined` that
-     * turns into a `NaN` three lines later. `-1` is not a byte, so no equality
-     * test against a real character can accidentally match it.
-     */
-    byte(at) {
-        const value = this.data[at];
-        return value === undefined ? -1 : value;
-    }
-    lexer(at) {
-        const lexer = new Lexer(this.data, this.limits, this.nodeBudget);
-        lexer.pos = at;
-        return lexer;
-    }
-    readXrefChain() {
-        const tail = latin1(this.data.subarray(Math.max(0, this.data.length - 2048)));
-        const marker = tail.lastIndexOf("startxref");
-        if (marker === -1) {
-            throw new PdfParseError("pdf_no_startxref", "No `startxref` keyword in the last 2 KiB of the file. Either this is not a PDF, " +
-                "or it was truncated in transit — a complete PDF always ends with startxref and %%EOF.");
-        }
-        const offsetText = /startxref\s+(\d+)/.exec(tail.slice(marker));
-        if (!offsetText) {
-            throw new PdfParseError("pdf_bad_startxref", "The `startxref` keyword is not followed by a byte offset.");
-        }
-        let next = Number(offsetText[1]);
-        const seen = this.seenXrefOffsets;
-        let sections = 0;
-        while (next !== undefined) {
-            if (seen.has(next)) {
-                throw new PdfParseError("pdf_xref_loop", `The cross-reference chain revisits byte ${next}, so it is a loop. ` +
-                    `Refusing rather than following it forever.`);
-            }
-            seen.add(next);
-            if (++sections > this.limits.maxXrefSections) {
-                throw new PdfSecurityError("pdf_xref_chain_too_long", `The cross-reference chain is longer than ${this.limits.maxXrefSections} sections.`);
-            }
-            if (next < 0 || next >= this.data.length) {
-                throw new PdfParseError("pdf_bad_xref_offset", `A cross-reference section claims to start at byte ${next}, outside a ` +
-                    `${this.data.length}-byte file.`);
-            }
-            next = this.readXrefSection(next);
-        }
-        if (!this.trailer.has("Root")) {
-            throw new PdfParseError("pdf_no_root", "No /Root entry in any trailer, so the document catalog cannot be found.");
-        }
-    }
-    /** Reads one section and returns its `/Prev` offset, if any. */
-    readXrefSection(offset) {
-        const lexer = this.lexer(offset);
-        lexer.skipWhitespace();
-        if (latin1(this.data.subarray(lexer.pos, lexer.pos + 4)) === "xref") {
-            lexer.pos += 4;
-            // Classic table: repeated "start count" subsections of 20-byte entries.
-            for (;;) {
-                lexer.skipWhitespace();
-                if (latin1(this.data.subarray(lexer.pos, lexer.pos + 7)) === "trailer") {
-                    lexer.pos += 7;
-                    break;
-                }
-                const start = lexer.readToken();
-                const count = lexer.readToken();
-                if (!/^\d+$/.test(start) || !/^\d+$/.test(count)) {
-                    throw new PdfParseError("pdf_bad_xref_table", `A cross-reference subsection header reads "${start} ${count}", which is not two integers.`);
-                }
-                const first = Number(start);
-                const total = Number(count);
-                if (total > this.limits.maxObjects) {
-                    throw new PdfSecurityError("pdf_too_many_objects", `A cross-reference subsection declares ${total} entries, over the ` +
-                        `${this.limits.maxObjects} limit.`);
-                }
-                for (let i = 0; i < total; i++) {
-                    lexer.skipWhitespace();
-                    const entryStart = lexer.pos;
-                    const entry = latin1(this.data.subarray(entryStart, entryStart + 20));
-                    const match = /^(\d{10})\s(\d{5})\s([nf])/.exec(entry);
-                    if (!match) {
-                        throw new PdfParseError("pdf_bad_xref_table", `Cross-reference entry ${first + i} at byte ${entryStart} is malformed.`);
-                    }
-                    lexer.pos = entryStart + (entry[19] === "\n" || entry[19] === "\r" ? 20 : 19);
-                    if (match[3] === "n" && !this.entries.has(first + i)) {
-                        this.entries.set(first + i, { offset: Number(match[1]) });
-                    }
-                }
-            }
-            const trailer = lexer.parseObject();
-            if (!(trailer instanceof Map)) {
-                throw new PdfParseError("pdf_bad_trailer", "The `trailer` keyword is not followed by a dictionary.");
-            }
-            for (const [key, value] of trailer) {
-                if (!this.trailer.has(key))
-                    this.trailer.set(key, value);
-            }
-            // A hybrid file points at a parallel xref stream; read it for the
-            // entries the table omits.
-            // A hybrid file's /XRefStm is followed by a direct recursive call, so it
-            // does not pass through the loop guard in readXrefChain. Without its own
-            // check, a table whose /XRefStm names its own offset recurses until the
-            // stack gives out — caught below, but only by accident, and only after
-            // re-parsing the whole table once per frame.
-            const xrefStm = trailer.get("XRefStm");
-            if (typeof xrefStm === "number" &&
-                !this.seenXrefOffsets.has(xrefStm) &&
-                xrefStm >= 0 &&
-                xrefStm < this.data.length) {
-                this.seenXrefOffsets.add(xrefStm);
-                try {
-                    this.readXrefSection(xrefStm);
-                }
-                catch {
-                    // A broken /XRefStm in a hybrid file is recoverable: the classic
-                    // table we just read is authoritative for every object it lists.
-                }
-            }
-            const prev = trailer.get("Prev");
-            return typeof prev === "number" ? prev : undefined;
-        }
-        // Cross-reference stream: "N G obj <<...>> stream".
-        lexer.readToken(); // object number
-        lexer.readToken(); // generation
-        const keyword = lexer.readToken();
-        if (keyword !== "obj") {
-            throw new PdfParseError("pdf_bad_xref_offset", `Byte ${offset} is neither an \`xref\` table nor an indirect object, so it ` +
-                `cannot be a cross-reference section.`);
-        }
-        const stream = lexer.parseObject();
-        if (!(stream instanceof PdfStream)) {
-            throw new PdfParseError("pdf_bad_xref_stream", `The object at byte ${offset} is not a stream, so it cannot be a cross-reference stream.`);
-        }
-        this.readXrefStream(stream);
-        for (const [key, value] of stream.dict) {
-            if (!this.trailer.has(key))
-                this.trailer.set(key, value);
-        }
-        const prev = stream.dict.get("Prev");
-        return typeof prev === "number" ? prev : undefined;
-    }
-    readXrefStream(stream) {
-        const data = this.decodeStream(stream);
-        const w = stream.dict.get("W");
-        if (!Array.isArray(w) || w.length < 3) {
-            throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream has no usable /W field-width array.");
-        }
-        const widths = w.map((n) => (typeof n === "number" ? n : 0));
-        const rowLength = widths.reduce((a, b) => a + b, 0);
-        if (rowLength === 0) {
-            throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream declares zero-width fields.");
-        }
-        const size = stream.dict.get("Size");
-        let index = stream.dict.get("Index");
-        if (!Array.isArray(index)) {
-            index = [0, typeof size === "number" ? size : 0];
-        }
-        let pos = 0;
-        for (let pair = 0; pair + 1 < index.length; pair += 2) {
-            const first = Number(index[pair]);
-            const count = Number(index[pair + 1]);
-            if (!Number.isFinite(first) || !Number.isFinite(count) || count < 0) {
-                throw new PdfParseError("pdf_bad_xref_stream", "A cross-reference stream's /Index is not a list of integer pairs.");
-            }
-            if (count > this.limits.maxObjects) {
-                throw new PdfSecurityError("pdf_too_many_objects", `A cross-reference stream declares ${count} entries, over the ${this.limits.maxObjects} limit.`);
-            }
-            for (let i = 0; i < count; i++) {
-                if (pos + rowLength > data.length)
-                    return; // truncated tail: keep what parsed
-                const fields = [];
-                for (const width of widths) {
-                    let value = 0;
-                    for (let b = 0; b < width; b++) {
-                        value = value * 256 + data[pos++];
-                    }
-                    fields.push(value);
-                }
-                const type = widths[0] === 0 ? 1 : fields[0];
-                const num = first + i;
-                if (this.entries.has(num))
-                    continue;
-                if (type === 1) {
-                    this.entries.set(num, { offset: fields[1] });
-                }
-                else if (type === 2) {
-                    this.entries.set(num, {
-                        objStm: { num: fields[1], index: fields[2] },
-                    });
-                }
-            }
-        }
-    }
-    /** Applies filters. Only FlateDecode (optionally PNG-predicted) is implemented. */
-    decodeStream(stream) {
-        const filter = this.resolve(stream.dict.get("Filter") ?? null);
-        const filters = filter instanceof PdfName
-            ? [filter]
-            : Array.isArray(filter)
-                ? filter.filter((f) => f instanceof PdfName)
-                : [];
-        let data = stream.raw;
-        for (const f of filters) {
-            if (f.name === "FlateDecode" || f.name === "Fl") {
-                // The document-wide budget is folded into the per-stream cap rather
-                // than checked afterwards, so a stream that would exhaust it stops
-                // inflating at the boundary instead of allocating past it first.
-                const remaining = Math.max(0, this.limits.maxTotalInflatedBytes - this.inflatedTotal);
-                const perStream = Math.min(this.limits.maxStreamBytes, Math.max(4096, data.length * this.limits.maxCompressionRatio));
-                const cap = Math.min(perStream, remaining);
-                const budgetBound = remaining < perStream;
-                const exhausted = () => {
-                    throw new PdfSecurityError("pdf_total_inflated_too_large", `The streams in this document inflate to more than the ` +
-                        `${this.limits.maxTotalInflatedBytes}-byte document-wide limit. One stream may sit ` +
-                        `under maxStreamBytes and a hundred of them still not; raise ` +
-                        `maxTotalInflatedBytes if the document really is this large.`);
-                };
-                if (cap === 0)
-                    exhausted();
-                try {
-                    data = inflate(data, cap);
-                }
-                catch (error) {
-                    if (budgetBound &&
-                        error instanceof PdfSecurityError &&
-                        error.code === "pdf_stream_too_large") {
-                        exhausted();
-                    }
-                    throw error;
-                }
-                this.inflatedTotal += data.length;
-            }
-            else if (f.name === "Crypt") {
-                throw new PdfUnsupportedFilterError("Crypt", "The document appears to be encrypted.");
-            }
-            else {
-                throw new PdfUnsupportedFilterError(f.name);
-            }
-        }
-        const parms = this.resolve(stream.dict.get("DecodeParms") ?? stream.dict.get("DP") ?? null);
-        // `find` returns the *element*, which in an array-valued /DecodeParms is
-        // routinely an indirect reference. Resolving after the search — as this
-        // used to — hands a PdfRef to code that then calls `.get` on it.
-        const parmDict = parms instanceof Map
-            ? parms
-            : Array.isArray(parms)
-                ? parms
-                    .map((p) => this.resolve(p))
-                    .find((p) => p instanceof Map)
-                : undefined;
-        if (parmDict) {
-            const predictor = Number(this.resolve(parmDict.get("Predictor") ?? 1));
-            if (predictor >= 10) {
-                data = applyPngPredictor(data, Number(this.resolve(parmDict.get("Colors") ?? 1)) || 1, Number(this.resolve(parmDict.get("BitsPerComponent") ?? 8)) || 8, Number(this.resolve(parmDict.get("Columns") ?? 1)) || 1);
-            }
-            else if (predictor === 2) {
-                throw new PdfUnsupportedFilterError("TIFF predictor 2", "It does not occur in Factur-X files.");
-            }
-        }
-        return data;
-    }
-    /** One dereference step. Non-references pass through. */
-    resolve(object) {
-        let current = object;
-        let hops = 0;
-        while (current instanceof PdfRef) {
-            if (++hops > 32) {
-                throw new PdfParseError("pdf_reference_loop", "An indirect reference chain is more than 32 hops long, so it is a loop.");
-            }
-            current = this.getObject(current.num);
-        }
-        return current;
-    }
-    getObject(num) {
-        const cached = this.cache.get(num);
-        if (cached !== undefined)
-            return cached;
-        if (++this.resolvedCount > this.limits.maxObjects) {
-            throw new PdfSecurityError("pdf_too_many_objects", `Resolving this document needed more than ${this.limits.maxObjects} objects.`);
-        }
-        const entry = this.entries.get(num);
-        if (!entry) {
-            throw new PdfParseError("pdf_missing_object", `Object ${num} is referenced but the cross-reference table does not list it.`);
-        }
-        let value;
-        if (entry.objStm) {
-            value = this.getFromObjectStream(entry.objStm.num, entry.objStm.index, num);
-        }
-        else {
-            const offset = entry.offset ?? -1;
-            if (offset < 0 || offset >= this.data.length) {
-                throw new PdfParseError("pdf_bad_object_offset", `Object ${num} is listed at byte ${offset}, outside a ${this.data.length}-byte file.`);
-            }
-            const lexer = this.lexer(offset);
-            const declaredNum = lexer.readToken();
-            lexer.readToken();
-            const keyword = lexer.readToken();
-            if (keyword !== "obj") {
-                throw new PdfParseError("pdf_bad_object_header", `Byte ${offset} should begin object ${num} but reads "${declaredNum} … ${keyword}".`);
-            }
-            value = lexer.parseObject();
-        }
-        this.cache.set(num, value);
-        return value;
-    }
-    getFromObjectStream(stmNum, index, wantedNum) {
-        let parsed = this.objStmCache.get(stmNum);
-        if (!parsed) {
-            const entry = this.entries.get(stmNum);
-            if (entry?.objStm) {
-                // An object stream inside an object stream is forbidden by the spec
-                // (ISO 32000-1 §7.5.7) and is the shape a recursive-decompression
-                // attack takes, so it is refused by name rather than by depth counter.
-                throw new PdfParseError("pdf_nested_object_stream", `Object stream ${stmNum} is itself stored inside an object stream. The PDF ` +
-                    `specification forbids that, and following it is how a decompression loop starts.`);
-            }
-            const stream = this.resolve(new PdfRef(stmNum, 0));
-            if (!(stream instanceof PdfStream)) {
-                throw new PdfParseError("pdf_bad_object_stream", `Object ${stmNum} is referenced as an object stream but is not a stream.`);
-            }
-            const data = this.decodeStream(stream);
-            const count = Number(this.resolve(stream.dict.get("N") ?? 0));
-            const first = Number(this.resolve(stream.dict.get("First") ?? 0));
-            if (!Number.isFinite(count) || !Number.isFinite(first) || count < 0) {
-                throw new PdfParseError("pdf_bad_object_stream", `Object stream ${stmNum} has no usable /N and /First.`);
-            }
-            if (count > this.limits.maxObjects) {
-                throw new PdfSecurityError("pdf_too_many_objects", `Object stream ${stmNum} declares ${count} objects, over the ${this.limits.maxObjects} limit.`);
-            }
-            const header = new Lexer(data, this.limits, this.nodeBudget);
-            const pairs = [];
-            for (let i = 0; i < count; i++) {
-                const objNum = Number(header.readToken());
-                const objOff = Number(header.readToken());
-                if (!Number.isFinite(objNum) || !Number.isFinite(objOff)) {
-                    throw new PdfParseError("pdf_bad_object_stream", `Object stream ${stmNum} has a malformed offset table.`);
-                }
-                pairs.push([objNum, objOff]);
-            }
-            parsed = new Map();
-            for (const [objNum, objOff] of pairs) {
-                const at = first + objOff;
-                if (at < 0 || at >= data.length)
-                    continue;
-                const lexer = new Lexer(data, this.limits, this.nodeBudget);
-                lexer.pos = at;
-                try {
-                    parsed.set(objNum, lexer.parseObject());
-                }
-                catch (error) {
-                    // One unreadable member does not condemn the rest of the stream —
-                    // but a *limit* is not an unreadable member. Swallowing it here let
-                    // a member large enough to blow the parsed-value budget be retried
-                    // as the next member, and the next, with the budget already spent.
-                    if (error instanceof PdfSecurityError)
-                        throw error;
-                }
-            }
-            this.objStmCache.set(stmNum, parsed);
-        }
-        void index;
-        const value = parsed.get(wantedNum);
-        if (value === undefined) {
-            throw new PdfParseError("pdf_missing_object", `Object ${wantedNum} is listed as living in object stream ${stmNum}, which does not contain it.`);
-        }
-        return value;
-    }
-    dictGet(dict, key) {
-        return this.resolve(dict.get(key) ?? null);
-    }
-}
-/**
- * Undo the PNG row filters a cross-reference stream is normally written with.
- *
- * The three parameters come out of a dictionary an attacker writes, so they are
- * checked before they reach arithmetic. `/Columns -5` used to produce a
- * negative row length and a bare `RangeError: Invalid typed array length` from
- * `new Uint8Array(-25)`, and `/Columns 600000000` used to commit a 600 MB
- * allocation for a row buffer no byte of the stream could ever fill.
- */
-function applyPngPredictor(data, colors, bits, columns) {
-    if (data.length === 0)
-        return data;
-    const sane = (value, name, max) => {
-        if (!Number.isInteger(value) || value < 1 || value > max) {
-            throw new PdfParseError("pdf_bad_predictor_parms", `A stream's predictor declares /${name} ${value}, which is not a positive ` +
-                `integer no larger than ${max}. Predictor parameters are read from the ` +
-                `document, so an impossible one is refused rather than turned into an ` +
-                `allocation size.`);
-        }
-        return value;
-    };
-    colors = sane(colors, "Colors", 32);
-    bits = sane(bits, "BitsPerComponent", 32);
-    // A row cannot be longer than the data it is filtered out of: every row costs
-    // at least its own length plus a filter byte, so a larger /Columns describes
-    // rows that cannot exist and must not be allocated for.
-    columns = sane(columns, "Columns", Math.max(1, data.length));
-    const bpp = Math.max(1, Math.ceil((colors * bits) / 8));
-    const rowLength = Math.ceil((colors * bits * columns) / 8);
-    // No complete row fits, so there is nothing to unfilter — and in particular
-    // no reason to allocate a row buffer of that size.
-    if (rowLength + 1 > data.length)
-        return new Uint8Array(0);
-    const rows = Math.floor(data.length / (rowLength + 1));
-    const out = new Uint8Array(rows * rowLength);
-    let prev = new Uint8Array(rowLength);
-    for (let r = 0; r < rows; r++) {
-        const filter = data[r * (rowLength + 1)];
-        const row = data.subarray(r * (rowLength + 1) + 1, r * (rowLength + 1) + 1 + rowLength);
-        const current = new Uint8Array(row);
-        for (let i = 0; i < rowLength; i++) {
-            const left = i >= bpp ? current[i - bpp] : 0;
-            const up = prev[i];
-            const upLeft = i >= bpp ? prev[i - bpp] : 0;
-            switch (filter) {
-                case 0: break;
-                case 1:
-                    current[i] = (current[i] + left) & 0xff;
-                    break;
-                case 2:
-                    current[i] = (current[i] + up) & 0xff;
-                    break;
-                case 3:
-                    current[i] = (current[i] + ((left + up) >> 1)) & 0xff;
-                    break;
-                case 4: {
-                    const p = left + up - upLeft;
-                    const pa = Math.abs(p - left);
-                    const pb = Math.abs(p - up);
-                    const pc = Math.abs(p - upLeft);
-                    const best = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
-                    current[i] = (current[i] + best) & 0xff;
-                    break;
-                }
-                default:
-                    throw new PdfParseError("pdf_bad_predictor", `A stream uses PNG row filter ${filter}, which is not one of the five defined.`);
-            }
-        }
-        out.set(current, r * rowLength);
-        prev = current;
+/** A rule path, as steps through a UBL file. The root step is left out. */
+function ublSteps(raw, root) {
+    const creditNote = root.namespace === CREDIT_NOTE_NS;
+    const out = [];
+    for (const step of raw.slice(1)) {
+        const ns = UBL_NS[step.prefix];
+        if (!ns)
+            return null;
+        const local = (creditNote ? CREDIT_NOTE_NAMES[step.local] : INVOICE_NAMES[step.local]) ?? step.local;
+        out.push({ ns, local, index: step.index, choose: UBL_CHOOSE[step.local] ?? "position" });
     }
     return out;
 }
-// ---------------------------------------------------------------------------
-// Finding the attachment
-// ---------------------------------------------------------------------------
-/**
- * The filenames the standards mandate, best first.
- *
- * `factur-x.xml` is the Factur-X / ZUGFeRD 2.x name, `zugferd-invoice.xml` the
- * ZUGFeRD 1.0 one, and `xrechnung.xml` the name the XRECHNUNG reference profile
- * uses. Any other `.xml` attachment is accepted with a warning rather than
- * refused: a file that carries exactly one XML attachment under a house name is
- * still a file whose invoice we can read, and refusing it would help nobody.
- */
-const PREFERRED_NAMES = ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"];
-/**
- * One `/Filespec` → a candidate, or `undefined` if it does not resolve to one.
- *
- * Resolution failures are swallowed deliberately. A PDF may list several
- * attachments, and one dangling reference must not stop the others being
- * found — the caller's question is "is there an invoice in here", and the
- * honest answer to a file with one broken entry and one good one is the good
- * one. When *every* entry fails, the caller gets `FacturXNotFoundError`, which
- * says what was actually observed, rather than an object-numbering error that
- * only a PDF implementer could act on.
- */
-function fileSpecCandidate(doc, spec, source) {
-    try {
-        return fileSpecCandidateStrict(doc, spec, source);
-    }
-    catch (error) {
-        if (error instanceof PdfSecurityError)
-            throw error; // a limit still stops us
-        return undefined;
-    }
-}
-function fileSpecCandidateStrict(doc, spec, source) {
-    const dict = doc.resolve(spec);
-    if (!(dict instanceof Map))
-        return undefined;
-    const ef = doc.dictGet(dict, "EF");
-    if (!(ef instanceof Map))
-        return undefined;
-    // Each key in turn, not the first key that is *present*: a file whose /F is a
-    // dangling reference and whose /UF is good is a file whose attachment we can
-    // still return, and stopping at /F would have thrown that away.
-    let stream = null;
-    for (const key of ["F", "UF", "DOS", "Mac", "Unix"]) {
-        if (!ef.has(key))
-            continue;
-        let resolved;
-        try {
-            resolved = doc.resolve(ef.get(key) ?? null);
-        }
-        catch (error) {
-            if (error instanceof PdfSecurityError)
-                throw error;
-            continue;
-        }
-        if (resolved instanceof PdfStream) {
-            stream = resolved;
-            break;
-        }
-    }
-    if (!(stream instanceof PdfStream))
-        return undefined;
-    // /UF first — it is the Unicode one, and the one PDF 2.0 prefers — but fall
-    // through to /F when /UF is absent or is not a string at all.
-    const rawName = [doc.dictGet(dict, "UF"), doc.dictGet(dict, "F")].find((v) => typeof v === "string");
-    const name = rawName === undefined ? undefined : decodePdfTextString(rawName);
-    const relationship = doc.dictGet(dict, "AFRelationship");
-    const subtype = doc.dictGet(stream.dict, "Subtype");
-    return {
-        name: (name ?? "").replace(/^.*[\\/]/, ""),
-        stream,
-        source,
-        relationship: relationship instanceof PdfName ? relationship.name : undefined,
-        subtype: subtype instanceof PdfName ? subtype.name : undefined,
-    };
-}
-/**
- * Walk the EmbeddedFiles name tree, bounded in depth *and* in total nodes.
- *
- * The depth cap alone is not a bound. Thirty dictionaries in a chain, each
- * naming the next one twice in its `/Kids`, never exceed depth thirty and
- * describe 2³⁰ paths; because `getObject` caches, the file that says so is
- * about a kilobyte. Measured before this counter existed, depth 28 took 13.5
- * seconds and depth 40 would not have finished. `visited` handles the honest
- * half of the same shape — a diamond, where one node is legitimately reachable
- * by two routes — and the counter catches everything else.
- */
-function walkNameTree(doc, node, out, depth, state = { nodes: 0, visited: new Set(), path: new Set() }) {
-    if (depth > doc.limits.maxNameTreeDepth) {
-        throw new PdfSecurityError("pdf_name_tree_too_deep", `The EmbeddedFiles name tree nests more than ${doc.limits.maxNameTreeDepth} levels deep.`);
-    }
-    if (++state.nodes > doc.limits.maxNameTreeNodes) {
-        throw new PdfSecurityError("pdf_name_tree_too_large", `The EmbeddedFiles name tree has more than ${doc.limits.maxNameTreeNodes} nodes. ` +
-            `A tree whose /Kids revisit each other describes exponentially many paths ` +
-            `through very few objects, so the node count is what bounds the walk, not the depth.`);
-    }
-    const dict = doc.resolve(node);
-    if (!(dict instanceof Map))
-        return;
-    // Reached again from a *different* branch — a diamond. Its subtree is already
-    // collected, so walking it again can only duplicate candidates and multiply
-    // the work; this is the prune that turns 2^30 paths back into 30 nodes.
-    //
-    // Reached again from *within itself* is a different thing: a cycle, which is
-    // a corrupt file rather than a redundant one. That case deliberately falls
-    // through to the depth counter, so it is still reported as the structural
-    // defect it is instead of being quietly read as an empty tree.
-    if (state.visited.has(dict) && !state.path.has(dict))
-        return;
-    state.visited.add(dict);
-    state.path.add(dict);
-    const names = doc.dictGet(dict, "Names");
-    if (Array.isArray(names)) {
-        for (let i = 0; i + 1 < names.length; i += 2) {
-            const key = doc.resolve(names[i]);
-            const candidate = fileSpecCandidate(doc, names[i + 1], "name-tree");
-            if (candidate) {
-                if (!candidate.name && typeof key === "string") {
-                    candidate.name = decodePdfTextString(key);
-                }
-                out.push(candidate);
-            }
-        }
-    }
-    const kids = doc.dictGet(dict, "Kids");
-    if (Array.isArray(kids)) {
-        for (const kid of kids)
-            walkNameTree(doc, kid, out, depth + 1, state);
-    }
-    state.path.delete(dict);
-}
-function utf8(bytes) {
-    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-}
-/**
- * Decode a PDF *text string* into real characters.
- *
- * The lexer hands strings back one byte per code unit, which is right for the
- * byte strings PDF uses for things like `/F`, and wrong for the text strings it
- * uses for `/UF`. ISO 32000-1 §7.9.2.2 says a text string is either
- * PDFDocEncoded or UTF-16BE introduced by a `FE FF` byte-order mark, and
- * §7.9.2.2.1 of PDF 2.0 adds UTF-8 behind `EF BB BF`. Every Factur-X producer
- * writes `/UF (þÿ\0f\0a\0c…)`, so skipping this step made the attachment name
- * come back as `þÿ f a c t u r - x . x m l` — which does not match `/\.xml$/`,
- * and the extractor reported a conformant file as carrying no XML at all.
- *
- * A string with no BOM is left alone: PDFDocEncoding agrees with Latin-1 over
- * every character a filename realistically uses, and guessing beyond that would
- * corrupt names this already reads correctly.
- */
-function decodePdfTextString(value) {
-    if (value.charCodeAt(0) === 0xfe && value.charCodeAt(1) === 0xff) {
-        let out = "";
-        for (let i = 2; i + 1 < value.length; i += 2) {
-            out += String.fromCharCode((value.charCodeAt(i) << 8) | value.charCodeAt(i + 1));
-        }
-        return out;
-    }
-    // Not in the specification, but written by enough producers to be worth
-    // reading: the little-endian mark. Nothing legitimate starts `ÿþ` otherwise.
-    if (value.charCodeAt(0) === 0xff && value.charCodeAt(1) === 0xfe) {
-        let out = "";
-        for (let i = 2; i + 1 < value.length; i += 2) {
-            out += String.fromCharCode((value.charCodeAt(i + 1) << 8) | value.charCodeAt(i));
-        }
-        return out;
-    }
-    if (value.charCodeAt(0) === 0xef &&
-        value.charCodeAt(1) === 0xbb &&
-        value.charCodeAt(2) === 0xbf) {
-        const raw = new Uint8Array(value.length - 3);
-        for (let i = 3; i < value.length; i++)
-            raw[i - 3] = value.charCodeAt(i) & 0xff;
-        return utf8(raw);
-    }
-    return value;
-}
-/**
- * Pull the invoice XML out of a Factur-X / ZUGFeRD / XRechnung-CII PDF.
- *
- * Extraction only — this never writes a PDF. The returned `xml` is the
- * attachment's bytes decoded as UTF-8 and is suitable input for
- * `parseCiiInvoice`.
- *
- * Throws `FacturXNotFoundError` when the document carries no XML attachment,
- * `PdfParseError` when the bytes are not a readable PDF, `PdfSecurityError`
- * when a limit in `PdfLimits` is hit, and `PdfUnsupportedFilterError` for a
- * compression filter this reader does not implement. It does not return a
- * partial result and it does not throw anything else.
- */
-function extractFacturX(bytes, limits = {}) {
-    const lim = { ...DEFAULT_PDF_LIMITS, ...limits };
-    if (!(bytes instanceof Uint8Array)) {
-        throw new PdfParseError("pdf_not_bytes", "extractFacturX expects the PDF as a Uint8Array.");
-    }
-    if (bytes.length === 0) {
-        throw new PdfParseError("pdf_empty", "The input is zero bytes long, so there is no PDF to read.");
-    }
-    const header = latin1(bytes.subarray(0, 1024));
-    if (!header.startsWith("%PDF-") && !header.includes("%PDF-")) {
-        throw new PdfParseError("pdf_no_header", "The input does not begin with %PDF-. A Factur-X file is a PDF; if you have the " +
-            "XML on its own, pass it to parseCiiInvoice instead of this function.");
-    }
-    const warnings = [];
-    const doc = new PdfDocument(bytes, lim);
-    const root = doc.resolve(doc.trailer.get("Root") ?? null);
-    if (!(root instanceof Map)) {
-        throw new PdfParseError("pdf_no_catalog", "The /Root entry does not resolve to a document catalog dictionary.");
-    }
-    const candidates = [];
-    // 1. /Names /EmbeddedFiles — where the attachment is registered.
-    const names = doc.dictGet(root, "Names");
-    if (names instanceof Map) {
-        const embedded = doc.dictGet(names, "EmbeddedFiles");
-        if (embedded instanceof Map)
-            walkNameTree(doc, embedded, candidates, 0);
-    }
-    // 2. /AF — the PDF/A-3 associated-files array. Factur-X requires both, and
-    // a file that has only one of them still opens, so both are read.
-    const af = doc.dictGet(root, "AF");
-    if (Array.isArray(af)) {
-        for (const spec of af) {
-            const candidate = fileSpecCandidate(doc, spec, "AF");
-            if (candidate)
-                candidates.push(candidate);
-        }
-    }
-    if (candidates.length === 0) {
-        throw new FacturXNotFoundError("This PDF has no embedded files: neither a /Names /EmbeddedFiles name tree nor an " +
-            "/AF array names one. It is an ordinary PDF, not a Factur-X or ZUGFeRD file — " +
-            "the XML invoice is what makes it one, and there is no XML here.");
-    }
-    // Deduplicate: the same stream normally appears in both the name tree and
-    // /AF, which is correct and not worth a warning. Two *different* streams
-    // under one name is worth one.
-    const unique = [];
-    for (const candidate of candidates) {
-        const twin = unique.find((u) => u.name.toLowerCase() === candidate.name.toLowerCase());
-        if (!twin) {
-            unique.push(candidate);
-            continue;
-        }
-        if (twin.stream !== candidate.stream) {
-            warnings.push(`The name tree and the /AF array both name "${candidate.name}" but point at different ` +
-                `embedded streams. The name-tree copy was used. A conformant file has one attachment ` +
-                `referenced from both places.`);
-        }
-    }
-    const xmlCandidates = unique.filter((c) => /\.xml$/i.test(c.name));
-    if (xmlCandidates.length === 0) {
-        throw new FacturXNotFoundError(`This PDF has ${unique.length} embedded file(s) — ${unique
-            .map((c) => `"${c.name}"`)
-            .join(", ")} — and none of them is an .xml file. Factur-X and ZUGFeRD carry the ` +
-            `invoice as XML attached under factur-x.xml, zugferd-invoice.xml or xrechnung.xml.`);
-    }
-    const ranked = [...xmlCandidates].sort((a, b) => {
-        const ai = PREFERRED_NAMES.indexOf(a.name.toLowerCase());
-        const bi = PREFERRED_NAMES.indexOf(b.name.toLowerCase());
-        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+/** A CII path written as text (`ram:X/udt:Y`), as steps. */
+function ciiSegments(to) {
+    return to
+        .split("/")
+        .filter(Boolean)
+        .map((part) => {
+        if (part === "..")
+            return "..";
+        const [prefix, local] = part.split(":");
+        return { ns: CII_NS[prefix], local, choose: "position" };
     });
-    const chosen = ranked[0];
-    if (ranked.length > 1) {
-        warnings.push(`This PDF carries ${ranked.length} XML attachments (${ranked
-            .map((c) => `"${c.name}"`)
-            .join(", ")}). "${chosen.name}" was returned. A conformant Factur-X file has exactly one.`);
-    }
-    if (!PREFERRED_NAMES.includes(chosen.name.toLowerCase())) {
-        warnings.push(`The XML is attached as "${chosen.name}", which is not one of the standard names ` +
-            `(${PREFERRED_NAMES.join(", ")}). The XML was returned anyway, but a receiver that ` +
-            `looks the attachment up by name — as Factur-X readers are entitled to — will not find it.`);
-    }
-    if (chosen.relationship === undefined) {
-        warnings.push(`The attachment declares no /AFRelationship. PDF/A-3 requires one, and Germany requires ` +
-            `"Alternative" for the BASIC, EN 16931, EXTENDED and XRECHNUNG profiles.`);
-    }
-    else if (!["Alternative", "Data", "Source"].includes(chosen.relationship)) {
-        warnings.push(`The attachment declares /AFRelationship "${chosen.relationship}". Factur-X expects ` +
-            `"Alternative" (the XML and the page image are the same invoice).`);
-    }
-    if (chosen.subtype && !/xml/i.test(chosen.subtype)) {
-        warnings.push(`The embedded file's /Subtype is "${chosen.subtype}" rather than an XML media type.`);
-    }
-    const raw = doc.decodeStream(chosen.stream);
-    if (raw.length > lim.maxAttachmentBytes) {
-        throw new PdfSecurityError("pdf_attachment_too_large", `The embedded XML is ${raw.length} bytes, over the ${lim.maxAttachmentBytes}-byte limit. ` +
-            `Raise maxAttachmentBytes if an invoice this size is expected.`);
-    }
-    const xml = utf8(raw).replace(/^﻿/, "");
-    if (!/<[^>]*CrossIndustryInvoice/i.test(xml) && !/<\?xml/i.test(xml)) {
-        warnings.push(`The attachment "${chosen.name}" does not begin with an XML declaration and contains no ` +
-            `CrossIndustryInvoice element, so it may not be an invoice at all. It was returned ` +
-            `unchanged for you to inspect.`);
-    }
-    else if (!/CrossIndustryInvoice/i.test(xml)) {
-        warnings.push(`The attachment is XML but has no rsm:CrossIndustryInvoice root. Factur-X and ZUGFeRD 2.x ` +
-            `carry UN/CEFACT CII; this may be a ZUGFeRD 1.0 document or another syntax entirely.`);
-    }
-    return { xml, attachmentName: chosen.name, warnings };
 }
+/**
+ * A rule's UBL path, translated to steps through a CII file.
+ *
+ * `complete` is false when the path runs past what the table knows; the steps
+ * then stop at the last element it could translate.
+ */
+function ciiSteps(raw) {
+    let steps = [];
+    let kids = UBL_TO_CII;
+    let carried;
+    for (const step of raw.slice(1)) {
+        const node = kids?.[`${step.prefix}:${step.local}`];
+        if (!node)
+            return { steps, complete: false };
+        if (node.to.startsWith("/"))
+            steps = [];
+        const added = [];
+        for (const seg of ciiSegments(node.to)) {
+            if (seg === "..") {
+                if (added.length > 0)
+                    added.pop();
+                else
+                    steps.pop();
+            }
+            else
+                added.push(seg);
+        }
+        // A step that adds no CII element of its own (`to: ""`) cannot hold its
+        // index, so the index goes down to the next one, as `carry` asks for
+        // explicitly. Dropping it would make `PartyIdentification[2]/cbc:ID` read
+        // as the only identifier, and point confidently at the first.
+        const passes = node.carry || added.length === 0;
+        const index = passes ? undefined : (step.index ?? carried);
+        carried = passes ? (step.index ?? carried) : undefined;
+        const last = added.at(-1);
+        if (last) {
+            last.choose = node.choose ?? "position";
+            last.index = index;
+            if (node.or)
+                last.or = node.or;
+        }
+        steps.push(...added);
+        kids = node.kids;
+    }
+    return { steps, complete: true };
+}
+/** Allowances then charges, per list of siblings; the list is the cached one above. */
+const allowanceOrder = new WeakMap();
+const isCharge = (el) => {
+    for (const child of el.children) {
+        if (child.local !== "ChargeIndicator")
+            continue;
+        // UBL states it as text; CII wraps it in udt:Indicator.
+        const text = child.children.length > 0 ? (child.children[0]?.text ?? "") : child.text;
+        return text.trim().toLowerCase() === "true";
+    }
+    return false;
+};
+/**
+ * An element's children grouped by expanded name, built once per element.
+ *
+ * Every finding walks from the root, and a document with a finding on each of
+ * its N lines would otherwise filter the root's N children N times: measured
+ * at 216 µs a finding on a 4,000-line invoice against 19 µs at 100 lines,
+ * which is quadratic. A WeakMap keeps the index exactly as long as the tree.
+ */
+const byName = new WeakMap();
+function childrenNamed(parent, ns, local) {
+    let index = byName.get(parent);
+    if (!index) {
+        index = new Map();
+        for (const c of parent.children) {
+            const key = `${c.namespace} ${c.local}`;
+            const list = index.get(key);
+            if (list)
+                list.push(c);
+            else
+                index.set(key, [c]);
+        }
+        byName.set(parent, index);
+    }
+    return index.get(`${ns} ${local}`) ?? [];
+}
+/** Pick the child a step names. Undefined when it is missing or cannot be told apart. */
+function choose(parent, step) {
+    let named = childrenNamed(parent, step.ns, step.local);
+    if (step.or) {
+        const also = step.or.flatMap((local) => childrenNamed(parent, step.ns, local));
+        // Back in document order, which is what "the only one" and a position mean.
+        if (also.length > 0)
+            named = [...named, ...also].sort((a, b) => parent.children.indexOf(a) - parent.children.indexOf(b));
+    }
+    const n = step.index ?? 1;
+    switch (step.choose) {
+        case "allowance": {
+            let ordered = allowanceOrder.get(named);
+            if (!ordered) {
+                ordered = [...named.filter((c) => !isCharge(c)), ...named.filter(isCharge)];
+                allowanceOrder.set(named, ordered);
+            }
+            return ordered[n - 1];
+        }
+        case "taxTotal": {
+            if (named.length <= 1)
+                return n === 1 ? named[0] : undefined;
+            const withBreakdown = named.filter((t) => t.children.some((c) => c.local === "TaxSubtotal"));
+            const without = named.filter((t) => !withBreakdown.includes(t));
+            if (withBreakdown.length !== 1 || without.length !== 1)
+                return undefined;
+            return n === 1 ? withBreakdown[0] : n === 2 ? without[0] : undefined;
+        }
+        case "single":
+            return named.length === 1 && n === 1 ? named[0] : undefined;
+        case "position":
+            // An index the path does not give is only an answer when there is one.
+            if (step.index === undefined && named.length > 1)
+                return undefined;
+            return named[n - 1];
+    }
+}
+function walk(root, steps) {
+    let el = root;
+    for (const step of steps) {
+        const next = choose(el, step);
+        if (!next)
+            return { el, exact: false };
+        el = next;
+    }
+    return { el, exact: true };
+}
+const at = (el, exact) => ({
+    line: el.line,
+    column: el.column,
+    path: el.path,
+    exact,
+});
+/**
+ * Where a rule's path lands in a parsed document.
+ *
+ * `xpath` is the address to report: the element's path in the file as written
+ * when it was found, otherwise the rule's own path in the file's syntax (the
+ * place the element belongs), otherwise undefined for a CII file whose path
+ * could not be translated, because a UBL path on a CII document points at
+ * nothing and is worse than no path.
+ */
+function locateFinding(xpath, root, syntax) {
+    const parsed = xpath ? splitPath(xpath) : null;
+    if (!parsed)
+        return { location: at(root, false), xpath: syntax === "ubl" ? xpath : undefined };
+    const suffix = parsed.attribute ? `/@${parsed.attribute}` : "";
+    const first = parsed.steps[0];
+    // A handful of rules already write a CII path; walk it as written.
+    if (first.prefix === "rsm") {
+        if (syntax !== "cii")
+            return { location: at(root, false), xpath: undefined };
+        const steps = parsed.steps.slice(1).map((s) => ({
+            ns: CII_NS[s.prefix] ?? "",
+            local: s.local,
+            index: s.index,
+            choose: "position",
+        }));
+        const { el, exact } = walk(root, steps);
+        return { location: at(el, exact), xpath: exact ? el.path + suffix : xpath };
+    }
+    if (syntax === "ubl") {
+        const steps = ublSteps(parsed.steps, root);
+        if (!steps)
+            return { location: at(root, false), xpath };
+        const { el, exact } = walk(root, steps);
+        return { location: at(el, exact), xpath: exact ? el.path + suffix : xpath };
+    }
+    const { steps, complete } = ciiSteps(parsed.steps);
+    const { el, exact } = walk(root, steps);
+    const found = exact && complete;
+    const written = complete
+        ? `/rsm:CrossIndustryInvoice${steps.map((s) => `/${prefixOf(s.ns)}:${s.local}${s.index ? `[${s.index}]` : ""}`).join("")}${suffix}`
+        : undefined;
+    return { location: at(el, found), xpath: found ? el.path + suffix : written };
+}
+const prefixOf = (ns) => Object.entries(CII_NS).find(([, uri]) => uri === ns)?.[0] ?? "ram";
+/** @internal For the table's own test: whether a path translates in full. */
+const __ciiSteps = (xpath) => {
+    const parsed = splitPath(xpath);
+    return parsed ? ciiSteps(parsed.steps) : null;
+};
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/codelists/invoice-type.js
 /**
@@ -65753,6 +65757,589 @@ function cii_tax_point_code_taxPointCodeToCii(code) {
     return MODEL_TO_CII[code.trim()] ?? code;
 }
 
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-parse.js
+/**
+ * Minimal, hardened XML reader for the UBL subset.
+ *
+ * This package ships with zero runtime dependencies, so it cannot pull in a
+ * general XML parser — and it should not want to. A general parser accepts far
+ * more than UBL needs (DTDs, entities, mixed content, notations), and every one
+ * of those features is an attack surface when the document comes from a third
+ * party.
+ *
+ * What this reader accepts:
+ *   - one root element, with nested elements, attributes and text
+ *   - namespace declarations (`xmlns` and `xmlns:prefix`), resolved to URIs
+ *   - the five predefined entities (`&amp; &lt; &gt; &quot; &apos;`) and
+ *     numeric character references
+ *   - CDATA sections, comments and processing instructions
+ *
+ * What it refuses, loudly:
+ *   - any document containing `<!DOCTYPE` or `<!ENTITY`
+ *   - any entity reference that is not one of the five predefined ones
+ *   - documents deeper, longer or larger than the limits below
+ *   - mixed content: an element with both child elements and text
+ *
+ * Refusing is deliberate. A parser that guesses at a construct it does not
+ * understand produces a wrong invoice, and a wrong invoice is a tax problem.
+ */
+/** Base class for every failure this reader and the UBL mapper raise. */
+class ParseError extends Error {
+    code;
+    constructor(code, message) {
+        super(message);
+        this.name = new.target.name;
+        this.code = code;
+    }
+}
+/** The document is not well-formed XML, or uses a construct outside the subset. */
+class XmlSyntaxError extends ParseError {
+}
+/**
+ * The document tripped one of the limits that exist to stop a hostile file
+ * from exhausting memory or CPU. Never a comment on the invoice itself.
+ */
+class XmlSecurityError extends ParseError {
+}
+const DEFAULT_XML_LIMITS = {
+    maxCharacters: 8_000_000,
+    maxDepth: 100,
+    maxElements: 50_000,
+    maxAttributes: 256,
+};
+/** Attribute lookup by namespace and local name. */
+function attr(el, local, namespace = "") {
+    for (const a of el.attributes) {
+        if (a.local === local && a.namespace === namespace)
+            return a.value;
+    }
+    return undefined;
+}
+const NAME_START = /[A-Za-z_]/;
+const NAME_CHAR = /[A-Za-z0-9._\-]/;
+/**
+ * Characters XML 1.0 does not permit at all. They cannot be escaped, so a
+ * document containing one is not well-formed however it was produced. Checked
+ * on decoded text and attribute values, which is also where a numeric
+ * character reference to a control character would land.
+ */
+// eslint-disable-next-line no-control-regex
+const ILLEGAL_XML_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/;
+const XMLNS_URI = "http://www.w3.org/2000/xmlns/";
+const XML_URI = "http://www.w3.org/XML/1998/namespace";
+/** A namespace map with no prototype at all — see {@link Frame.nsMap}. */
+function emptyNsMap() {
+    const map = Object.create(null);
+    map[""] = "";
+    map["xml"] = XML_URI;
+    return map;
+}
+/**
+ * Parse a UBL-shaped XML document into a tree.
+ *
+ * @throws {XmlSecurityError} on a DOCTYPE, a non-predefined entity, or a
+ *   document over any of the limits.
+ * @throws {XmlSyntaxError} on anything that is not well-formed, or that uses a
+ *   construct outside the accepted subset.
+ */
+function xml_parse_parseXml(source, limits = {}) {
+    const lim = { ...DEFAULT_XML_LIMITS, ...limits };
+    if (typeof source !== "string") {
+        throw new XmlSyntaxError("xml_not_a_string", "Expected the XML document as a string.");
+    }
+    // Defence: input size cap. Refuses a hostile or accidental upload before any
+    // allocation, rather than running out of memory building the tree.
+    if (source.length > lim.maxCharacters) {
+        throw new XmlSecurityError("xml_too_large", `The document is ${source.length} characters, over the ${lim.maxCharacters} ` +
+            `character limit. Raise it with the maxCharacters option if you really do ` +
+            `need to parse a document this size, or check that you are not passing a ` +
+            `whole archive where one invoice was expected.`);
+    }
+    // Defence against XXE and against billion-laughs style entity expansion: no
+    // DTD is processed at all, and a document that carries one is refused rather
+    // than parsed with the declarations ignored. Ignoring them would silently
+    // change the meaning of every entity reference in the body. The check runs on
+    // the raw text, so it also fires for a DOCTYPE hidden inside a CDATA section
+    // — a false positive we accept, because no invoice needs one.
+    const doctypeAt = source.indexOf("<!DOCTYPE");
+    if (doctypeAt >= 0) {
+        throw new XmlSecurityError("xml_doctype_forbidden", "This document contains a DOCTYPE declaration, which this parser refuses to " +
+            "process. A DTD can declare external entities (the XXE attack, which reads " +
+            "local files or makes network requests) and nested internal entities (the " +
+            "billion-laughs attack, which exhausts memory). No EN 16931 invoice needs a " +
+            "DOCTYPE. Remove the declaration and parse the document again.");
+    }
+    const entityAt = source.indexOf("<!ENTITY");
+    if (entityAt >= 0) {
+        throw new XmlSecurityError("xml_entity_declaration_forbidden", "This document declares an XML entity. Custom entities are never expanded by " +
+            "this parser, because entity expansion is how the billion-laughs denial of " +
+            "service works. Remove the declaration.");
+    }
+    let i = 0;
+    // A byte order mark is legal and invisible; drop it rather than treating it
+    // as text before the root element.
+    if (source.charCodeAt(0) === 0xfeff)
+        i = 1;
+    const stack = [];
+    let root;
+    let elementCount = 0;
+    // Line and column of an offset. Elements are met in document order, so the
+    // scan only ever moves forward and the whole document is walked once: O(n)
+    // in total, not O(n) per element. A line ends at LF, CRLF or a lone CR, as
+    // XML 1.0 section 2.11 and every editor have it: a file saved with classic
+    // Mac line endings is not one long line.
+    let scanned = i;
+    let lineNo = 1;
+    let lineStart = i;
+    const position = (at) => {
+        for (; scanned < at; scanned += 1) {
+            const ch = source.charCodeAt(scanned);
+            if (ch === 10 || (ch === 13 && source.charCodeAt(scanned + 1) !== 10)) {
+                lineNo += 1;
+                lineStart = scanned + 1;
+            }
+        }
+        return [lineNo, at - lineStart + 1];
+    };
+    const fail = (code, message) => {
+        throw new XmlSyntaxError(code, `${message} (at character ${i})`);
+    };
+    const readName = () => {
+        const start = i;
+        if (i >= source.length || !NAME_START.test(source[i])) {
+            fail("xml_bad_name", "Expected an element or attribute name");
+        }
+        i += 1;
+        let colons = 0;
+        while (i < source.length) {
+            const ch = source[i];
+            if (ch === ":") {
+                colons += 1;
+                if (colons > 1) {
+                    fail("xml_bad_name", "A qualified name may contain at most one colon");
+                }
+                i += 1;
+                if (i >= source.length || !NAME_START.test(source[i])) {
+                    fail("xml_bad_name", "Expected a local name after the namespace prefix");
+                }
+                i += 1;
+                continue;
+            }
+            if (!NAME_CHAR.test(ch))
+                break;
+            i += 1;
+        }
+        return source.slice(start, i);
+    };
+    const skipSpace = () => {
+        while (i < source.length && /[\s]/.test(source[i]))
+            i += 1;
+    };
+    const decode = (raw, where) => {
+        const decoded = raw.includes("&") ? decodeEntities(raw, where) : raw;
+        if (ILLEGAL_XML_CHARS.test(decoded)) {
+            throw new XmlSyntaxError("xml_illegal_character", `${where} contains a control character that XML 1.0 does not permit. ` +
+                `Such a character cannot be escaped: the document is not well-formed.`);
+        }
+        return decoded;
+    };
+    const current = () => stack[stack.length - 1];
+    while (i < source.length) {
+        const lt = source.indexOf("<", i);
+        if (lt < 0) {
+            // Trailing text after the last tag.
+            const rest = source.slice(i);
+            if (rest.trim() !== "") {
+                fail("xml_text_outside_root", "Text after the root element");
+            }
+            break;
+        }
+        if (lt > i) {
+            const raw = source.slice(i, lt);
+            const frame = current();
+            if (!frame) {
+                if (raw.trim() !== "") {
+                    fail("xml_text_outside_root", "Text outside the root element");
+                }
+            }
+            else {
+                frame.text.push(decode(raw, `The content of <${frame.el.qname}>`));
+            }
+            i = lt;
+        }
+        // --- comment ------------------------------------------------------------
+        if (source.startsWith("<!--", i)) {
+            const end = source.indexOf("-->", i + 4);
+            if (end < 0)
+                fail("xml_unterminated_comment", "Unterminated comment");
+            // XML 1.0 forbids the literal string "--" anywhere inside a comment.
+            // "-->" is the only terminator there is, so a comment carrying "--" has
+            // no single reading: a writer who meant it as text and a reader who takes
+            // it as the start of the terminator disagree about where the comment ends
+            // — and therefore about how much of the document is markup. Refusing is
+            // the only answer that cannot silently drop or resurrect content.
+            const body = source.slice(i + 4, end);
+            const dashes = body.indexOf("--");
+            if (dashes >= 0) {
+                fail("xml_bad_comment", `A comment contains "--" ${dashes + 4} characters in, which XML 1.0 does ` +
+                    `not permit anywhere inside a comment`);
+            }
+            // The same rule seen from the other end: a comment may not finish with a
+            // hyphen, because that writes the close as "--->". Single hyphens
+            // separated by other characters are legal and stay legal — "<!-- a- -b -->"
+            // parses.
+            if (body.endsWith("-")) {
+                fail("xml_bad_comment", `A comment ends "--->" ${body.length + 4} characters in; a comment may not ` +
+                    `end with a hyphen`);
+            }
+            // The Char production covers comments too: a control character here is
+            // as ill-formed as one in text, and a reader that skips it would accept a
+            // file that every schema validator refuses.
+            if (ILLEGAL_XML_CHARS.test(body)) {
+                fail("xml_illegal_character", "A comment contains a control character that XML 1.0 does not permit");
+            }
+            i = end + 3;
+            continue;
+        }
+        // --- CDATA --------------------------------------------------------------
+        if (source.startsWith("<![CDATA[", i)) {
+            const end = source.indexOf("]]>", i + 9);
+            if (end < 0)
+                fail("xml_unterminated_cdata", "Unterminated CDATA section");
+            const frame = current();
+            const raw = source.slice(i + 9, end);
+            if (!frame) {
+                fail("xml_text_outside_root", "CDATA outside the root element");
+            }
+            else {
+                // No entity decoding inside CDATA — that is what CDATA means.
+                if (ILLEGAL_XML_CHARS.test(raw)) {
+                    throw new XmlSyntaxError("xml_illegal_character", "A CDATA section contains a control character that XML 1.0 does not permit.");
+                }
+                frame.text.push(raw);
+            }
+            i = end + 3;
+            continue;
+        }
+        // --- processing instruction (including the XML declaration) -------------
+        if (source.startsWith("<?", i)) {
+            const end = source.indexOf("?>", i + 2);
+            if (end < 0) {
+                fail("xml_unterminated_pi", "Unterminated processing instruction");
+            }
+            // Processing instructions are skipped, never acted on. A stylesheet PI in
+            // particular must not cause this library to fetch anything. Skipped is
+            // not unchecked: the same characters are forbidden here as in text.
+            if (ILLEGAL_XML_CHARS.test(source.slice(i + 2, end))) {
+                fail("xml_illegal_character", "A processing instruction contains a control character that XML 1.0 does not permit");
+            }
+            i = end + 2;
+            continue;
+        }
+        // --- other declarations -------------------------------------------------
+        if (source.startsWith("<!", i)) {
+            fail("xml_unsupported_declaration", "Unsupported markup declaration; only comments and CDATA sections are accepted");
+        }
+        // --- end tag ------------------------------------------------------------
+        if (source.startsWith("</", i)) {
+            i += 2;
+            const qname = readName();
+            skipSpace();
+            if (source[i] !== ">")
+                fail("xml_bad_end_tag", "Expected '>' to close an end tag");
+            i += 1;
+            const frame = stack.pop();
+            if (!frame)
+                fail("xml_unbalanced", `Stray end tag </${qname}>`);
+            if (frame.el.qname !== qname) {
+                fail("xml_unbalanced", `End tag </${qname}> does not match the open element <${frame.el.qname}>`);
+            }
+            closeFrame(frame);
+            continue;
+        }
+        // --- start tag ----------------------------------------------------------
+        const [line, column] = position(i);
+        i += 1;
+        const qname = readName();
+        elementCount += 1;
+        // Defence: element-count cap. A flat document of millions of empty
+        // elements passes the depth check and can still exhaust memory.
+        if (elementCount > lim.maxElements) {
+            throw new XmlSecurityError("xml_too_many_elements", `The document has more than ${lim.maxElements} elements. Raise the ` +
+                `maxElements option if a document this large is genuinely expected.`);
+        }
+        const parent = current();
+        const rawAttrs = [];
+        let selfClosing = false;
+        for (;;) {
+            skipSpace();
+            if (i >= source.length)
+                fail("xml_unterminated_tag", "Unterminated start tag");
+            if (source[i] === ">") {
+                i += 1;
+                break;
+            }
+            if (source.startsWith("/>", i)) {
+                selfClosing = true;
+                i += 2;
+                break;
+            }
+            const aname = readName();
+            skipSpace();
+            if (source[i] !== "=") {
+                fail("xml_bad_attribute", `Attribute ${aname} has no value`);
+            }
+            i += 1;
+            skipSpace();
+            const quote = source[i];
+            if (quote !== '"' && quote !== "'") {
+                fail("xml_bad_attribute", `The value of ${aname} is not quoted`);
+            }
+            const end = source.indexOf(quote, i + 1);
+            if (end < 0)
+                fail("xml_bad_attribute", `Unterminated value for ${aname}`);
+            const raw = source.slice(i + 1, end);
+            if (raw.includes("<")) {
+                fail("xml_bad_attribute", `The value of ${aname} contains an unescaped '<'`);
+            }
+            rawAttrs.push({ qname: aname, value: decode(raw, `The value of ${aname}`) });
+            // Defence: per-element attribute cap. Namespace declarations are
+            // attributes, and an element carrying tens of thousands of them builds a
+            // namespace map that every descendant lookup has to walk.
+            if (rawAttrs.length > lim.maxAttributes) {
+                throw new XmlSecurityError("xml_too_many_attributes", `<${qname}> carries more than ${lim.maxAttributes} attributes. Raise the ` +
+                    `maxAttributes option only if a document this unusual is genuinely ` +
+                    `expected; an EN 16931 element carries a handful.`);
+            }
+            i = end + 1;
+        }
+        // Namespace declarations first: an element's own prefix may be declared on
+        // the element itself.
+        let nsMap = parent ? parent.nsMap : emptyNsMap();
+        let declared = false;
+        for (const a of rawAttrs) {
+            const isDefault = a.qname === "xmlns";
+            const isPrefixed = a.qname.startsWith("xmlns:");
+            if (!isDefault && !isPrefixed)
+                continue;
+            if (!declared) {
+                // Chain, do not copy: copying the inherited map on every element that
+                // declares a prefix is quadratic in the number of declarations in
+                // scope. `Object.create` is O(1) and lookups still find inherited
+                // prefixes, because the whole chain is ours and bottoms out at a
+                // null-prototype map.
+                nsMap = Object.create(nsMap);
+                declared = true;
+            }
+            const prefix = isDefault ? "" : a.qname.slice(6);
+            if (isPrefixed && a.value === "") {
+                fail("xml_bad_namespace", `Cannot undeclare the prefix ${prefix}`);
+            }
+            nsMap[prefix] = a.value;
+        }
+        const resolve = (name, forAttribute) => {
+            const colon = name.indexOf(":");
+            if (colon < 0) {
+                // An unprefixed attribute is in no namespace; an unprefixed element is
+                // in the default namespace.
+                return [forAttribute ? "" : (nsMap[""] ?? ""), name];
+            }
+            const prefix = name.slice(0, colon);
+            const local = name.slice(colon + 1);
+            if (prefix === "xmlns")
+                return [XMLNS_URI, local];
+            const uri = nsMap[prefix];
+            if (uri === undefined) {
+                fail("xml_unbound_prefix", `The namespace prefix "${prefix}" is used but never declared`);
+            }
+            return [uri, local];
+        };
+        const [ns, local] = resolve(qname, false);
+        const attributes = rawAttrs.map((a) => {
+            const [ans, alocal] = resolve(a.qname, true);
+            return { namespace: ans, local: alocal, qname: a.qname, value: a.value };
+        });
+        // XML 1.0 well-formedness: no element may carry the same attribute twice.
+        // "The same" is the expanded name — namespace URI plus local name — not the
+        // text as written, so `a:x` and `b:x` are one attribute written twice when
+        // both prefixes are bound to one URI, while the same local name under two
+        // genuinely different namespaces is legal and stays accepted. That is why
+        // this runs here rather than over `rawAttrs`: only after `resolve` is the
+        // namespace context of this element known.
+        //
+        // Accepting a duplicate is not a cosmetic fault. `attr()` returns the first
+        // match, so a document stating two different @currencyID or @schemeID values
+        // on one element would be read by position, and whichever value lost is
+        // gone from the invoice with nothing raised.
+        const seen = new Map();
+        for (const a of attributes) {
+            // NUL separates the two halves unambiguously: it is refused as an illegal
+            // character everywhere else, so it cannot be smuggled into a namespace URI
+            // to forge or hide a collision.
+            const key = `${a.namespace}\u0000${a.local}`;
+            const first = seen.get(key);
+            if (first !== undefined) {
+                fail("xml_duplicate_attribute", first === a.qname
+                    ? `<${qname}> carries the attribute ${a.qname} twice`
+                    : `<${qname}> carries both ${first} and ${a.qname}, which are the same ` +
+                        `attribute once their prefixes are resolved`);
+            }
+            seen.set(key, a.qname);
+        }
+        // The `[n]` index counts preceding siblings of the same name. Counting them
+        // by rescanning `parent.el.children` is O(siblings) per element and so
+        // quadratic over the document: a flat 200,000-element file took over two
+        // minutes, entirely inside this one line, and no cap bounded it because
+        // maxElements is only checked once the element is already being built.
+        // A per-frame tally is O(1) and produces byte-identical paths.
+        let sameName = 0;
+        if (parent) {
+            sameName = parent.counts.get(qname) ?? 0;
+            parent.counts.set(qname, sameName + 1);
+        }
+        const step = sameName > 0 ? `${qname}[${sameName + 1}]` : qname;
+        const path = parent ? `${parent.el.path}/${step}` : `/${qname}`;
+        const el = {
+            namespace: ns,
+            local,
+            qname,
+            path,
+            line,
+            column,
+            attributes,
+            children: [],
+            text: "",
+        };
+        if (parent) {
+            parent.el.children.push(el);
+        }
+        else if (root) {
+            fail("xml_multiple_roots", "A document may have only one root element");
+        }
+        else {
+            root = el;
+        }
+        if (selfClosing) {
+            continue;
+        }
+        const frame = { el, nsMap, counts: new Map(), text: [] };
+        stack.push(frame);
+        // Defence: nesting depth cap. Without it, a few kilobytes of open tags
+        // build a tree hundreds of thousands of levels deep and any recursive
+        // consumer of it overflows the stack.
+        if (stack.length > lim.maxDepth) {
+            throw new XmlSecurityError("xml_too_deep", `The document nests more than ${lim.maxDepth} elements deep. A UBL invoice ` +
+                `nests about eight levels; a document this deep is either broken or ` +
+                `hostile. Raise the maxDepth option only if you know why it is that deep.`);
+        }
+    }
+    if (stack.length > 0) {
+        throw new XmlSyntaxError("xml_unbalanced", `The document ends while <${stack[stack.length - 1].el.qname}> is still open.`);
+    }
+    if (!root) {
+        throw new XmlSyntaxError("xml_no_root", "The document contains no root element.");
+    }
+    return root;
+}
+function closeFrame(frame) {
+    const text = frame.text.join("");
+    if (frame.el.children.length > 0) {
+        if (text.trim() !== "") {
+            throw new XmlSyntaxError("xml_mixed_content", `<${frame.el.qname}> holds both child elements and text ("${text.trim().slice(0, 40)}"). ` +
+                `UBL never mixes the two, so this parser refuses the document rather than ` +
+                `guessing which of the two carries the value.`);
+        }
+        frame.el.text = "";
+        return;
+    }
+    frame.el.text = text;
+}
+/**
+ * The five predefined entities, and nothing else.
+ *
+ * Null-prototype on purpose. As an object literal this table also answered to
+ * every member of `Object.prototype`: `&constructor;` resolved to the `Object`
+ * constructor and was substituted into the document as the string
+ * `"function Object() { [native code] }"`, so an invoice number written
+ * `&constructor;` parsed, validated and was billed for without a single
+ * finding. `&toString;`, `&valueOf;` and `&__proto__;` did the same. Every one
+ * of those names is short enough to pass the length guard in `decodeEntities`.
+ */
+const PREDEFINED = Object.assign(Object.create(null), {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+});
+/**
+ * Decode the five predefined entities and numeric character references.
+ *
+ * Every other entity reference is refused. Custom entities are what the
+ * billion-laughs attack expands, and external entities are what XXE
+ * dereferences; neither is decoded here, and neither is quietly dropped —
+ * dropping one would change the text of a tax document without saying so.
+ *
+ * Numeric character references are safe to expand: each produces exactly one
+ * character and cannot refer to another reference, so there is no expansion to
+ * run away.
+ */
+function decodeEntities(raw, where) {
+    let out = "";
+    let i = 0;
+    for (;;) {
+        const amp = raw.indexOf("&", i);
+        if (amp < 0) {
+            out += raw.slice(i);
+            return out;
+        }
+        out += raw.slice(i, amp);
+        const semi = raw.indexOf(";", amp + 1);
+        // A reference longer than this is not one of ours and not a code point.
+        if (semi < 0 || semi - amp > 12) {
+            throw new XmlSyntaxError("xml_bare_ampersand", `${where} contains a bare "&". In XML it must be written "&amp;".`);
+        }
+        const name = raw.slice(amp + 1, semi);
+        out += resolveEntity(name, where);
+        i = semi + 1;
+    }
+}
+function resolveEntity(name, where) {
+    // Own-property check as well as the null prototype: two independent guards,
+    // because getting this wrong substitutes attacker-chosen text into a tax
+    // document without raising anything.
+    if (Object.hasOwn(PREDEFINED, name))
+        return PREDEFINED[name];
+    if (name.startsWith("#")) {
+        const hex = name[1] === "x" || name[1] === "X";
+        const digits = hex ? name.slice(2) : name.slice(1);
+        if (digits === "" || !/^[0-9a-fA-F]+$/.test(digits) || (!hex && !/^[0-9]+$/.test(digits))) {
+            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the malformed character reference "&${name};".`);
+        }
+        const code = Number.parseInt(digits, hex ? 16 : 10);
+        if (!Number.isFinite(code) ||
+            code > 0x10ffff ||
+            (code >= 0xd800 && code <= 0xdfff)) {
+            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the character reference "&${name};", which is not a ` +
+                `valid Unicode code point.`);
+        }
+        return String.fromCodePoint(code);
+    }
+    throw new XmlSecurityError("xml_entity_forbidden", `${where} refers to the entity "&${name};". Only the five predefined entities ` +
+        `(&amp; &lt; &gt; &quot; &apos;) and numeric character references are decoded. ` +
+        `Custom entities are refused because expanding them is how the billion-laughs ` +
+        `denial of service works, and because an external entity would read a local ` +
+        `file or make a network request (the XXE attack).`);
+}
+/** First child element with this namespace and local name. */
+function firstChild(el, namespace, local) {
+    return el.children.find((c) => c.local === local && c.namespace === namespace);
+}
+/** Every child element with this namespace and local name, in document order. */
+function xml_parse_childrenNamed(el, namespace, local) {
+    return el.children.filter((c) => c.local === local && c.namespace === namespace);
+}
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-reader.js
 /**
  * Bookkeeping shared by the two document readers.
@@ -65934,7 +66521,7 @@ class TreeReader {
     /** Every matching child, each marked as read. */
     leafAll(parent, namespace, local) {
         this.visited.add(parent);
-        const found = childrenNamed(parent, namespace, local);
+        const found = xml_parse_childrenNamed(parent, namespace, local);
         for (const el of found) {
             this.consumed.add(el);
             if (el.children.length > 0)
@@ -65953,7 +66540,7 @@ class TreeReader {
     /** Every matching child, each marked as walked into. */
     groupAll(parent, namespace, local) {
         this.visited.add(parent);
-        const found = childrenNamed(parent, namespace, local);
+        const found = xml_parse_childrenNamed(parent, namespace, local);
         for (const el of found)
             this.visited.add(el);
         return found;
@@ -66599,7 +67186,7 @@ function readPeriod(r, el) {
     return period;
 }
 /** `ram:ChargeIndicator/udt:Indicator` — the schematron matches `true()`. */
-function isCharge(r, el) {
+function parse_cii_isCharge(r, el) {
     const indicator = r.grp(el, "ChargeIndicator");
     if (!indicator)
         return false;
@@ -66760,7 +67347,7 @@ function readLine(r, el) {
             r.num(grossPrice, "BasisQuantity");
             const applied = r.grp(grossPrice, "AppliedTradeAllowanceCharge");
             if (applied) {
-                isCharge(r, applied);
+                parse_cii_isCharge(r, applied);
                 set(line, "priceDiscount", r.num(applied, "ActualAmount"));
             }
         }
@@ -66778,7 +67365,7 @@ function readLine(r, el) {
         const allowances = [];
         const charges = [];
         for (const entry of r.grpAll(settlement, "SpecifiedTradeAllowanceCharge")) {
-            const charge = isCharge(r, entry);
+            const charge = parse_cii_isCharge(r, entry);
             (charge ? charges : allowances).push(readAllowanceChargeCore(r, entry));
         }
         if (allowances.length > 0)
@@ -67187,7 +67774,7 @@ function parseCiiTree(root) {
         const allowances = [];
         const charges = [];
         for (const entry of r.grpAll(settlement, "SpecifiedTradeAllowanceCharge")) {
-            const charge = isCharge(r, entry);
+            const charge = parse_cii_isCharge(r, entry);
             (charge ? charges : allowances).push(readDocumentAllowanceCharge(r, entry));
         }
         if (allowances.length > 0)
@@ -67479,9 +68066,9 @@ const NOTE_SUBJECT_CODES_SET = new Set(NOTE_SUBJECT_CODES);
 
 const CBC = "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2";
 const CAC = "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2";
-const INVOICE_NS = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2";
-const CREDIT_NOTE_NS = "urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2";
-const CII_NS = "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100";
+const parse_INVOICE_NS = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2";
+const parse_CREDIT_NOTE_NS = "urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2";
+const parse_CII_NS = "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100";
 /** The customization identifiers (BT-24) this parser recognises, per profile. */
 const parse_PROFILE_BY_CUSTOMIZATION_ID = {
     "urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0": "xrechnung-ubl",
@@ -67503,8 +68090,8 @@ class UnsupportedSyntaxError extends ParseError {
         super("unsupported_syntax", `parseUbl reads UBL 2.1 Invoice and CreditNote documents only. ${detail} ` +
             `The root element found was <${rootElement}> in the namespace ` +
             `"${rootNamespace || "(none)"}"; a UBL invoice has the root element Invoice in ` +
-            `"${INVOICE_NS}", and a UBL credit note the root element CreditNote in ` +
-            `"${CREDIT_NOTE_NS}". Parsing this document as one of those would produce an ` +
+            `"${parse_INVOICE_NS}", and a UBL credit note the root element CreditNote in ` +
+            `"${parse_CREDIT_NOTE_NS}". Parsing this document as one of those would produce an ` +
             `invoice object with almost every field missing, and a long list of findings ` +
             `that all point at the wrong problem, so this call refuses instead.`);
         this.rootElement = rootElement;
@@ -67923,13 +68510,13 @@ function parseUbl(xml, options = {}) {
  * the text to the reader and parsing it a second time.
  */
 function parseUblTree(root) {
-    if (root.namespace === CII_NS || root.local === "CrossIndustryInvoice") {
+    if (root.namespace === parse_CII_NS || root.local === "CrossIndustryInvoice") {
         throw new UnsupportedSyntaxError(root.qname, root.namespace, "This is a CII (UN/CEFACT Cross Industry Invoice) document — the syntax used by " +
             "ZUGFeRD, Factur-X and XRechnung CII. It shares no element names with UBL. " +
             "Read it with parseCiiInvoice instead.");
     }
-    const creditNote = root.namespace === CREDIT_NOTE_NS && root.local === "CreditNote";
-    if (!creditNote && (root.namespace !== INVOICE_NS || root.local !== "Invoice")) {
+    const creditNote = root.namespace === parse_CREDIT_NOTE_NS && root.local === "CreditNote";
+    if (!creditNote && (root.namespace !== parse_INVOICE_NS || root.local !== "Invoice")) {
         throw new UnsupportedSyntaxError(root.qname, root.namespace, "The document is not a UBL invoice or credit note.");
     }
     // A UBL root with children, none of which are UBL.
@@ -68408,7 +68995,7 @@ function parseUblTree(root) {
  * a noun would break every caller for no functional gain. `parseUbl` is the
  * name to reach for in new code; this one will not be removed.
  */
-const parseUblInvoice = parseUbl;
+const parseUblInvoice = (/* unused pure expression or super */ null && (parseUbl));
 /**
  * BT-24 → profile.
  *
@@ -74932,7 +75519,7 @@ function finding(path, rule, severity, message, fix) {
 function wrongType(path, expected, value) {
     return finding(path, "ATW-INPUT-TYPE", "fatal", `${rules_representable_show(path)} should be ${expected}, but it is ${kindOf(value)}. The rules and the generators rely on the InvoiceInput types.`, `Set ${rules_representable_show(path)} to ${expected}, or leave it out. A value parsed from JSON or a form is the usual cause: "19" where 19 is expected, or null for a field that is simply absent.`);
 }
-function walk(value, path, out, seen) {
+function rules_representable_walk(value, path, out, seen) {
     const key = path[path.length - 1];
     const parent = path[path.length - 2];
     const inDeclared = path[0] === "declaredTotals";
@@ -75018,19 +75605,19 @@ function walk(value, path, out, seen) {
         return;
     seen.add(value);
     if (Array.isArray(value)) {
-        value.forEach((item, i) => walk(item, [...path, i], out, seen));
+        value.forEach((item, i) => rules_representable_walk(item, [...path, i], out, seen));
         return;
     }
     for (const [k, item] of Object.entries(value)) {
         if (path.length === 1 && path[0] === "declaredTotals" && SKIPPED_DECLARED.has(k))
             continue;
-        walk(item, [...path, k], out, seen);
+        rules_representable_walk(item, [...path, k], out, seen);
     }
 }
 const representableRules = [
     (inv) => {
         const out = [];
-        walk(inv, [], out, new Set());
+        rules_representable_walk(inv, [], out, new Set());
         // An unknown profile validated clean and was then refused by the
         // generator (fuzz run, 2026-09-23).
         const profile = inv.profile;
@@ -77343,7 +77930,26 @@ function runInputRules(inv) {
     return out;
 }
 
-;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/index.js
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/validate.js
+/**
+ * `validate` — a file in, findings out.
+ *
+ * Checking an existing invoice used to be four decisions the caller had to
+ * get right before any rule ran: is this a PDF (then `extractFacturX`), what
+ * encoding is the XML in, is it UBL or CII (then `parseUbl` or
+ * `parseCiiInvoice`), and only then `validateInput`. The command line made all
+ * four, and the hosted API made them again in its own code, so the two could
+ * drift. This is those decisions, once, for everyone.
+ *
+ * It never throws for anything about the document. A file that cannot be read
+ * comes back as a result with one fatal finding saying what the file actually
+ * is (a ZIP, an HTML login page, a PDF with no invoice inside) and `error`
+ * holding the reader's own exception, whose `code` says why. It throws only
+ * for a programming error, such as passing a number.
+ *
+ * Every finding carries a `location` in the caller's file: see locate.ts.
+ */
+
 
 
 
@@ -77351,83 +77957,262 @@ function runInputRules(inv) {
 
 
 /**
- * Reading the Factur-X / ZUGFeRD PDF container — new in 0.7.0.
+ * Validate an e-invoice as a file: UBL or CII XML, or a Factur-X / ZUGFeRD PDF.
  *
- * Extraction only. The container is read; it is still never built. See the
- * module doc-comment in `facturx-pdf.ts` for why that asymmetry is deliberate.
+ * Pass the bytes (a `Uint8Array`, which a Node `Buffer` is) when you have a
+ * file, so the encoding the document declares is honoured and a PDF is
+ * recognised. A string is taken as XML text that is already decoded.
+ *
+ * ```ts
+ * const result = validate(await readFile("invoice.xml"));
+ * for (const f of result.errors) console.log(f.location?.line, f.rule, f.fix);
+ * ```
  */
-
-/**
- * One call for an existing file — new in 0.10.0.
- *
- * XML (UBL or CII, any declared encoding) or a Factur-X / ZUGFeRD PDF in, the
- * same findings as `validateInput` out, each with the line and column of the
- * element in the caller's file. Never throws for anything about the document.
- */
-
-/**
- * Findings → SARIF 2.1.0 and JUnit XML, for CI pipelines — new in 0.7.0.
- *
- * Both are pure functions over the findings `validateInput` already returns;
- * neither reads the clock or the filesystem.
- */
-
-
-
-
-/**
- * The EN 16931 code lists the BR-CL-* rules enforce, as frozen arrays and
- * membership sets — useful for building a unit picker or a currency dropdown
- * that cannot offer a value the validator will then reject.
- *
- * Each list lives in its own side-effect-free module under `src/codelists/`, so
- * a bundler drops the ones you do not reference — which matters mainly for
- * `UNIT_CODES`, whose 2,162 entries are most of the package's data weight.
- */
-
-
-/**
- * Validate the JSON input model against EN 16931 / CIUS business rules.
- *
- * Returns every finding, not just the first: a teaching error is only useful if
- * you can see the whole set of things wrong with the document at once.
- * Schematron-parity validation of *existing* XML lands next; this entry point's
- * shape is stable — the same TeachingError payload appears everywhere.
- *
- * Findings are split three ways, matching the three flags KoSIT's schematron
- * uses. `information` is deliberately *not* folded into `warnings`: a caller
- * whose build fails on a non-empty `warnings` array should not be stopped by a
- * finding the official validator raises and then accepts.
- */
-function validateInput(inv) {
-    const findings = runInputRules(inv);
+function validate(document, options = {}) {
+    let xml;
+    let container = null;
+    if (typeof document === "string") {
+        if (document.startsWith("%PDF")) {
+            return unreadable("AW-PDF", "This is a PDF passed as text. A PDF's bytes do not survive being decoded to a string.", "Pass the file's bytes: validate(await readFile(path)) in Node, or new Uint8Array(await file.arrayBuffer()) in a browser.");
+        }
+        xml = document;
+    }
+    else {
+        let bytes;
+        if (document instanceof Uint8Array)
+            bytes = document;
+        else if (document instanceof ArrayBuffer)
+            bytes = new Uint8Array(document);
+        else
+            throw new TypeError("validate() takes the document as a string, a Uint8Array or an ArrayBuffer.");
+        // A PDF is recognised by its first bytes, not its name: a Factur-X saved as
+        // .xml by a mail client is still a Factur-X.
+        if (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) {
+            try {
+                const extracted = extractFacturX(bytes, options.pdfLimits);
+                xml = extracted.xml;
+                container = extracted.attachmentName ?? "embedded XML";
+            }
+            catch (err) {
+                if (!isReadFailure(err))
+                    throw err;
+                if (SIZE_CODES.has(err.code))
+                    return tooLarge(err);
+                return unreadable("AW-PDF", err.code === "facturx_no_xml_attachment"
+                    ? "This is a PDF with no invoice XML inside, so it is not a Factur-X / ZUGFeRD e-invoice."
+                    : `This could not be read as a Factur-X / ZUGFeRD PDF: ${err.message}`, err.code === "facturx_no_xml_attachment"
+                    ? "A plain PDF is not an e-invoice. Export a Factur-X / ZUGFeRD PDF, or the XRechnung XML, from your invoicing tool."
+                    : "Check the file is a PDF/A-3 with an EN 16931 CII attachment, or validate the XML payload directly.", err);
+            }
+        }
+        else {
+            const kind = notXml(bytes);
+            if (kind)
+                return unreadable("AW-PARSE", `This is ${kind.what}.`, kind.fix);
+            const decoded = decodeXml(bytes);
+            if (typeof decoded !== "string") {
+                return unreadable("AW-PARSE", `This could not be decoded: ${decoded.problem}.`, "Save the file as UTF-8, or declare the encoding it is actually in.");
+            }
+            xml = decoded;
+        }
+    }
+    let root;
+    let syntax;
+    let parsed;
+    try {
+        root = xml_parse_parseXml(xml, options.limits);
+        syntax = root.namespace === CII_NAMESPACES.rsm && root.local === "CrossIndustryInvoice" ? "cii" : "ubl";
+        parsed = syntax === "cii" ? parseCiiTree(root) : parseUblTree(root);
+    }
+    catch (err) {
+        if (!isReadFailure(err))
+            throw err;
+        const result = SIZE_CODES.has(err.code)
+            ? tooLarge(err)
+            : unreadable("AW-PARSE", `This is not an invoice this validator can read: ${err.message}`, "Supply a UBL 2.1 Invoice or CreditNote, or a UN/CEFACT CrossIndustryInvoice (XRechnung, Peppol, Factur-X).", err);
+        return { ...result, container };
+    }
+    const invoice = options.profile ? { ...parsed.invoice, profile: options.profile } : parsed.invoice;
+    const findings = runInputRules(invoice).map((f) => {
+        const { location, xpath } = locateFinding(f.xpath, root, syntax);
+        const out = { ...f, location: container === null ? location : { ...location, attachment: container } };
+        if (xpath === undefined)
+            delete out.xpath;
+        else
+            out.xpath = xpath;
+        return out;
+    });
+    const sub = subInvoiceProfile(parsed.customizationId);
+    if (sub) {
+        findings.unshift({
+            rule: "AW-PROFILE-SUBSET",
+            field: "BT-24",
+            severity: "fatal",
+            message: `This is a Factur-X ${sub} document. ${sub} carries too little to be an EN 16931 invoice, which is why the rules below fail; it is a booking aid, not a valid e-invoice in Germany or France.`,
+            fix: "Export at the EN 16931 (COMFORT) or EXTENDED profile instead.",
+        });
+    }
+    const expected = options.profile ? PROFILE_SYNTAX[options.profile] : undefined;
+    if (expected && expected !== syntax) {
+        findings.unshift({
+            rule: "AW-PROFILE-SYNTAX",
+            field: "BT-24",
+            severity: "warning",
+            message: `The profile asked for, ${options.profile}, is a ${expected.toUpperCase()} profile, but this document is ${syntax.toUpperCase()}.`,
+            fix: `Leave the profile out to use the one the document declares, or pick a ${syntax.toUpperCase()} profile.`,
+        });
+    }
     return {
-        valid: findings.every((e) => e.severity !== "fatal"),
-        profile: inv.profile,
-        errors: findings.filter((e) => e.severity === "fatal"),
-        warnings: findings.filter((e) => e.severity === "warning"),
-        information: findings.filter((e) => e.severity === "information"),
+        valid: findings.every((f) => f.severity !== "fatal"),
+        syntax,
+        profile: invoice.profile,
+        container,
+        errors: findings.filter((f) => f.severity === "fatal"),
+        warnings: findings.filter((f) => f.severity === "warning"),
+        information: findings.filter((f) => f.severity === "information"),
+        invoice,
+        unmapped: parsed.unmapped,
+        customizationId: parsed.customizationId,
     };
+}
+// ---------------------------------------------------------------------------
+function unreadable(rule, message, fix, error) {
+    const result = {
+        valid: false,
+        syntax: null,
+        profile: null,
+        container: null,
+        errors: [{ rule, field: "document", severity: "fatal", message, fix }],
+        warnings: [],
+        information: [],
+        invoice: null,
+        unmapped: [],
+    };
+    if (error)
+        result.error = error;
+    return result;
+}
+function tooLarge(err) {
+    return unreadable("AW-SIZE", `This is larger than the default limits: ${err.message.split(". ")[0]}.`, "If a document this size is expected, raise the limit it names through the limits (XML) or pdfLimits (PDF) option.", err);
+}
+/** Does this error come from the engine's own readers (ParseError, PdfError)? */
+function isReadFailure(err) {
+    const code = err?.code;
+    return /^(xml_|unsupported_|pdf_|facturx_)/.test(String(code ?? ""));
+}
+/** Reader codes that mean "too big", not "broken". */
+const SIZE_CODES = new Set([
+    "xml_too_large",
+    "xml_too_many_elements",
+    "pdf_stream_too_large",
+    "pdf_total_inflated_too_large",
+    "pdf_attachment_too_large",
+]);
+/**
+ * What a file that is not an invoice actually is, from its first bytes, so
+ * the answer is "this is a ZIP archive" rather than an XML parser's complaint
+ * about character 0. Null when it looks like it could be XML.
+ */
+function notXml(bytes) {
+    const head = new TextDecoder("latin1").decode(bytes.subarray(0, 512));
+    if (bytes.length === 0)
+        return { what: "an empty file", fix: "Check the export wrote the invoice." };
+    if (head.startsWith("PK\x03\x04")) {
+        return { what: "a ZIP archive", fix: "Unpack it and pass the XML or PDF files inside (or the folder)." };
+    }
+    const text = head.replace(/^﻿|^\xEF\xBB\xBF/, "").trimStart();
+    if (text.startsWith("{") || text.startsWith("[")) {
+        return {
+            what: "JSON, not XML",
+            fix: "This reads UBL or CII XML. If the JSON is an invoice object for this library, call validateInput() on it from code.",
+        };
+    }
+    if (/^(<!--[\s\S]*?-->\s*)*<(!doctype\s+html|html[\s>])/i.test(text)) {
+        return { what: "an HTML page", fix: "It may be a download or login page saved in place of the invoice. Download the XML again." };
+    }
+    if (head.includes("\0") && !(bytes[0] === 0xff && bytes[1] === 0xfe) && !(bytes[0] === 0xfe && bytes[1] === 0xff)) {
+        return { what: "a binary file, not XML", fix: "Pass the invoice's .xml file, or a Factur-X / ZUGFeRD .pdf." };
+    }
+    return null;
+}
+/**
+ * Bytes to text, honouring the byte-order mark and the XML declaration.
+ *
+ * The engine takes a string and does not read the declaration, so a
+ * windows-1252 invoice decoded as UTF-8 would reach the rules with every "ü"
+ * replaced, and pass. Decoding is strict: bytes that are not valid in the
+ * declared encoding are a finding, not a replacement character.
+ */
+function decodeXml(bytes) {
+    let label = "utf-8";
+    let start = 0;
+    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+        start = 3;
+    else if (bytes[0] === 0xff && bytes[1] === 0xfe)
+        [label, start] = ["utf-16le", 2];
+    else if (bytes[0] === 0xfe && bytes[1] === 0xff)
+        [label, start] = ["utf-16be", 2];
+    else {
+        // The declaration is ASCII in every encoding this can apply to.
+        const head = String.fromCharCode(...bytes.subarray(0, 200));
+        const declared = /^<\?xml[^>]*\bencoding\s*=\s*["']([A-Za-z0-9._-]+)["']/.exec(head)?.[1];
+        if (declared)
+            label = declared.toLowerCase();
+    }
+    let decoder;
+    try {
+        // ignoreBOM: the mark is skipped above, by hand, and a SECOND one is a
+        // character of the document that TextDecoder would otherwise eat too.
+        decoder = new TextDecoder(label, { fatal: true, ignoreBOM: true });
+    }
+    catch {
+        return { problem: `it declares encoding "${label}", which this runtime cannot decode` };
+    }
+    try {
+        // The mark goes back on as U+FEFF, so the text is exactly what a caller
+        // who decoded the file themselves would pass, and a column on line 1
+        // means the same thing whichever way the document arrived.
+        return (start > 0 ? "\uFEFF" : "") + decoder.decode(bytes.subarray(start));
+    }
+    catch {
+        return { problem: `it contains bytes that are not valid ${label}` };
+    }
+}
+/** Profiles that exist in only one syntax. en16931 is either. */
+const PROFILE_SYNTAX = {
+    "xrechnung-ubl": "ubl",
+    "peppol-bis-3": "ubl",
+    "xrechnung-cii": "cii",
+    "facturx-en16931": "cii",
+};
+/** Factur-X / ZUGFeRD profiles below EN 16931: they are not full invoices. */
+function subInvoiceProfile(customizationId) {
+    const id = (customizationId ?? "").toLowerCase();
+    if (/factur-x\.eu:1p0:minimum|zugferd.*:minimum/.test(id))
+        return "MINIMUM";
+    if (/factur-x\.eu:1p0:basicwl|zugferd.*:basicwl/.test(id))
+        return "BASIC WL";
+    return null;
 }
 
 ;// CONCATENATED MODULE: ./src/read.js
 /**
  * One document in, one verdict out — locally, in the runner.
  *
- * This module owns the two decisions the rest of the action does not want to
- * make: which reader an XML file goes to, and what a file we could not read at
- * all looks like once it reaches the report. The second one matters more than
- * it sounds. A pipeline that silently skips the invoice it could not parse is
- * worse than one that has no validation in it, because it reports green for a
- * file nobody has ever looked at. Every failure path here therefore produces a
- * FINDING, in the same shape as a rule violation, and that finding is fatal.
+ * The engine's `validate(bytes)` makes every decision about the file: whether
+ * it is a Factur-X / ZUGFeRD PDF (by its first bytes, not its name), which
+ * encoding the XML declares, whether it is UBL or CII, and which profile it
+ * claims. It is the same call the engine's command line and the hosted API
+ * make, so the three cannot disagree about a file. What it adds over the older
+ * parse-then-`validateInput` path is where each finding is: a `location` with
+ * the line of the element in the file, and an `xpath` in the file's own syntax
+ * (CII paths for a CII file, not the UBL paths the rules are written in).
  *
- * The syntax probe mirrors `apps/api/src/xml-document.js` deliberately: the
- * root element is read once by the library's own parser and compared by
- * namespace, rather than the reader being guessed from the file extension or
- * from a substring search. A file named `.xml` that turns out to be HTML is
- * then refused by `parseUbl` with the library's own message, naming the root it
- * found, instead of by a regex here with a worse one.
+ * What stays here is the part the engine cannot see: a file the runner could
+ * not read at all. That, like every other failure, becomes a FINDING in the
+ * same shape as a rule violation, and it is fatal. A pipeline that silently
+ * skips the invoice it could not open is worse than one that has no validation
+ * in it, because it reports green for a file nobody has ever looked at.
  */
 
 
@@ -77445,44 +78230,26 @@ const read_PROFILES = Object.freeze([
 /**
  * A finding for something that went wrong before any rule could run.
  *
- * Same shape as a `TeachingError`, so the SARIF writer, the annotation writer
- * and the summary table need no special case. `docsUrl` is deliberately absent:
- * there is no rule page for "your file is not an invoice", and inventing a link
- * that 404s would be worse than having none.
+ * Same shape as the engine's own `AW-` findings, so the SARIF writer, the
+ * annotation writer and the summary table need no special case. `docsUrl` is
+ * deliberately absent: there is no rule page for "your file is not an
+ * invoice", and inventing a link that 404s would be worse than having none.
  */
-function unreadable(rule, message, fix) {
+function read_unreadable(rule, message, fix) {
   return { rule, field: "document", severity: "fatal", message, fix };
 }
 
-/** Is this a `ParseError` from the engine, including across module realms? */
-function isParseFailure(err) {
-  return /^(xml_|unsupported_|pdf_|facturx_)/.test(String(err?.code ?? ""));
-}
-
-/** CII is the narrow case; everything else goes to the UBL reader. */
-function syntaxOf(xml, limits) {
-  const root = parseXml(xml, limits);
-  return root.namespace === CII_NAMESPACES.rsm &&
-    root.local === "CrossIndustryInvoice"
-    ? "cii"
-    : "ubl";
-}
-
 /**
- * Read a file into XML, unwrapping a Factur-X / ZUGFeRD PDF when it is one.
- *
- * The PDF branch is chosen by extension rather than by sniffing bytes, because
- * a `.pdf` that is not a PDF should be told so in those words. `extractFacturX`
- * pulls the embedded CII payload out; validating that payload is not validating
- * the PDF container, and the summary says as much.
+ * The engine's fix for an oversized document names its own `limits` option.
+ * In this action that limit is the `max-characters` input, so say that; the
+ * other size limits (element count, PDF streams) have no input here, and the
+ * engine's sentence is left as it is.
  */
-async function readDocument(file) {
-  const bytes = await (0,promises_namespaceObject.readFile)(file);
-  if (/\.pdf$/i.test(file)) {
-    const { xml, attachmentName } = extractFacturX(new Uint8Array(bytes));
-    return { xml, container: attachmentName ?? "embedded XML" };
+function inActionTerms(finding, error) {
+  if (finding.rule === "AW-SIZE" && error?.code === "xml_too_large") {
+    return { ...finding, fix: "If a document this size is expected, raise the max-characters input." };
   }
-  return { xml: bytes.toString("utf8"), container: null };
+  return finding;
 }
 
 /**
@@ -77491,35 +78258,21 @@ async function readDocument(file) {
  * `profile` overrides the profile the document declares. That is an override
  * and not a filter: with it set, a Peppol document is judged against, say,
  * XRechnung rules and will fail rules it was never meant to satisfy. Off by
- * default for exactly that reason.
+ * default for exactly that reason. A profile of the other syntax draws the
+ * engine's `AW-PROFILE-SYNTAX` warning.
  *
  * @returns {Promise<{file: string, syntax: string|null, profile: string|null,
  *   container: string|null, findings: object[]}>}
  */
 async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
-  const base = { file, syntax: null, profile: null, container: null };
-  const limits = maxCharacters ? { maxCharacters } : undefined;
-
-  let xml, container;
+  let bytes;
   try {
-    ({ xml, container } = await readDocument(file));
+    bytes = await (0,promises_namespaceObject.readFile)(file);
   } catch (err) {
-    if (isParseFailure(err)) {
-      return {
-        ...base,
-        findings: [
-          unreadable(
-            "AW-PDF",
-            `${file} could not be read as a Factur-X / ZUGFeRD PDF: ${err.message}`,
-            "Check the file is a PDF/A-3 with an EN 16931 CII attachment, or validate the XML payload directly.",
-          ),
-        ],
-      };
-    }
     return {
-      ...base,
+      file, syntax: null, profile: null, container: null,
       findings: [
-        unreadable(
+        read_unreadable(
           "AW-IO",
           `${file} could not be read: ${err?.message ?? String(err)}`,
           "Check the path and the runner's permissions on it.",
@@ -77528,38 +78281,18 @@ async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
     };
   }
 
-  let syntax, parsed;
-  try {
-    syntax = syntaxOf(xml, limits);
-    parsed =
-      syntax === "cii"
-        ? parseCiiInvoice(xml, limits)
-        : parseUblInvoice(xml, limits);
-  } catch (err) {
-    if (!isParseFailure(err)) throw err;
-    return {
-      ...base,
-      container,
-      findings: [
-        unreadable(
-          "AW-PARSE",
-          `${file} is not a document this validator can read: ${err.message}`,
-          "Supply a UBL 2.1 Invoice/CreditNote or a UN/CEFACT CrossIndustryInvoice. " +
-            "If the file is large, raise max-characters.",
-        ),
-      ],
-    };
-  }
-
-  const invoice = profile ? { ...parsed.invoice, profile } : parsed.invoice;
-  const result = validateInput(invoice);
+  const result = validate(bytes, {
+    ...(profile ? { profile } : {}),
+    ...(maxCharacters ? { limits: { maxCharacters } } : {}),
+  });
 
   return {
     file,
-    syntax,
-    container,
+    syntax: result.syntax,
+    container: result.container,
     profile: result.profile,
-    findings: [...result.errors, ...result.warnings, ...result.information],
+    findings: [...result.errors, ...result.warnings, ...result.information]
+      .map((f) => inActionTerms(f, result.error)),
   };
 }
 
@@ -77664,7 +78397,7 @@ async function validateFileViaApi(
     return {
       ...base,
       findings: [
-        unreadable("AW-IO", `${file} could not be read: ${err?.message ?? String(err)}`,
+        read_unreadable("AW-IO", `${file} could not be read: ${err?.message ?? String(err)}`,
           "Check the path and the runner's permissions on it."),
       ],
     };
@@ -77677,7 +78410,7 @@ async function validateFileViaApi(
       ...base,
       container,
       findings: [
-        unreadable("AW-NETWORK",
+        read_unreadable("AW-NETWORK",
           `${file} could not be validated: the request to ${apiUrl} failed (${sent.reason}).`,
           "Retry the job, or drop api-key to fall back to the bundled local validator."),
       ],
@@ -77698,7 +78431,7 @@ async function validateFileViaApi(
       ...base,
       container,
       findings: [
-        unreadable("AW-API",
+        read_unreadable("AW-API",
           `${file} was refused by the validator (HTTP ${response.status}): ${message}`,
           response.status === 401 || response.status === 403
             ? "Check the api-key secret. Remove it to run the bundled local validator instead, which needs no key."
@@ -77707,11 +78440,16 @@ async function validateFileViaApi(
     };
   }
 
+  // The validator locates each finding at a line of what it was sent. For a
+  // PDF that was the XML payload alone, so the line is the attachment's, and
+  // saying so keeps it off the PDF in the annotations and the SARIF regions.
+  const inPayload = (f) =>
+    container !== null && f?.location ? { ...f, location: { ...f.location, attachment: container } } : f;
   const findings = [
     ...(body?.errors ?? []),
     ...(body?.warnings ?? []),
     ...(body?.information ?? []),
-  ];
+  ].map(inPayload);
 
   // `profile` is echoed from the engine's own result, not from our input, for
   // the same reason the API echoes it: a document that declared nothing was
@@ -78014,6 +78752,8 @@ function ruleUrl(rule) {
 const isFatal = (f) => f.severity === "fatal";
 const isWarning = (f) => f.severity === "warning";
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 /** Business terms as one string — `field` is a term or a list of them. */
 function terms(field) {
   return Array.isArray(field) ? field.join(", ") : String(field ?? "");
@@ -78046,35 +78786,153 @@ function shouldFail(counts, failOn) {
     : counts.errors > 0;
 }
 
+// --- where a finding is ------------------------------------------------------
+
+/**
+ * The line of the file a finding is on, or null.
+ *
+ * The engine's `validate` reads each finding's line and column off the file
+ * it was given. For a Factur-X / ZUGFeRD PDF that is the XML attachment inside
+ * it, which `location.attachment` names, and line 117 of `factur-x.xml` is not
+ * line 117 of the PDF, so no line of the PDF is claimed. The engine's `toSarif`
+ * draws the same line for its regions. A finding about the whole file (it
+ * could not be read, or is not an invoice) has no location at all.
+ */
+function lineInFile(f) {
+  const at = f.location;
+  return at && at.attachment === undefined ? at.line : null;
+}
+
+/**
+ * Where a finding is, in the engine command line's words: the element's path
+ * and line or, when the element is missing (`exact: false`), where it belongs
+ * and the nearest element that is there.
+ */
+function whereText(f) {
+  const at = f.location;
+  if (!at) return f.xpath ?? "";
+  const inside = at.attachment === undefined ? "" : ` of ${at.attachment}`;
+  if (at.exact) return `line ${at.line}${inside}, ${f.xpath ?? at.path}`;
+  const nearest = at.path.split("/").pop().replace(/\[\d+\]$/, "");
+  const near = `nearest element in the file: <${nearest}>, line ${at.line}${inside}`;
+  return f.xpath ? `${f.xpath} (${near})` : `(${near})`;
+}
+
 // --- annotations -------------------------------------------------------------
 
 /**
- * `::error` / `::warning` per finding, attributed to the file.
- *
- * NO LINE NUMBERS, DELIBERATELY. A finding carries an XPath — a location in the
- * document's logical structure — and GitHub's annotation model wants a line.
- * Fabricating one would draw a red underline at a line chosen by arithmetic
- * rather than by evidence, which is worse than an annotation that points at the
- * file and names the XPath in its text. The same reasoning governs the SARIF
- * writer in the library itself.
+ * GitHub makes annotations of the first ten `::error` and the first ten
+ * `::warning` lines a step prints, only logs the rest, and cuts each message
+ * at 4,096 characters (`_maxCountPerIssueType` and `_maxIssueMessageLength` in
+ * actions/runner).
  */
-function emitAnnotations(results, core) {
+const ANNOTATIONS_PER_STEP = 10;
+const MESSAGE_LIMIT = 4096;
+
+/** The first sentence of a message, for a one-line mention of a finding. */
+function firstSentence(message) {
+  const m = /^(.+?[.!?])(\s|$)/.exec(message);
+  const sentence = (m ? m[1] : message).trim();
+  return sentence.length > 160 ? `${sentence.slice(0, 157)}...` : sentence;
+}
+
+/** "BR-CL-14 (BT-40), line 24: The country code ..." — one finding, one line. */
+function mention(f) {
+  const at = f.location;
+  const inside = at?.attachment === undefined ? "" : ` of ${at.attachment}`;
+  const line = at ? `, ${at.exact ? "line" : "near line"} ${at.line}${inside}` : "";
+  return `- ${f.rule} (${terms(f.field)})${line}: ${firstSentence(f.message)}`;
+}
+
+/** As many lines as fit in `budget` characters, then how many did not. */
+function within(lines, budget) {
+  const out = [];
+  let used = 0;
+  for (const [i, line] of lines.entries()) {
+    const rest = lines.length - i;
+    const reserve = rest > 1 ? `- and ${rest - 1} more`.length + 1 : 0;
+    if (used + line.length + 1 + reserve > budget) {
+      out.push(`- and ${rest} more`);
+      break;
+    }
+    out.push(line);
+    used += line.length + 1;
+  }
+  return out;
+}
+
+/**
+ * The one annotation a file gets, or null when it has nothing above
+ * informational.
+ *
+ * Its level is the file's worst finding, its line the line of the first
+ * finding at that level (`lineInFile`), and its title that finding's rule and
+ * how many more the file has. The message is that finding in full — what, the
+ * fix, where — and then one line for each other finding: rule, line, and the
+ * first sentence of its message. "First" is the engine's order, which puts a
+ * finding that explains the others ahead of them: on a Factur-X MINIMUM file,
+ * `AW-PROFILE-SUBSET` before the four rules that profile cannot satisfy.
+ */
+function fileAnnotation(r, { summary = true } = {}) {
+  const errors = r.findings.filter(isFatal);
+  const warnings = r.findings.filter(isWarning);
+  const [lead, ...others] = [...errors, ...warnings];
+  if (!lead) return null;
+
+  const counts = [
+    errors.length > 0 ? plural(errors.length, "error") : "",
+    warnings.length > 0 ? plural(warnings.length, "warning") : "",
+  ].filter(Boolean).join(", ");
+  const title = `${lead.rule} (${terms(lead.field)})` +
+    (others.length > 0 ? ` and ${others.length} more: ${counts}` : "");
+
+  const where = whereText(lead);
+  let message = [lead.message, lead.fix ? `Fix: ${lead.fix}` : "", where ? `At: ${where}` : ""]
+    .filter(Boolean)
+    .join(" ");
+  if (others.length > 0) {
+    const tail = summary ? "The job summary lists every finding with its fix." : "";
+    const head = `${message}\nAlso in this file:`;
+    const list = within(others.map(mention), MESSAGE_LIMIT - head.length - tail.length - 2);
+    message = [head, ...list, tail].filter(Boolean).join("\n");
+  }
+
+  const properties = { title, file: r.file };
+  const line = lineInFile(lead);
+  if (line !== null) properties.startLine = line;
+  return { level: errors.length > 0 ? "error" : "warning", message, properties };
+}
+
+/**
+ * One `::error` or `::warning` per file, not one per finding.
+ *
+ * One per finding printed a hundred lines for a few hundred invoices, of which
+ * GitHub showed the first ten, and not the step's own failure message. So a
+ * file gets one annotation (see `fileAnnotation`), and at most nine files get
+ * an error annotation: a step with one always fails, and its failure message is
+ * the tenth error. Warnings have all ten. A file past that is logged as a plain
+ * line in the same words, and counted, so the step can say how many there were.
+ *
+ * @returns {{annotated: number, notAnnotated: number}} files annotated, and
+ *   files logged instead because GitHub would not have shown them.
+ */
+function emitAnnotations(results, core, { summary = true } = {}) {
+  const room = { error: ANNOTATIONS_PER_STEP - 1, warning: ANNOTATIONS_PER_STEP };
+  let annotated = 0, notAnnotated = 0;
   for (const r of results) {
-    for (const f of r.findings) {
-      if (f.severity === "information") continue;
-      const emit = isFatal(f) ? core.error : core.warning;
-      // The engine's rules state locations as UBL paths; on a CII document
-      // they point at nothing, so they are left out rather than shown wrong.
-      const at = f.xpath && !(r.syntax === "cii" && f.xpath.startsWith("/ubl:")) ? f.xpath : "";
-      const detail = [f.message, f.fix ? `Fix: ${f.fix}` : "", at ? `At: ${at}` : ""]
-        .filter(Boolean)
-        .join(" ");
-      emit.call(core, detail, {
-        title: `${f.rule} (${terms(f.field)})`,
-        file: r.file,
-      });
+    const a = fileAnnotation(r, { summary });
+    if (!a) continue;
+    if (room[a.level] > 0) {
+      room[a.level]--;
+      annotated++;
+      (a.level === "error" ? core.error : core.warning).call(core, a.message, a.properties);
+    } else {
+      notAnnotated++;
+      const at = a.properties.startLine === undefined ? "" : `:${a.properties.startLine}`;
+      core.info(`${a.level}: ${a.properties.file}${at}: ${a.properties.title}`);
     }
   }
+  return { annotated, notAnnotated };
 }
 
 // --- job summary -------------------------------------------------------------
@@ -78180,38 +79038,72 @@ function summaryMarkdown(results, { mode, engineVersion, failOn, provenance = nu
 // --- SARIF -------------------------------------------------------------------
 
 /**
- * One SARIF log for the whole run, one run per document.
+ * A repository-relative path as a SARIF URI reference: every segment
+ * percent-encoded, the slashes kept. `Rechnung 2026-01.xml` is not a valid
+ * URI, and upload-sarif decodes each URI before it reads the file, which
+ * throws on a bare `%`.
+ */
+function fileUri(file) {
+  return file.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * One SARIF log for the whole invocation, as ONE run over every document.
  *
- * The library's `toSarif` produces a complete single-run log; a run over many
- * invoices needs those runs merged rather than the last one winning. Merging at
- * the `runs` level rather than concatenating results keeps each document's
- * `artifacts` and rule descriptors attached to the document they came from,
- * which is what makes GitHub attribute a finding to a file.
+ * GitHub's code scanning refuses a file holding two runs of the same tool and
+ * category ("A delivery cannot contain multiple runs with the same category",
+ * since July 2025) and takes at most 20 runs per file, so the run per document
+ * this action wrote until 1.4.0 failed the upload for any repository with two
+ * invoices. The run has:
  *
- * Files with no findings still get a run. An empty run is how SARIF says "this
- * file was examined and was clean" — drop it and re-running with a fixed
- * invoice leaves the old alert open, because code scanning only resolves alerts
- * for artefacts the new upload mentions.
+ *   - `artifacts`: every document examined, the clean ones included, so the
+ *     log says what was looked at and not only what failed;
+ *   - `results`: each pointing at its document by URI and artifact index, with
+ *     a region (line and column) wherever the engine read one off that file;
+ *   - `tool.driver.rules`: every rule that fired anywhere, once, which each
+ *     result refers to by `ruleIndex`.
+ *
+ * The per-document work (levels, messages, logical locations, regions, rule
+ * descriptors) is the engine's `toSarif`, called once per document; this only
+ * merges what it returns. There is no `automationDetails`: an id in the file
+ * takes precedence over upload-sarif's `category` input, and an id without a
+ * slash is an empty category, so leaving it out is what lets a workflow name
+ * its own category, or get one per job by default.
  */
 function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {}) {
-  const runs = [];
-  for (const r of results) {
-    const log = toSarif(r.findings, {
-      engineVersion: engineVersion ?? "unknown",
-      profile: r.profile ?? undefined,
-      documentUri: r.file,
-      generatedAt,
-      rulesetVersions,
-      suiteName: "validate-einvoice-action",
-    });
-    runs.push(...log.runs);
-  }
-  return {
-    $schema:
-      "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
-    version: "2.1.0",
-    runs,
-  };
+  const log = toSarif([], { engineVersion: engineVersion ?? "unknown", generatedAt, rulesetVersions });
+  const [run] = log.runs;
+  delete run.automationDetails;
+
+  const rules = [];
+  const ruleIndex = new Map();
+  const artifacts = [];
+  const found = [];
+  results.forEach((r, index) => {
+    const uri = fileUri(r.file);
+    const artifact = { location: { uri }, roles: ["analysisTarget"] };
+    const facts = Object.entries({ syntax: r.syntax, profile: r.profile, container: r.container })
+      .filter(([, value]) => value);
+    if (facts.length > 0) artifact.properties = Object.fromEntries(facts);
+    artifacts.push(artifact);
+
+    const [own] = toSarif(r.findings, { engineVersion: engineVersion ?? "unknown", documentUri: uri }).runs;
+    for (const result of own.results) {
+      if (!ruleIndex.has(result.ruleId)) {
+        ruleIndex.set(result.ruleId, rules.length);
+        rules.push(own.tool.driver.rules[result.ruleIndex]);
+      }
+      result.ruleIndex = ruleIndex.get(result.ruleId);
+      const physical = result.locations?.[0]?.physicalLocation;
+      if (physical) physical.artifactLocation = { uri, index };
+      found.push(result);
+    }
+  });
+
+  run.tool.driver.rules = rules;
+  run.artifacts = artifacts;
+  run.results = found;
+  return log;
 }
 
 ;// CONCATENATED MODULE: ./src/version.js
@@ -78256,6 +79148,8 @@ const bool = (value, fallback = false) => {
   return v === "true" || v === "1" || v === "yes";
 };
 
+const run_plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 /**
  * Read and CHECK every input before a single file is opened.
  *
@@ -78263,9 +79157,23 @@ const bool = (value, fallback = false) => {
  * build for a reason nobody could see. Every enumerated input is therefore
  * refused with the list of what it accepts, and refused up front — before the
  * work, so the failure is cheap and unambiguous.
+ *
+ * `files` has no default. Until 1.4.0 it defaulted to every `.xml` file in the
+ * repository, which in an ordinary one includes `pom.xml` and
+ * `.idea/workspace.xml`, and each of those failed the build as a document that
+ * is not an invoice. Only the workflow knows where its invoices are, so it has
+ * to say. (`required: true` in action.yml is documentation only; the runner
+ * does not enforce it, so this does.)
  */
 function readInputs(core) {
-  const files = core.getInput("files") || "**/*.xml";
+  const files = (core.getInput("files") || "").trim();
+  if (!files) {
+    throw new Error(
+      "files: is required. Name your invoices, one glob per line, for example `invoices/**/*.xml` and " +
+        "`invoices/**/*.pdf`. There is no default: a repository-wide `**/*.xml` also matches pom.xml, " +
+        "IDE settings and every other XML file, and each of those would fail the build as not an invoice.",
+    );
+  }
   const profile = (core.getInput("profile") || "").trim();
   const failOn = (core.getInput("fail-on") || "error").trim().toLowerCase();
   const apiKey = (core.getInput("api-key") || "").trim();
@@ -78379,7 +79287,9 @@ async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {}) {
   const counts = tally(results);
   const provenance = results.find((r) => r.provenance)?.provenance ?? null;
 
-  if (inputs.annotations) emitAnnotations(results, core);
+  const shown = inputs.annotations
+    ? emitAnnotations(results, core, { summary: inputs.summary })
+    : { annotated: 0, notAnnotated: 0 };
 
   let sarifPath = "";
   if (inputs.sarif) {
@@ -78418,16 +79328,25 @@ async function run(core, { fetchImpl = fetch, cwd = process.cwd() } = {}) {
   core.setOutput("sarif-path", sarifPath);
   core.setOutput("record-urls", recordUrls.join("\n"));
 
+  // GitHub shows ten annotations of each kind per step; the files past that
+  // were logged instead, and the closing line says so rather than letting
+  // them disappear from the pull request without a word.
+  const unshown = shown.notAnnotated > 0
+    ? ` ${run_plural(shown.notAnnotated, "more file")} with findings ${shown.notAnnotated === 1 ? "is" : "are"} ` +
+      "listed in the log, not annotated: GitHub shows ten annotations of each kind per step." +
+      (inputs.summary ? " The job summary has every finding." : "")
+    : "";
+
   if (shouldFail(counts, inputs.failOn)) {
     core.setFailed(
       `${counts.errors} error${counts.errors === 1 ? "" : "s"} and ${counts.warnings} ` +
         `warning${counts.warnings === 1 ? "" : "s"} across ${counts.files} document` +
-        `${counts.files === 1 ? "" : "s"} (fail-on: ${inputs.failOn}).`,
+        `${counts.files === 1 ? "" : "s"} (fail-on: ${inputs.failOn}).${unshown}`,
     );
   } else {
     core.info(
       `All ${counts.files} document${counts.files === 1 ? "" : "s"} pass (${counts.warnings} warning` +
-        `${counts.warnings === 1 ? "" : "s"}, ${counts.information} informational).`,
+        `${counts.warnings === 1 ? "" : "s"}, ${counts.information} informational).${unshown}`,
     );
   }
 
