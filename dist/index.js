@@ -61921,6 +61921,130 @@ function glob_hashFiles(patterns_1) {
     });
 }
 //# sourceMappingURL=glob.js.map
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-decode.js
+/**
+ * Bytes to XML text, the way an XML processor reads them.
+ *
+ * One decoder, two callers: `validate` reads a file with it, and
+ * `extractFacturX` the XML attached to a PDF, so the same bytes cannot be read
+ * two ways. They were read two ways until this module existed. The PDF reader
+ * decoded its attachment as UTF-8 and replaced whatever did not decode,
+ * whatever the attachment declared, so an ISO-8859-1 `factur-x.xml` reached
+ * the rules with U+FFFD in place of every "ß" and could come back valid.
+ *
+ * The byte-order mark decides first, then the encoding the XML declaration
+ * names, then UTF-8, which XML 1.0 makes the default. Decoding is strict:
+ * bytes that are not valid in that encoding are a problem to report, never a
+ * replacement character to judge.
+ *
+ * ONE KIND OF DECLARATION IS NOT BELIEVED. A declaration naming a single-byte
+ * encoding (ISO-8859-1, windows-1252 and the rest) over bytes that are valid
+ * UTF-8, and not plain ASCII, is almost always a file that something converted
+ * to UTF-8 while leaving its declaration alone. Every byte is valid in a
+ * single-byte encoding, so such a file decodes "successfully" into mojibake —
+ * "Straße" as "StraÃŸe" — and an invoice read that way passes with the
+ * corruption in it. A genuine single-byte file is practically never valid
+ * UTF-8: each "ß" or "é" in it would have to be followed, every time, by
+ * exactly the bytes UTF-8 requires after that lead byte. So the combination is
+ * reported by name and decoded neither way. Read as declared, the invoice
+ * would be judged corrupted; read as UTF-8, it would be judged as a document
+ * that no XML processor, honouring the declaration, would ever see.
+ */
+/**
+ * Decode an XML document's bytes: byte-order mark, then declaration, then
+ * UTF-8, strictly. See the module comment for the one declaration it refuses
+ * to believe.
+ */
+function decodeXml(bytes) {
+    let label = "utf-8";
+    let start = 0;
+    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+        start = 3;
+    else if (bytes[0] === 0xff && bytes[1] === 0xfe)
+        [label, start] = ["utf-16le", 2];
+    else if (bytes[0] === 0xfe && bytes[1] === 0xff)
+        [label, start] = ["utf-16be", 2];
+    else {
+        // The declaration is ASCII in every encoding this can apply to.
+        const head = String.fromCharCode(...bytes.subarray(0, 200));
+        const declared = /^<\?xml[^>]*\bencoding\s*=\s*["']([A-Za-z0-9._-]+)["']/.exec(head)?.[1];
+        if (declared)
+            label = declared.toLowerCase();
+    }
+    let decoder;
+    try {
+        // ignoreBOM: the mark is skipped above, by hand, and a SECOND one is a
+        // character of the document that TextDecoder would otherwise eat too.
+        decoder = new TextDecoder(label, { fatal: true, ignoreBOM: true });
+    }
+    catch {
+        return { problem: "unsupported", label };
+    }
+    const body = bytes.subarray(start);
+    // Only a declaration can name a single-byte encoding: a byte-order mark
+    // names UTF-8 or UTF-16.
+    if (SINGLE_BYTE.has(decoder.encoding) && isMultiByteUtf8(body)) {
+        return { problem: "mislabelled", label };
+    }
+    try {
+        return { text: (start > 0 ? "\uFEFF" : "") + decoder.decode(body), encoding: decoder.encoding, label };
+    }
+    catch {
+        return { problem: "invalid", label };
+    }
+}
+/**
+ * The WHATWG Encoding Standard's single-byte encodings, by the names
+ * `TextDecoder` reports. ISO-8859-1 and US-ASCII are here as `windows-1252`,
+ * which is what the standard reads both labels as.
+ */
+const SINGLE_BYTE = new Set([
+    "ibm866",
+    "iso-8859-2",
+    "iso-8859-3",
+    "iso-8859-4",
+    "iso-8859-5",
+    "iso-8859-6",
+    "iso-8859-7",
+    "iso-8859-8",
+    "iso-8859-8-i",
+    "iso-8859-10",
+    "iso-8859-13",
+    "iso-8859-14",
+    "iso-8859-15",
+    "iso-8859-16",
+    "koi8-r",
+    "koi8-u",
+    "macintosh",
+    "windows-874",
+    "windows-1250",
+    "windows-1251",
+    "windows-1252",
+    "windows-1253",
+    "windows-1254",
+    "windows-1255",
+    "windows-1256",
+    "windows-1257",
+    "windows-1258",
+    "x-mac-cyrillic",
+]);
+/**
+ * Valid UTF-8 that is not plain ASCII: text no single-byte label describes.
+ * ASCII is excluded because it reads the same in every one of them, so a
+ * declaration over ASCII bytes cannot be wrong in a way that matters.
+ */
+function isMultiByteUtf8(bytes) {
+    if (!bytes.some((b) => b >= 0x80))
+        return false;
+    try {
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/facturx-pdf.js
 /**
  * Reading the Factur-X / ZUGFeRD PDF container.
@@ -61935,8 +62059,8 @@ function glob_hashFiles(patterns_1) {
  * embedding, colour profiles, XMP metadata and a conformance claim that a
  * validator will check, and shipping a half-conformant writer would produce
  * files that look like Factur-X and are not. Extraction has no such failure
- * mode: either the attachment is there and comes out byte-identical, or it is
- * not and this throws.
+ * mode: either the attachment is there and comes out as exactly the text it
+ * holds, or this throws.
  *
  * ## Zero dependencies, including the decompressor
  *
@@ -61958,6 +62082,34 @@ function glob_hashFiles(patterns_1) {
  * not decrypt, and does not implement `LZWDecode`, `/Crypt` or any of the image
  * filters — it names them and refuses instead, because a wrong answer about the
  * contents of a tax document is worse than no answer.
+ *
+ * ## The attachment's text: UTF-8, or a refusal that names the encoding
+ *
+ * The attachment is bytes, and `xml` is text, so something decides the
+ * encoding. Until this was written down it was decided badly: the bytes were
+ * decoded as UTF-8 with replacement, whatever the attachment declared, so an
+ * ISO-8859-1 `factur-x.xml` came back with U+FFFD in place of every "ß", no
+ * warning, and — through `validate` — `valid: true`.
+ *
+ * Factur-X and ZUGFeRD attachments are UTF-8. ZUGFeRD 1.0 said so in as many
+ * words (§6.1: "Als Zeichensatz wird ausschließlich UTF-8 verwendet"), FeRD's
+ * sample files are UTF-8, and Mustang, the open-source ZUGFeRD library and
+ * validator, decodes the attachment as UTF-8 without reading its declaration
+ * (`getUTF8()`). So an
+ * attachment in another encoding is not just unusual. A receiver that follows
+ * the format reads it as UTF-8, one that honours the XML declaration reads it
+ * as declared, and the two see different invoices. Whichever of them this
+ * package imitated, its verdict would be about a document some receiver does
+ * not see.
+ *
+ * So the bytes go through `decodeXml` (xml-decode.ts), the decoder `validate`
+ * uses for a file: the byte-order mark, then the declaration, strictly. The
+ * attachment is returned when both readers would agree on its text, which
+ * means UTF-8, with or without a byte-order mark; or plain ASCII under another
+ * declaration, which reads the same either way and is returned with a warning.
+ * Anything else throws `FacturXEncodingError` naming the encoding: an
+ * attachment in ISO-8859-1 or UTF-16, bytes that are not valid in the
+ * encoding named, or UTF-8 bytes under a stale single-byte declaration.
  *
  * ## Hostile input
  *
@@ -61982,6 +62134,7 @@ function glob_hashFiles(patterns_1) {
  *   the byte it came from. `maxObjectNodes` is the cap that corresponds to what
  *   a Cloudflare Worker actually runs out of.
  */
+
 const DEFAULT_PDF_LIMITS = {
     maxStreamBytes: 32 * 1024 * 1024,
     maxTotalInflatedBytes: 64 * 1024 * 1024,
@@ -62016,6 +62169,26 @@ class PdfSecurityError extends PdfError {
 class FacturXNotFoundError extends PdfError {
     constructor(message) {
         super("facturx_no_xml_attachment", message);
+    }
+}
+/**
+ * The XML attachment is there, and is not UTF-8 text: it is in another
+ * encoding, its bytes are not valid in the one it names, or it names one it is
+ * not in. Factur-X and ZUGFeRD attachments are UTF-8; see "The attachment's
+ * text" at the top of this module for why this is a refusal and not a guess.
+ */
+class FacturXEncodingError extends PdfError {
+    /** The attachment's filename, e.g. `factur-x.xml`. */
+    attachmentName;
+    /**
+     * The encoding the attachment's byte-order mark or XML declaration names,
+     * lower-cased (`iso-8859-1`, `utf-16le`), or `utf-8` when it names none.
+     */
+    encoding;
+    constructor(attachmentName, encoding, message) {
+        super("facturx_xml_encoding", message);
+        this.attachmentName = attachmentName;
+        this.encoding = encoding;
     }
 }
 /** A filter we do not implement — named rather than guessed at. */
@@ -63227,8 +63400,34 @@ function walkNameTree(doc, node, out, depth, state = { nodes: 0, visited: new Se
     }
     state.path.delete(dict);
 }
+/** For PDF text strings (names), where a replaced byte costs a character of a filename. Never for the XML. */
 function utf8(bytes) {
     return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+/**
+ * Would a reader that takes the attachment as UTF-8 get this same text? Only
+ * when the bytes are ASCII and so is what they decoded to: ISO-2022-JP, for
+ * one, spells non-ASCII characters in ASCII bytes. A UTF-16 byte-order mark
+ * is not ASCII, so a UTF-16 attachment never passes.
+ */
+function readsTheSameAsUtf8(raw, decoded) {
+    return raw.every((b) => b < 0x80) && !/[^\x00-\x7F]/.test(decoded.text);
+}
+/** `FacturXEncodingError`'s message for an attachment whose bytes did not decode. */
+function undecodableAttachment(name, { problem, label }) {
+    const attached = `The XML attached as "${name}"`;
+    switch (problem) {
+        case "unsupported":
+            return (`${attached} declares encoding "${label}", which this runtime cannot decode. Factur-X and ` +
+                `ZUGFeRD attachments are UTF-8, which every runtime decodes.`);
+        case "invalid":
+            return (`${attached} contains bytes that are not valid ${label}, so it is not the text its producer ` +
+                `meant. Factur-X and ZUGFeRD attachments are UTF-8.`);
+        case "mislabelled":
+            return (`${attached} declares encoding "${label}", but its bytes are UTF-8: it was converted to UTF-8 ` +
+                `and its declaration was not. A receiver that honours the declaration reads every non-ASCII ` +
+                `character in it as two or more wrong ones.`);
+    }
 }
 /**
  * Decode a PDF *text string* into real characters.
@@ -63277,14 +63476,15 @@ function decodePdfTextString(value) {
  * Pull the invoice XML out of a Factur-X / ZUGFeRD / XRechnung-CII PDF.
  *
  * Extraction only — this never writes a PDF. The returned `xml` is the
- * attachment's bytes decoded as UTF-8 and is suitable input for
- * `parseCiiInvoice`.
+ * attachment's UTF-8 text and is suitable input for `parseCiiInvoice`.
  *
  * Throws `FacturXNotFoundError` when the document carries no XML attachment,
- * `PdfParseError` when the bytes are not a readable PDF, `PdfSecurityError`
- * when a limit in `PdfLimits` is hit, and `PdfUnsupportedFilterError` for a
- * compression filter this reader does not implement. It does not return a
- * partial result and it does not throw anything else.
+ * `FacturXEncodingError` when the attachment is not UTF-8 (see "The
+ * attachment's text" above), `PdfParseError` when the bytes are not a readable
+ * PDF, `PdfSecurityError` when a limit in `PdfLimits` is hit, and
+ * `PdfUnsupportedFilterError` for a compression filter this reader does not
+ * implement. It does not return a partial result and it does not throw
+ * anything else.
  */
 function extractFacturX(bytes, limits = {}) {
     const lim = { ...DEFAULT_PDF_LIMITS, ...limits };
@@ -63383,7 +63583,24 @@ function extractFacturX(bytes, limits = {}) {
         throw new PdfSecurityError("pdf_attachment_too_large", `The embedded XML is ${raw.length} bytes, over the ${lim.maxAttachmentBytes}-byte limit. ` +
             `Raise maxAttachmentBytes if an invoice this size is expected.`);
     }
-    const xml = utf8(raw).replace(/^﻿/, "");
+    const decoded = decodeXml(raw);
+    if ("problem" in decoded) {
+        throw new FacturXEncodingError(chosen.name, decoded.label, undecodableAttachment(chosen.name, decoded));
+    }
+    if (decoded.encoding !== "utf-8") {
+        if (!readsTheSameAsUtf8(raw, decoded)) {
+            throw new FacturXEncodingError(chosen.name, decoded.label, `The XML attached as "${chosen.name}" is in ${decoded.label}, not UTF-8. Factur-X and ZUGFeRD ` +
+                `attachments are UTF-8, and a receiver that follows the format reads them as UTF-8 whatever ` +
+                `they declare — Mustang, the open-source ZUGFeRD validator, does — so every non-ASCII ` +
+                `character in this one would reach it as something else.`);
+        }
+        warnings.push(`The attachment "${chosen.name}" declares encoding "${decoded.label}". Factur-X and ZUGFeRD ` +
+            `attachments are UTF-8. This one holds only ASCII, which reads the same in both, so it was ` +
+            `returned; the first non-ASCII character its producer writes will not read the same.`);
+    }
+    // The byte-order mark is not part of the XML. A second one would be: it
+    // stays, as it does when validate() reads a file.
+    const xml = decoded.text.replace(/^\uFEFF/, "");
     if (!/<[^>]*CrossIndustryInvoice/i.test(xml) && !/<\?xml/i.test(xml)) {
         warnings.push(`The attachment "${chosen.name}" does not begin with an XML declaration and contains no ` +
             `CrossIndustryInvoice element, so it may not be an invoice at all. It was returned ` +
@@ -78146,6 +78363,7 @@ function runInputRules(inv) {
 
 
 
+
 /**
  * The message for a programming error: something that is not a document at all.
  *
@@ -78210,6 +78428,15 @@ function validate(document, options = {}) {
                     throw err;
                 if (SIZE_CODES.has(err.code))
                     return tooLarge(err);
+                if (err instanceof FacturXEncodingError) {
+                    // The PDF was read and the attachment found; what failed is its
+                    // text. So this is the XML's finding, and it says which attachment,
+                    // as a parse failure of the XML inside a PDF does.
+                    return {
+                        ...unreadable("AW-PARSE", err.message, "Export the invoice again with its XML attachment in UTF-8, and declared as UTF-8, which is what Factur-X and ZUGFeRD require.", err),
+                        container: err.attachmentName,
+                    };
+                }
                 return unreadable("AW-PDF", err.code === "facturx_no_xml_attachment"
                     ? "This is a PDF with no invoice XML inside, so it is not a Factur-X / ZUGFeRD e-invoice."
                     : `This could not be read as a Factur-X / ZUGFeRD PDF: ${err.message}`, err.code === "facturx_no_xml_attachment"
@@ -78222,10 +78449,9 @@ function validate(document, options = {}) {
             if (kind)
                 return unreadable("AW-PARSE", `This is ${kind.what}.`, kind.fix);
             const decoded = decodeXml(bytes);
-            if (typeof decoded !== "string") {
-                return unreadable("AW-PARSE", `This could not be decoded: ${decoded.problem}.`, "Save the file as UTF-8, or declare the encoding it is actually in.");
-            }
-            xml = decoded;
+            if ("problem" in decoded)
+                return unreadable("AW-PARSE", ...undecodable(decoded));
+            xml = decoded.text;
         }
     }
     let root;
@@ -78349,46 +78575,26 @@ function notXml(bytes) {
     return null;
 }
 /**
- * Bytes to text, honouring the byte-order mark and the XML declaration.
- *
- * The engine takes a string and does not read the declaration, so a
- * windows-1252 invoice decoded as UTF-8 would reach the rules with every "ü"
- * replaced, and pass. Decoding is strict: bytes that are not valid in the
- * declared encoding are a finding, not a replacement character.
+ * The finding for a file whose bytes are not the text it says they are, as
+ * `[message, fix]`. The engine takes a string and does not read the
+ * declaration, so the decoding is done here (xml-decode.ts), and strictly: a
+ * file that does not decode is a finding, not a replacement character.
  */
-function decodeXml(bytes) {
-    let label = "utf-8";
-    let start = 0;
-    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
-        start = 3;
-    else if (bytes[0] === 0xff && bytes[1] === 0xfe)
-        [label, start] = ["utf-16le", 2];
-    else if (bytes[0] === 0xfe && bytes[1] === 0xff)
-        [label, start] = ["utf-16be", 2];
-    else {
-        // The declaration is ASCII in every encoding this can apply to.
-        const head = String.fromCharCode(...bytes.subarray(0, 200));
-        const declared = /^<\?xml[^>]*\bencoding\s*=\s*["']([A-Za-z0-9._-]+)["']/.exec(head)?.[1];
-        if (declared)
-            label = declared.toLowerCase();
-    }
-    let decoder;
-    try {
-        // ignoreBOM: the mark is skipped above, by hand, and a SECOND one is a
-        // character of the document that TextDecoder would otherwise eat too.
-        decoder = new TextDecoder(label, { fatal: true, ignoreBOM: true });
-    }
-    catch {
-        return { problem: `it declares encoding "${label}", which this runtime cannot decode` };
-    }
-    try {
-        // The mark goes back on as U+FEFF, so the text is exactly what a caller
-        // who decoded the file themselves would pass, and a column on line 1
-        // means the same thing whichever way the document arrived.
-        return (start > 0 ? "\uFEFF" : "") + decoder.decode(bytes.subarray(start));
-    }
-    catch {
-        return { problem: `it contains bytes that are not valid ${label}` };
+function undecodable({ problem, label }) {
+    const fix = "Save the file as UTF-8, or declare the encoding it is actually in.";
+    switch (problem) {
+        case "unsupported":
+            return [`This could not be decoded: it declares encoding "${label}", which this runtime cannot decode.`, fix];
+        case "invalid":
+            return [`This could not be decoded: it contains bytes that are not valid ${label}.`, fix];
+        case "mislabelled":
+            return [
+                `This declares encoding "${label}", but its bytes are UTF-8: it was converted to UTF-8 and its ` +
+                    "declaration was not. Read as it declares, which is how an XML processor reads it, every " +
+                    "non-ASCII character in it comes out as two or more wrong ones.",
+                `Change the declaration to encoding="UTF-8", which is what the file is; or, if it is meant to ` +
+                    `be ${label}, save it in ${label} again.`,
+            ];
     }
 }
 /** Profiles that exist in only one syntax. en16931 is either. */
@@ -78414,18 +78620,31 @@ function subInvoiceProfile(customizationId) {
  *
  * The engine's `validate(bytes)` makes every decision about the file: whether
  * it is a Factur-X / ZUGFeRD PDF (by its first bytes, not its name), which
- * encoding the XML declares, whether it is UBL or CII, and which profile it
- * claims. It is the same call the engine's command line and the hosted API
- * make, so the three cannot disagree about a file. What it adds over the older
- * parse-then-`validateInput` path is where each finding is: a `location` with
- * the line of the element in the file, and an `xpath` in the file's own syntax
- * (CII paths for a CII file, not the UBL paths the rules are written in).
+ * encoding the XML is in (its byte-order mark, then its declaration), whether
+ * it is UBL or CII, which profile it claims, and, when it is none of those,
+ * what it actually is: an HTML page, a ZIP archive, JSON. No reader is chosen
+ * here and nothing is decoded here. That used to be done in this module, from
+ * the file's extension and `bytes.toString("utf8")`, and the decoding was the
+ * bug: an ISO-8859-1 invoice reached the rules with every umlaut replaced by
+ * U+FFFD, and could pass, while a UTF-16 one could not be read at all. The
+ * hosted validator hands the same bytes to the same call (api mode now sends
+ * the file as it is; see api.js), so the two modes cannot read a file
+ * differently.
  *
- * What stays here is the part the engine cannot see: a file the runner could
- * not read at all. That, like every other failure, becomes a FINDING in the
- * same shape as a rule violation, and it is fatal. A pipeline that silently
- * skips the invoice it could not open is worse than one that has no validation
- * in it, because it reports green for a file nobody has ever looked at.
+ * What the engine adds over the older parse-then-`validateInput` path is where
+ * each finding is: a `location` with the line of the element in the file, and
+ * an `xpath` in the file's own syntax (CII paths for a CII file, not the UBL
+ * paths the rules are written in).
+ *
+ * What stays here is what the engine cannot see: a file the runner could not
+ * open, and a file whose name says PDF when its bytes do not. Each becomes a
+ * FINDING in the same shape as a rule violation, and it is fatal. A pipeline
+ * that silently skips the invoice it could not open is worse than one that has
+ * no validation in it, because it reports green for a file nobody has ever
+ * looked at. (A PDF whose attached XML is not UTF-8 is the engine's to refuse:
+ * since 0.12.0 `validate` answers it with a fatal AW-PARSE naming the
+ * encoding, where 0.10.0 and 0.11.0 decoded the attachment with replacement
+ * characters.)
  */
 
 
@@ -78450,6 +78669,32 @@ const read_PROFILES = Object.freeze([
  */
 function read_unreadable(rule, message, fix) {
   return { rule, field: "document", severity: "fatal", message, fix };
+}
+
+/** Is this a PDF? By its first four bytes, `%PDF`: the test `validate` applies. */
+function isPdf(bytes) {
+  return bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+}
+
+/**
+ * A file named `.pdf` that is not a PDF, as a finding; null for any other file.
+ *
+ * The engine goes by the bytes, so it would read such a file as whatever it
+ * turns out to be, and the verdict would be about a document the workflow did
+ * not know it had: an HTML login page a download step saved as `invoice.pdf`,
+ * or XML under the wrong name. The name is the one fact about a file that only
+ * the runner has, so the runner checks it, and a `.pdf` that is not a PDF is
+ * told so in those words. Both modes ask this first, so a file gets the same
+ * answer from either.
+ */
+function pdfInNameOnly(file, bytes) {
+  if (!/\.pdf$/i.test(file) || isPdf(bytes)) return null;
+  return read_unreadable(
+    "AW-PDF",
+    `${file} could not be read as a Factur-X / ZUGFeRD PDF: it is named .pdf, but it does not begin ` +
+      "with %PDF-, so it is not a PDF.",
+    "Check the file is a PDF/A-3 with an EN 16931 CII attachment, or validate the XML payload directly.",
+  );
 }
 
 /**
@@ -78478,12 +78723,14 @@ function inActionTerms(finding, error) {
  *   container: string|null, findings: object[]}>}
  */
 async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
+  const base = { file, syntax: null, profile: null, container: null };
+
   let bytes;
   try {
     bytes = await (0,promises_namespaceObject.readFile)(file);
   } catch (err) {
     return {
-      file, syntax: null, profile: null, container: null,
+      ...base,
       findings: [
         read_unreadable(
           "AW-IO",
@@ -78494,16 +78741,18 @@ async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
     };
   }
 
+  const misnamed = pdfInNameOnly(file, bytes);
+  if (misnamed) return { ...base, findings: [misnamed] };
+
   const result = validate(bytes, {
     ...(profile ? { profile } : {}),
     ...(maxCharacters ? { limits: { maxCharacters } } : {}),
   });
+  const read = { file, syntax: result.syntax, container: result.container, profile: result.profile };
+
 
   return {
-    file,
-    syntax: result.syntax,
-    container: result.container,
-    profile: result.profile,
+    ...read,
     findings: [...result.errors, ...result.warnings, ...result.information]
       .map((f) => inActionTerms(f, result.error)),
   };
@@ -78527,17 +78776,27 @@ async function validateFile(file, { profile = "", maxCharacters = null } = {}) {
  *      a URL somebody outside your CI can open. A runner cannot mint one about
  *      itself and have it mean anything.
  *
- * A PDF is unwrapped LOCALLY even in this mode, and the extracted CII payload
- * is what gets posted. The hosted endpoint reads XML documents, not PDF
- * containers, and the extraction is a pure function in the bundled library —
- * shipping the whole PDF over the wire to have it refused would be slower and
- * less private for no gain.
+ * THE FILE IS SENT AS IT IS, byte for byte: a PDF as `application/pdf`, any
+ * other file as `application/xml`, with no `charset`. The hosted validator
+ * hands the bytes to the same `validate()` local mode calls, so it unwraps the
+ * PDF, decodes the XML in the encoding the file declares, and names a file that
+ * is not an invoice, exactly as the runner would. This mode used to decode
+ * every file as UTF-8 and post the text, still declaring the encoding it was no
+ * longer in: an ISO-8859-1 invoice arrived with every umlaut replaced by
+ * U+FFFD and could pass, and a UTF-16 one could not be read. It also unwrapped
+ * a PDF itself and posted only the XML. Sending the file instead means a
+ * Validation Record fingerprints the file in the repository, not a payload
+ * extracted from it.
+ *
+ * The header chooses the validator's door, a document rather than the JSON
+ * invoice model, and a body under a header that door does not take is answered
+ * 415 `unsupported_media_type`. So it is chosen from the bytes, by the test the
+ * engine applies, and not from the file's name.
  *
  * Failures here are findings, never exceptions: a 401, a quota exhaustion or a
  * DNS failure produces a fatal finding against the file, so a broken key gives
  * a red build with a sentence explaining it rather than a stack trace.
  */
-
 
 
 
@@ -78561,18 +78820,18 @@ function validateUrl(base, { record = false, maxCharacters = null } = {}) {
  *
  * `fetch` is Node 20's own; there is no HTTP client in this action's bundle.
  */
-async function post(url, xml, apiKey, fetchImpl) {
+async function post(url, bytes, contentType, apiKey, fetchImpl) {
   let last;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
       const response = await fetchImpl(url, {
         method: "POST",
         headers: {
-          "content-type": "application/xml",
+          "content-type": contentType,
           authorization: `Bearer ${apiKey}`,
           "user-agent": "attestwire/validate-einvoice-action",
         },
-        body: xml,
+        body: bytes,
       });
       if (response.status < 500) return { ok: true, response };
       last = `HTTP ${response.status}`;
@@ -78596,16 +78855,9 @@ async function validateFileViaApi(
 ) {
   const base = { file, syntax: null, profile: null, container: null };
 
-  let xml, container = null;
+  let bytes;
   try {
-    const bytes = await (0,promises_namespaceObject.readFile)(file);
-    if (/\.pdf$/i.test(file)) {
-      const extracted = extractFacturX(new Uint8Array(bytes));
-      xml = extracted.xml;
-      container = extracted.attachmentName ?? "embedded XML";
-    } else {
-      xml = bytes.toString("utf8");
-    }
+    bytes = await (0,promises_namespaceObject.readFile)(file);
   } catch (err) {
     return {
       ...base,
@@ -78616,12 +78868,17 @@ async function validateFileViaApi(
     };
   }
 
+  // The validator is never told the file's name, so a `.pdf` that is not a
+  // PDF is answered here, in the words local mode uses, and costs no request.
+  const misnamed = pdfInNameOnly(file, bytes);
+  if (misnamed) return { ...base, findings: [misnamed] };
+
+  const pdf = isPdf(bytes);
   const url = validateUrl(apiUrl, { record, maxCharacters });
-  const sent = await post(url, xml, apiKey, fetchImpl);
+  const sent = await post(url, bytes, pdf ? "application/pdf" : "application/xml", apiKey, fetchImpl);
   if (!sent.ok) {
     return {
       ...base,
-      container,
       findings: [
         read_unreadable("AW-NETWORK",
           `${file} could not be validated: the request to ${apiUrl} failed (${sent.reason}).`,
@@ -78642,7 +78899,6 @@ async function validateFileViaApi(
     const message = body?.message ?? `HTTP ${response.status}`;
     return {
       ...base,
-      container,
       findings: [
         read_unreadable("AW-API",
           `${file} was refused by the validator (HTTP ${response.status}): ${message}`,
@@ -78653,9 +78909,12 @@ async function validateFileViaApi(
     };
   }
 
-  // The validator locates each finding at a line of what it was sent. For a
-  // PDF that was the XML payload alone, so the line is the attachment's, and
-  // saying so keeps it off the PDF in the annotations and the SARIF regions.
+  // For a PDF the validator names the attachment it read the XML from, and
+  // each finding's line is a line of that XML, not of the PDF. Every location
+  // is marked with the name, which keeps it off the PDF in the annotations and
+  // the SARIF regions even if a response left a location unmarked; if one ever
+  // named no attachment at all, the engine's own words for one stand in.
+  const container = body?.container ?? (pdf ? "embedded XML" : null);
   const inPayload = (f) =>
     container !== null && f?.location ? { ...f, location: { ...f.location, attachment: container } } : f;
   const findings = [
@@ -79327,10 +79586,10 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * the bundle has no `node_modules` to read at runtime and a version reported
  * from an absent file is worse than no version at all. The obvious failure —
  * bumping the dependency and forgetting this line — is caught by
- * `test/version.test.js`, which compares this string against both the installed
+ * `test/metadata.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.11.0";
+const ENGINE_VERSION = "0.12.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";
