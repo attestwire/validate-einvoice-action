@@ -8,7 +8,7 @@
  * `test/metadata.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-export const ENGINE_VERSION = "0.12.0";
+export const ENGINE_VERSION = "0.12.1";
 
 /** Name reported in the SARIF driver and the summary. */
 export const ENGINE_NAME = "@attestwire/en16931";

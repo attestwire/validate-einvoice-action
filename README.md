@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/attestwire/validate-einvoice-action/actions/workflows/ci.yml/badge.svg)](https://github.com/attestwire/validate-einvoice-action/actions/workflows/ci.yml)
 [![Marketplace](https://img.shields.io/badge/marketplace-validate--e--invoice-blue)](https://github.com/marketplace/actions/validate-e-invoice-en-16931)
-[![engine: @attestwire/en16931 0.12.0](https://img.shields.io/badge/engine-%40attestwire%2Fen16931%400.12.0-blue)](https://www.npmjs.com/package/@attestwire/en16931)
+[![engine: @attestwire/en16931 0.12.1](https://img.shields.io/badge/engine-%40attestwire%2Fen16931%400.12.1-blue)](https://www.npmjs.com/package/@attestwire/en16931)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
 **Fail the build when an e-invoice would be rejected — before a customer's ERP,
@@ -153,7 +153,7 @@ its page on [attestwire.com/rules](https://attestwire.com/rules):
 >
 > **12** documents · **1** error · **0** warnings · **3** informational
 >
-> Mode: **local** · Rules: bundled `@attestwire/en16931@0.12.0` — pinned, offline, no key · Fails on: `error`
+> Mode: **local** · Rules: bundled `@attestwire/en16931@0.12.1` — pinned, offline, no key · Fails on: `error`
 >
 > ### FAIL — `invoices/2026-000142.xml`
 > UBL · xrechnung-ubl
@@ -198,7 +198,7 @@ your invoice broke or the rules moved.
 
 So this action ships the engine **pinned**:
 
-- **Local mode (default)** — `@attestwire/en16931@0.12.0` is bundled into
+- **Local mode (default)** — `@attestwire/en16931@0.12.1` is bundled into
   `dist/index.js`. A given tag of this action always runs exactly those rules.
   Same commit, same verdict, on any runner, offline, forever. You upgrade rules
   the way you upgrade any dependency: by bumping the action's tag, in a pull
