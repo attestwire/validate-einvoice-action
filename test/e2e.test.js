@@ -130,6 +130,17 @@ test("the bundle prints one annotation per file, and a PDF's claims no line", as
   assert.match(annotations[0], /^::error title=AW-PROFILE-SUBSET \(BT-24\) and 4 more%3A 5 errors,file=[^,:]+\.pdf::/);
 });
 
+test("the bundle reads ISO-8859-1 and UTF-16 invoices in the encodings they declare", async () => {
+  const r = await runAction({ files: path.join(FIXTURES, "encodings", "*.xml") });
+  assert.equal(r.code, 0, r.stderr || r.stdout);
+  assert.equal(r.outputs["file-count"], "2");
+  assert.equal(r.outputs["error-count"], "0");
+  assert.equal(r.outputs["warning-count"], "1");
+  assert.match(r.stdout,
+    /^::warning title=BR-DE-28 \(BT-43\),file=[^,]+iso-8859-1\.xml,line=47::.*"Jürgen Weiß <rechnungen@/m,
+    "the umlaut and the ß arrive as themselves, not as U+FFFD");
+});
+
 test("the bundle refuses to run without files, and says what to write", async () => {
   const r = await runAction({});
   assert.equal(r.code, 1);

@@ -15,11 +15,22 @@
  *      a URL somebody outside your CI can open. A runner cannot mint one about
  *      itself and have it mean anything.
  *
- * A PDF is unwrapped LOCALLY even in this mode, and the extracted CII payload
- * is what gets posted. The hosted endpoint reads XML documents, not PDF
- * containers, and the extraction is a pure function in the bundled library —
- * shipping the whole PDF over the wire to have it refused would be slower and
- * less private for no gain.
+ * THE FILE IS SENT AS IT IS, byte for byte: a PDF as `application/pdf`, any
+ * other file as `application/xml`, with no `charset`. The hosted validator
+ * hands the bytes to the same `validate()` local mode calls, so it unwraps the
+ * PDF, decodes the XML in the encoding the file declares, and names a file that
+ * is not an invoice, exactly as the runner would. This mode used to decode
+ * every file as UTF-8 and post the text, still declaring the encoding it was no
+ * longer in: an ISO-8859-1 invoice arrived with every umlaut replaced by
+ * U+FFFD and could pass, and a UTF-16 one could not be read. It also unwrapped
+ * a PDF itself and posted only the XML. Sending the file instead means a
+ * Validation Record fingerprints the file in the repository, not a payload
+ * extracted from it.
+ *
+ * The header chooses the validator's door, a document rather than the JSON
+ * invoice model, and a body under a header that door does not take is answered
+ * 415 `unsupported_media_type`. So it is chosen from the bytes, by the test the
+ * engine applies, and not from the file's name.
  *
  * Failures here are findings, never exceptions: a 401, a quota exhaustion or a
  * DNS failure produces a fatal finding against the file, so a broken key gives
@@ -27,8 +38,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { extractFacturX } from "@attestwire/en16931";
-import { unreadable } from "./read.js";
+import { isPdf, pdfInNameOnly, unreadable } from "./read.js";
 
 /** Requests that fail below the HTTP layer are retried; a 4xx verdict is not. */
 const RETRIES = 2;
@@ -49,18 +59,18 @@ export function validateUrl(base, { record = false, maxCharacters = null } = {})
  *
  * `fetch` is Node 20's own; there is no HTTP client in this action's bundle.
  */
-async function post(url, xml, apiKey, fetchImpl) {
+async function post(url, bytes, contentType, apiKey, fetchImpl) {
   let last;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
       const response = await fetchImpl(url, {
         method: "POST",
         headers: {
-          "content-type": "application/xml",
+          "content-type": contentType,
           authorization: `Bearer ${apiKey}`,
           "user-agent": "attestwire/validate-einvoice-action",
         },
-        body: xml,
+        body: bytes,
       });
       if (response.status < 500) return { ok: true, response };
       last = `HTTP ${response.status}`;
@@ -84,16 +94,9 @@ export async function validateFileViaApi(
 ) {
   const base = { file, syntax: null, profile: null, container: null };
 
-  let xml, container = null;
+  let bytes;
   try {
-    const bytes = await readFile(file);
-    if (/\.pdf$/i.test(file)) {
-      const extracted = extractFacturX(new Uint8Array(bytes));
-      xml = extracted.xml;
-      container = extracted.attachmentName ?? "embedded XML";
-    } else {
-      xml = bytes.toString("utf8");
-    }
+    bytes = await readFile(file);
   } catch (err) {
     return {
       ...base,
@@ -104,12 +107,17 @@ export async function validateFileViaApi(
     };
   }
 
+  // The validator is never told the file's name, so a `.pdf` that is not a
+  // PDF is answered here, in the words local mode uses, and costs no request.
+  const misnamed = pdfInNameOnly(file, bytes);
+  if (misnamed) return { ...base, findings: [misnamed] };
+
+  const pdf = isPdf(bytes);
   const url = validateUrl(apiUrl, { record, maxCharacters });
-  const sent = await post(url, xml, apiKey, fetchImpl);
+  const sent = await post(url, bytes, pdf ? "application/pdf" : "application/xml", apiKey, fetchImpl);
   if (!sent.ok) {
     return {
       ...base,
-      container,
       findings: [
         unreadable("AW-NETWORK",
           `${file} could not be validated: the request to ${apiUrl} failed (${sent.reason}).`,
@@ -130,7 +138,6 @@ export async function validateFileViaApi(
     const message = body?.message ?? `HTTP ${response.status}`;
     return {
       ...base,
-      container,
       findings: [
         unreadable("AW-API",
           `${file} was refused by the validator (HTTP ${response.status}): ${message}`,
@@ -141,9 +148,12 @@ export async function validateFileViaApi(
     };
   }
 
-  // The validator locates each finding at a line of what it was sent. For a
-  // PDF that was the XML payload alone, so the line is the attachment's, and
-  // saying so keeps it off the PDF in the annotations and the SARIF regions.
+  // For a PDF the validator names the attachment it read the XML from, and
+  // each finding's line is a line of that XML, not of the PDF. Every location
+  // is marked with the name, which keeps it off the PDF in the annotations and
+  // the SARIF regions even if a response left a location unmarked; if one ever
+  // named no attachment at all, the engine's own words for one stand in.
+  const container = body?.container ?? (pdf ? "embedded XML" : null);
   const inPayload = (f) =>
     container !== null && f?.location ? { ...f, location: { ...f.location, attachment: container } } : f;
   const findings = [

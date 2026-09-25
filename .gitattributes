@@ -3,3 +3,6 @@
 # bytes on every OS, so every text file is LF in the working tree everywhere.
 * text=auto eol=lf
 *.pdf binary
+# Invoices in ISO-8859-1 and UTF-16: their bytes are what the tests are about,
+# so no checkout may normalise them.
+test/fixtures/encodings/*.xml binary

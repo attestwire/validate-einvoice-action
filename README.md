@@ -45,7 +45,13 @@ line concerned, and writes a findings table to the job summary.
 
 The syntax is decided by the document's root element, not by its filename, so a
 `.xml` file that is not an invoice is refused by name rather than skipped. A PDF
-is recognised by its bytes, so a Factur-X saved as `.xml` is still read as one.
+is recognised by its bytes, so a Factur-X saved as `.xml` is still read as one;
+a file named `.pdf` that is not a PDF is refused as one. XML is decoded in the
+encoding it declares (its byte-order mark, then its XML declaration), so an
+ISO-8859-1 or UTF-16 invoice is judged with its umlauts intact, and bytes that
+are not valid in that encoding fail the file instead of turning into
+replacement characters. A Factur-X PDF whose attached XML is not UTF-8 is
+refused for the same reason.
 A Factur-X MINIMUM or BASIC WL file fails with `AW-PROFILE-SUBSET` ahead of the
 rules it cannot meet: those profiles carry too little to be an EN 16931 invoice.
 
@@ -201,7 +207,8 @@ So this action ships the engine **pinned**:
   which always runs the **current** rule set and returns a `provenance` block
   naming the engine version and rule set that judged it. Your build tracks the
   regulation, and when it goes red you can see from the summary which rule set
-  said so.
+  said so. The file is sent as it is on disk, a PDF whole as
+  `application/pdf`, and read there by the same engine call local mode makes.
 
 | | local (default) | api (`api-key` set) |
 | --- | --- | --- |
@@ -241,7 +248,8 @@ machine-readable feed at `/rule-currency.json`.
 ## Validation Records
 
 In api mode, `record: true` mints a **Validation Record** per document: a
-fingerprint of the file, the verdict, the rule set and the date, at a URL
+fingerprint of the file (its bytes, the PDF itself for a Factur-X), the
+verdict, the rule set and the date, at a URL
 somebody outside your CI can open. Useful when a counterparty disputes a
 rejection, or when an auditor wants evidence that a document was checked at the
 time it was sent. The URLs land in the `record-urls` output and in the job

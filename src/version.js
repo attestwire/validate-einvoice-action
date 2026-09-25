@@ -5,7 +5,7 @@
  * the bundle has no `node_modules` to read at runtime and a version reported
  * from an absent file is worse than no version at all. The obvious failure —
  * bumping the dependency and forgetting this line — is caught by
- * `test/version.test.js`, which compares this string against both the installed
+ * `test/metadata.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
 export const ENGINE_VERSION = "0.11.0";

@@ -224,7 +224,7 @@ const apiOk = {
   },
 };
 
-test("api mode posts the document as XML with a bearer key", async () => {
+test("api mode posts the file's bytes as XML with a bearer key", async () => {
   const fetchImpl = fakeFetch([apiOk]);
   const core = fakeCore({ files: inFixtures("xrechnung-ubl-minimal.xml"), "api-key": "aw_live_x" });
   await run(core, { fetchImpl });
@@ -235,8 +235,45 @@ test("api mode posts the document as XML with a bearer key", async () => {
   assert.equal(init.method, "POST");
   assert.equal(init.headers["content-type"], "application/xml");
   assert.equal(init.headers.authorization, "Bearer aw_live_x");
-  assert.match(init.body, /^<\?xml/);
+  assert.deepEqual(init.body, await readFile(inFixtures("xrechnung-ubl-minimal.xml")));
   assert.equal(core.calls.failed, null);
+});
+
+test("api mode sends an ISO-8859-1 or UTF-16 invoice as it is, for the validator to decode", async () => {
+  for (const name of ["xrechnung-ubl-iso-8859-1.xml", "xrechnung-cii-utf-16.xml"]) {
+    const file = path.join(FIXTURES, "encodings", name);
+    const fetchImpl = fakeFetch([apiOk]);
+    await run(fakeCore({ files: file, "api-key": "aw_live_x" }), { fetchImpl });
+    const [{ init }] = fetchImpl.seen;
+    assert.equal(init.headers["content-type"], "application/xml",
+      `${name}: no charset parameter, so the encoding the file declares decides`);
+    assert.deepEqual(init.body, await readFile(file), `${name}: the bytes on disk, not text re-encoded as UTF-8`);
+  }
+});
+
+test("api mode sends a Factur-X PDF whole, as application/pdf, whatever the file is called", async () => {
+  const pdf = inFixtures("facturx-en16931-einfach.pdf");
+  const renamed = path.join(await mkdtemp(path.join(tmpdir(), "einvoice-api-")), "saved-by-a-mail-client.xml");
+  await copyFile(pdf, renamed);
+  for (const file of [pdf, renamed]) {
+    const fetchImpl = fakeFetch([apiOk]);
+    await run(fakeCore({ files: file, "api-key": "aw_live_x" }), { fetchImpl });
+    const [{ init }] = fetchImpl.seen;
+    assert.equal(init.headers["content-type"], "application/pdf", `${path.basename(file)}: chosen by the bytes`);
+    assert.deepEqual(init.body, await readFile(pdf), "the PDF itself, for the validator to unwrap");
+  }
+});
+
+test("api mode answers a .pdf that is not a PDF itself, in local mode's words, and sends nothing", async () => {
+  const misnamed = path.join(await mkdtemp(path.join(tmpdir(), "einvoice-api-")), "invoice.pdf");
+  await copyFile(inFixtures("xrechnung-ubl-minimal.xml"), misnamed);
+  const fetchImpl = fakeFetch([apiOk]);
+  const core = fakeCore({ files: misnamed, "api-key": "aw_live_x" });
+  await run(core, { fetchImpl });
+  assert.equal(fetchImpl.seen.length, 0);
+  assert.equal(core.calls.outputs["error-count"], "1");
+  assert.equal(core.calls.errors[0].title, "AW-PDF (document)");
+  assert.match(core.calls.errors[0].message, /could not be read as a Factur-X \/ ZUGFeRD PDF: it is named \.pdf/);
 });
 
 test("record: true asks for a record and surfaces the URL as an output", async () => {
@@ -300,7 +337,9 @@ test("api mode: a line the validator found in a PDF's payload is not claimed as 
   const fetchImpl = fakeFetch([{
     status: 200,
     body: {
-      valid: false, profile: "en16931", syntax: "cii",
+      valid: false, profile: "en16931", syntax: "cii", container: "factur-x.xml",
+      // Unmarked on purpose: the validator marks it, and this is the case
+      // where a response did not.
       errors: [{ rule: "BR-16", field: "BG-25", severity: "fatal", message: "m", fix: "f",
                  docsUrl: "https://attestwire.com/rules/BR-16",
                  location: { line: 103, column: 3, path: "/rsm:CrossIndustryInvoice/rsm:SupplyChainTradeTransaction", exact: false } }],
@@ -315,6 +354,7 @@ test("api mode: a line the validator found in a PDF's payload is not claimed as 
   const [e] = core.calls.errors;
   assert.equal(e.startLine, undefined);
   assert.match(e.message, /line 103 of factur-x\.xml/);
+  assert.match(core.calls.summary, /Factur-X payload: factur-x\.xml/, "the attachment the validator named");
   const log = JSON.parse(await readFile(core.calls.outputs["sarif-path"], "utf8"));
   assert.equal(log.runs[0].results[0].locations[0].physicalLocation.region, undefined);
 });
@@ -333,14 +373,4 @@ test("api mode: a line in an XML document is used as it is", async () => {
   const core = fakeCore({ files: inFixtures("xrechnung-ubl-minimal.xml"), "api-key": "aw_live_x" });
   await run(core, { fetchImpl });
   assert.equal(core.calls.errors[0].startLine, 2);
-});
-
-test("a PDF is unwrapped locally in api mode and only its XML payload is sent", async () => {
-  const fetchImpl = fakeFetch([apiOk]);
-  const core = fakeCore({
-    files: inFixtures("facturx-en16931-einfach.pdf"), "api-key": "aw_live_x",
-  });
-  await run(core, { fetchImpl });
-  assert.match(fetchImpl.seen[0].init.body, /CrossIndustryInvoice/);
-  assert.ok(!fetchImpl.seen[0].init.body.startsWith("%PDF"));
 });

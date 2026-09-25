@@ -19,7 +19,8 @@ could put it somewhere it doesn't belong is a security issue — the job log, th
 job summary, an annotation, an error message, the SARIF report, a crash dump, or
 an outbound request to a host other than the configured `api-url`.
 
-**Your invoice documents.** In api mode the XML is POSTed to the Attestwire API.
+**Your invoice documents.** In api mode each file is POSTed to the Attestwire API
+as it is: the XML, or a Factur-X / ZUGFeRD PDF whole, pages and all.
 Invoices carry customer names, addresses, VAT IDs and bank details. Report
 anything that sends document contents somewhere unintended, or that leaks them
 into output visible to more people than the person who ran the job.

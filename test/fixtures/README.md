@@ -29,6 +29,28 @@ Both are also in the engine's own fixtures, `fixtures/facturx/` in
 - `facturx-en16931-einfach.pdf`: `a0978983423b7261cea82ed4bea1e7b3062c87521692be83ad52ed27caeb6612`
 - `facturx-minimum-rechnung.pdf`: `4d331416500719b338d8f969c8a414c396adce37e21273efdbf59c6a41920712`
 
+## `encodings/`
+
+Two of the invoices above, in encodings other than UTF-8. They sit in their own
+directory so the `test/fixtures/*.xml` globs in `run.test.js` and in the CI
+self-test match the same files as before, and `.gitattributes` marks them
+binary: their bytes are the test, and no checkout may normalise them.
+
+| File | Origin | Used for |
+| --- | --- | --- |
+| `xrechnung-ubl-iso-8859-1.xml` | derived: `xrechnung-ubl-minimal.xml` saved as ISO-8859-1 under `encoding="ISO-8859-1"`, with the seller's email address written with a display name, `Jürgen Weiß <rechnungen@musterlieferant.example>` | read in the encoding it declares: BR-DE-28 quotes the address back, so a test can see the `ü` and the `ß` the rules saw, where decoding as UTF-8 gives U+FFFD. Also attached to a hand-built PDF, for the attachment that is not UTF-8 |
+| `xrechnung-cii-utf-16.xml` | derived: `xrechnung-cii-minimal.xml` saved as UTF-16LE with a byte-order mark under `encoding="UTF-16"` | UTF-16 is read and passes, not refused as malformed |
+
+That hand-built PDF is `pdfWithAttachment` in `test/helpers.js`, made at test
+time. No producer's sample attaches XML in anything but UTF-8, and the question
+there is what happens to the attachment's bytes once it is found, not whether
+the reader can find it.
+
+`sha256`:
+
+- `encodings/xrechnung-ubl-iso-8859-1.xml`: `a5a59e8963c17d8057539235480f4a1cc2c77b18627c36f6dc75170c3be851dd`
+- `encodings/xrechnung-cii-utf-16.xml`: `5a780588aea0a55754e7ea44fcec48d984e1a274df45a4bd5f61ae87c7bc0931`
+
 ## `sarif-schema-2.1.0.json`
 
 Not an invoice: the SARIF 2.1.0 JSON schema, which `test/sarif-check.js`
