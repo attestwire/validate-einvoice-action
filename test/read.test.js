@@ -19,6 +19,11 @@ import { FIXTURES, pdfWithAttachment } from "./helpers.js";
 const fixture = (name) => path.join(FIXTURES, name);
 const encoded = (name) => path.join(FIXTURES, "encodings", name);
 
+// A PDF's container findings (AW-PDF-*, engine 0.14.0 and later) are notes about the
+// PDF, never failures. Everything else in a PDF's answer must be exactly as before.
+const withoutContainerNotes = (findings) =>
+  findings.filter((f) => !(f.rule.startsWith("AW-PDF-") && f.severity !== "fatal"));
+
 test("a conformant XRechnung UBL invoice produces no findings", async () => {
   const r = await validateFile(fixture("xrechnung-ubl-minimal.xml"));
   assert.equal(r.syntax, "ubl");
@@ -72,7 +77,7 @@ test("a Factur-X PDF is unwrapped and its CII payload validated", async () => {
   const r = await validateFile(fixture("facturx-en16931-einfach.pdf"));
   assert.equal(r.syntax, "cii");
   assert.equal(r.container, "factur-x.xml");
-  assert.deepEqual(r.findings, []);
+  assert.deepEqual(withoutContainerNotes(r.findings), []);
 });
 
 test("a Factur-X MINIMUM PDF says why it fails before the rules it fails, located in its attachment", async () => {
@@ -91,7 +96,7 @@ test("a PDF is recognised by its bytes, whatever the file is called", async () =
   await copyFile(fixture("facturx-en16931-einfach.pdf"), renamed);
   const r = await validateFile(renamed);
   assert.equal(r.container, "factur-x.xml");
-  assert.deepEqual(r.findings, []);
+  assert.deepEqual(withoutContainerNotes(r.findings), []);
 });
 
 test("a file named .pdf that is not a PDF is told so, even when it is a valid invoice", async () => {
@@ -140,14 +145,14 @@ test("a PDF whose attached XML is not UTF-8 is refused by name, not judged with 
 
   const control = await validateFile(utf8);
   assert.equal(control.container, "factur-x.xml");
-  assert.deepEqual(control.findings, [], "the same PDF around a UTF-8 attachment reads, and passes");
+  assert.deepEqual(withoutContainerNotes(control.findings), [], "the same PDF around a UTF-8 attachment reads, and passes");
 
   // Engines before 0.12.0 read this with "M\uFFFDnchen" in it, and it passed
   // with one warning. The engine now refuses the attachment, naming its
   // encoding, and the finding is the engine's own.
   const r = await validateFile(latin1);
   assert.equal(r.container, "factur-x.xml");
-  assert.deepEqual(r.findings.map((f) => `${f.rule}:${f.severity}`), ["AW-PARSE:fatal"]);
+  assert.deepEqual(withoutContainerNotes(r.findings).map((f) => `${f.rule}:${f.severity}`), ["AW-PARSE:fatal"]);
   assert.match(r.findings[0].message, /The XML attached as "factur-x\.xml" is in iso-8859-1, not UTF-8/);
   assert.doesNotMatch(JSON.stringify(r), /\uFFFD/);
 });

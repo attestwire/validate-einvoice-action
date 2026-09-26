@@ -187,7 +187,9 @@ test("the SARIF for many documents is one run, and upload-sarif's checks pass on
   assert.equal(log.runs.length, 1, "one run, not one per document");
   assert.equal(log.runs[0].artifacts.length, 8, "every document, the clean ones too");
   assert.deepEqual(uploadErrors(log), []);
-  const regions = log.runs[0].results.map((r) => r.locations[0].physicalLocation.region?.startLine ?? null);
+  // Container findings (AW-PDF-*, engine 0.14.0+) name the file and no line; they are left out here.
+  const regions = log.runs[0].results.filter((r) => !r.ruleId.startsWith("AW-PDF-"))
+    .map((r) => r.locations[0].physicalLocation.region?.startLine ?? null);
   assert.deepEqual(regions, [null, null, null, null, null, null, 72, 2],
     "the MINIMUM PDF's five (lines in its attachment), the non-invoice (no line), CII line 72, UBL line 2");
 });

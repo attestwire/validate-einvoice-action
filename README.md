@@ -278,9 +278,11 @@ out now:
   rejected by KoSIT or by a receiving platform. The engine's verdicts are
   checked against KoSIT's own validator (1.6.3, configuration 3.0.2) by hand at
   recorded dates, not on every call.
-- **A Factur-X PDF's container is not validated.** The embedded CII XML is
-  extracted and judged; PDF/A-3 conformance, attachment relationships and XMP
-  metadata are not checked. A valid payload does not make a valid Factur-X file.
+- **A Factur-X PDF's container is checked only in part.** The embedded CII XML
+  is extracted and judged, and the attachment's name, relationship and MIME type
+  and the XMP metadata are reported as `AW-PDF-*` warnings and notes, never as
+  failures. PDF/A-3 conformance and whether the page agrees with the XML are not
+  checked. A valid payload does not make a valid Factur-X file.
 - **No FatturaPA, no country formats outside EN 16931's syntaxes.**
 - **`profile` is local mode only.** In api mode the hosted validator judges each
   document against the profile it declares.
