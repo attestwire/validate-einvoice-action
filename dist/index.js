@@ -61921,6 +61921,1372 @@ function glob_hashFiles(patterns_1) {
     });
 }
 //# sourceMappingURL=glob.js.map
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-parse.js
+/**
+ * Minimal, hardened XML reader for the UBL subset.
+ *
+ * This package ships with zero runtime dependencies, so it cannot pull in a
+ * general XML parser — and it should not want to. A general parser accepts far
+ * more than UBL needs (DTDs, entities, mixed content, notations), and every one
+ * of those features is an attack surface when the document comes from a third
+ * party.
+ *
+ * What this reader accepts:
+ *   - one root element, with nested elements, attributes and text
+ *   - namespace declarations (`xmlns` and `xmlns:prefix`), resolved to URIs
+ *   - the five predefined entities (`&amp; &lt; &gt; &quot; &apos;`) and
+ *     numeric character references
+ *   - CDATA sections, comments and processing instructions
+ *
+ * What it refuses, loudly:
+ *   - any document containing `<!DOCTYPE` or `<!ENTITY`
+ *   - any entity reference that is not one of the five predefined ones
+ *   - documents deeper, longer or larger than the limits below
+ *   - mixed content: an element with both child elements and text
+ *
+ * Refusing is deliberate. A parser that guesses at a construct it does not
+ * understand produces a wrong invoice, and a wrong invoice is a tax problem.
+ */
+/** Base class for every failure this reader and the UBL mapper raise. */
+class ParseError extends Error {
+    code;
+    constructor(code, message) {
+        super(message);
+        this.name = new.target.name;
+        this.code = code;
+    }
+}
+/** The document is not well-formed XML, or uses a construct outside the subset. */
+class XmlSyntaxError extends ParseError {
+}
+/**
+ * The document tripped one of the limits that exist to stop a hostile file
+ * from exhausting memory or CPU. Never a comment on the invoice itself.
+ */
+class XmlSecurityError extends ParseError {
+}
+const DEFAULT_XML_LIMITS = {
+    maxCharacters: 8_000_000,
+    maxDepth: 100,
+    maxElements: 50_000,
+    maxAttributes: 256,
+};
+/** Attribute lookup by namespace and local name. */
+function attr(el, local, namespace = "") {
+    for (const a of el.attributes) {
+        if (a.local === local && a.namespace === namespace)
+            return a.value;
+    }
+    return undefined;
+}
+const NAME_START = /[A-Za-z_]/;
+const NAME_CHAR = /[A-Za-z0-9._\-]/;
+/**
+ * Characters XML 1.0 does not permit at all. They cannot be escaped, so a
+ * document containing one is not well-formed however it was produced. Checked
+ * on decoded text and attribute values, which is also where a numeric
+ * character reference to a control character would land.
+ */
+// eslint-disable-next-line no-control-regex
+const ILLEGAL_XML_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/;
+const XMLNS_URI = "http://www.w3.org/2000/xmlns/";
+const XML_URI = "http://www.w3.org/XML/1998/namespace";
+/** A namespace map with no prototype at all — see {@link Frame.nsMap}. */
+function emptyNsMap() {
+    const map = Object.create(null);
+    map[""] = "";
+    map["xml"] = XML_URI;
+    return map;
+}
+/**
+ * Parse a UBL-shaped XML document into a tree.
+ *
+ * @throws {XmlSecurityError} on a DOCTYPE, a non-predefined entity, or a
+ *   document over any of the limits.
+ * @throws {XmlSyntaxError} on anything that is not well-formed, or that uses a
+ *   construct outside the accepted subset.
+ */
+function xml_parse_parseXml(source, limits = {}) {
+    const lim = { ...DEFAULT_XML_LIMITS, ...limits };
+    if (typeof source !== "string") {
+        throw new XmlSyntaxError("xml_not_a_string", "Expected the XML document as a string.");
+    }
+    // Defence: input size cap. Refuses a hostile or accidental upload before any
+    // allocation, rather than running out of memory building the tree.
+    if (source.length > lim.maxCharacters) {
+        throw new XmlSecurityError("xml_too_large", `The document is ${source.length} characters, over the ${lim.maxCharacters} ` +
+            `character limit. Raise it with the maxCharacters option if you really do ` +
+            `need to parse a document this size, or check that you are not passing a ` +
+            `whole archive where one invoice was expected.`);
+    }
+    // Defence against XXE and against billion-laughs style entity expansion: no
+    // DTD is processed at all, and a document that carries one is refused rather
+    // than parsed with the declarations ignored. Ignoring them would silently
+    // change the meaning of every entity reference in the body. The check runs on
+    // the raw text, so it also fires for a DOCTYPE hidden inside a CDATA section
+    // — a false positive we accept, because no invoice needs one.
+    const doctypeAt = source.indexOf("<!DOCTYPE");
+    if (doctypeAt >= 0) {
+        throw new XmlSecurityError("xml_doctype_forbidden", "This document contains a DOCTYPE declaration, which this parser refuses to " +
+            "process. A DTD can declare external entities (the XXE attack, which reads " +
+            "local files or makes network requests) and nested internal entities (the " +
+            "billion-laughs attack, which exhausts memory). No EN 16931 invoice needs a " +
+            "DOCTYPE. Remove the declaration and parse the document again.");
+    }
+    const entityAt = source.indexOf("<!ENTITY");
+    if (entityAt >= 0) {
+        throw new XmlSecurityError("xml_entity_declaration_forbidden", "This document declares an XML entity. Custom entities are never expanded by " +
+            "this parser, because entity expansion is how the billion-laughs denial of " +
+            "service works. Remove the declaration.");
+    }
+    let i = 0;
+    // A byte order mark is legal and invisible; drop it rather than treating it
+    // as text before the root element.
+    if (source.charCodeAt(0) === 0xfeff)
+        i = 1;
+    const stack = [];
+    let root;
+    let elementCount = 0;
+    // Line and column of an offset. Elements are met in document order, so the
+    // scan only ever moves forward and the whole document is walked once: O(n)
+    // in total, not O(n) per element. A line ends at LF, CRLF or a lone CR, as
+    // XML 1.0 section 2.11 and every editor have it: a file saved with classic
+    // Mac line endings is not one long line.
+    let scanned = i;
+    let lineNo = 1;
+    let lineStart = i;
+    const position = (at) => {
+        for (; scanned < at; scanned += 1) {
+            const ch = source.charCodeAt(scanned);
+            if (ch === 10 || (ch === 13 && source.charCodeAt(scanned + 1) !== 10)) {
+                lineNo += 1;
+                lineStart = scanned + 1;
+            }
+        }
+        return [lineNo, at - lineStart + 1];
+    };
+    const fail = (code, message) => {
+        throw new XmlSyntaxError(code, `${message} (at character ${i})`);
+    };
+    const readName = () => {
+        const start = i;
+        if (i >= source.length || !NAME_START.test(source[i])) {
+            fail("xml_bad_name", "Expected an element or attribute name");
+        }
+        i += 1;
+        let colons = 0;
+        while (i < source.length) {
+            const ch = source[i];
+            if (ch === ":") {
+                colons += 1;
+                if (colons > 1) {
+                    fail("xml_bad_name", "A qualified name may contain at most one colon");
+                }
+                i += 1;
+                if (i >= source.length || !NAME_START.test(source[i])) {
+                    fail("xml_bad_name", "Expected a local name after the namespace prefix");
+                }
+                i += 1;
+                continue;
+            }
+            if (!NAME_CHAR.test(ch))
+                break;
+            i += 1;
+        }
+        return source.slice(start, i);
+    };
+    const skipSpace = () => {
+        while (i < source.length && /[\s]/.test(source[i]))
+            i += 1;
+    };
+    const decode = (raw, where) => {
+        const decoded = raw.includes("&") ? decodeEntities(raw, where) : raw;
+        if (ILLEGAL_XML_CHARS.test(decoded)) {
+            throw new XmlSyntaxError("xml_illegal_character", `${where} contains a control character that XML 1.0 does not permit. ` +
+                `Such a character cannot be escaped: the document is not well-formed.`);
+        }
+        return decoded;
+    };
+    const current = () => stack[stack.length - 1];
+    while (i < source.length) {
+        const lt = source.indexOf("<", i);
+        if (lt < 0) {
+            // Trailing text after the last tag.
+            const rest = source.slice(i);
+            if (rest.trim() !== "") {
+                fail("xml_text_outside_root", "Text after the root element");
+            }
+            break;
+        }
+        if (lt > i) {
+            const raw = source.slice(i, lt);
+            const frame = current();
+            if (!frame) {
+                if (raw.trim() !== "") {
+                    fail("xml_text_outside_root", "Text outside the root element");
+                }
+            }
+            else {
+                frame.text.push(decode(raw, `The content of <${frame.el.qname}>`));
+            }
+            i = lt;
+        }
+        // --- comment ------------------------------------------------------------
+        if (source.startsWith("<!--", i)) {
+            const end = source.indexOf("-->", i + 4);
+            if (end < 0)
+                fail("xml_unterminated_comment", "Unterminated comment");
+            // XML 1.0 forbids the literal string "--" anywhere inside a comment.
+            // "-->" is the only terminator there is, so a comment carrying "--" has
+            // no single reading: a writer who meant it as text and a reader who takes
+            // it as the start of the terminator disagree about where the comment ends
+            // — and therefore about how much of the document is markup. Refusing is
+            // the only answer that cannot silently drop or resurrect content.
+            const body = source.slice(i + 4, end);
+            const dashes = body.indexOf("--");
+            if (dashes >= 0) {
+                fail("xml_bad_comment", `A comment contains "--" ${dashes + 4} characters in, which XML 1.0 does ` +
+                    `not permit anywhere inside a comment`);
+            }
+            // The same rule seen from the other end: a comment may not finish with a
+            // hyphen, because that writes the close as "--->". Single hyphens
+            // separated by other characters are legal and stay legal — "<!-- a- -b -->"
+            // parses.
+            if (body.endsWith("-")) {
+                fail("xml_bad_comment", `A comment ends "--->" ${body.length + 4} characters in; a comment may not ` +
+                    `end with a hyphen`);
+            }
+            // The Char production covers comments too: a control character here is
+            // as ill-formed as one in text, and a reader that skips it would accept a
+            // file that every schema validator refuses.
+            if (ILLEGAL_XML_CHARS.test(body)) {
+                fail("xml_illegal_character", "A comment contains a control character that XML 1.0 does not permit");
+            }
+            i = end + 3;
+            continue;
+        }
+        // --- CDATA --------------------------------------------------------------
+        if (source.startsWith("<![CDATA[", i)) {
+            const end = source.indexOf("]]>", i + 9);
+            if (end < 0)
+                fail("xml_unterminated_cdata", "Unterminated CDATA section");
+            const frame = current();
+            const raw = source.slice(i + 9, end);
+            if (!frame) {
+                fail("xml_text_outside_root", "CDATA outside the root element");
+            }
+            else {
+                // No entity decoding inside CDATA — that is what CDATA means.
+                if (ILLEGAL_XML_CHARS.test(raw)) {
+                    throw new XmlSyntaxError("xml_illegal_character", "A CDATA section contains a control character that XML 1.0 does not permit.");
+                }
+                frame.text.push(raw);
+            }
+            i = end + 3;
+            continue;
+        }
+        // --- processing instruction (including the XML declaration) -------------
+        if (source.startsWith("<?", i)) {
+            const end = source.indexOf("?>", i + 2);
+            if (end < 0) {
+                fail("xml_unterminated_pi", "Unterminated processing instruction");
+            }
+            // Processing instructions are skipped, never acted on. A stylesheet PI in
+            // particular must not cause this library to fetch anything. Skipped is
+            // not unchecked: the same characters are forbidden here as in text.
+            if (ILLEGAL_XML_CHARS.test(source.slice(i + 2, end))) {
+                fail("xml_illegal_character", "A processing instruction contains a control character that XML 1.0 does not permit");
+            }
+            i = end + 2;
+            continue;
+        }
+        // --- other declarations -------------------------------------------------
+        if (source.startsWith("<!", i)) {
+            fail("xml_unsupported_declaration", "Unsupported markup declaration; only comments and CDATA sections are accepted");
+        }
+        // --- end tag ------------------------------------------------------------
+        if (source.startsWith("</", i)) {
+            i += 2;
+            const qname = readName();
+            skipSpace();
+            if (source[i] !== ">")
+                fail("xml_bad_end_tag", "Expected '>' to close an end tag");
+            i += 1;
+            const frame = stack.pop();
+            if (!frame)
+                fail("xml_unbalanced", `Stray end tag </${qname}>`);
+            if (frame.el.qname !== qname) {
+                fail("xml_unbalanced", `End tag </${qname}> does not match the open element <${frame.el.qname}>`);
+            }
+            closeFrame(frame);
+            continue;
+        }
+        // --- start tag ----------------------------------------------------------
+        const [line, column] = position(i);
+        i += 1;
+        const qname = readName();
+        elementCount += 1;
+        // Defence: element-count cap. A flat document of millions of empty
+        // elements passes the depth check and can still exhaust memory.
+        if (elementCount > lim.maxElements) {
+            throw new XmlSecurityError("xml_too_many_elements", `The document has more than ${lim.maxElements} elements. Raise the ` +
+                `maxElements option if a document this large is genuinely expected.`);
+        }
+        const parent = current();
+        const rawAttrs = [];
+        let selfClosing = false;
+        for (;;) {
+            skipSpace();
+            if (i >= source.length)
+                fail("xml_unterminated_tag", "Unterminated start tag");
+            if (source[i] === ">") {
+                i += 1;
+                break;
+            }
+            if (source.startsWith("/>", i)) {
+                selfClosing = true;
+                i += 2;
+                break;
+            }
+            const aname = readName();
+            skipSpace();
+            if (source[i] !== "=") {
+                fail("xml_bad_attribute", `Attribute ${aname} has no value`);
+            }
+            i += 1;
+            skipSpace();
+            const quote = source[i];
+            if (quote !== '"' && quote !== "'") {
+                fail("xml_bad_attribute", `The value of ${aname} is not quoted`);
+            }
+            const end = source.indexOf(quote, i + 1);
+            if (end < 0)
+                fail("xml_bad_attribute", `Unterminated value for ${aname}`);
+            const raw = source.slice(i + 1, end);
+            if (raw.includes("<")) {
+                fail("xml_bad_attribute", `The value of ${aname} contains an unescaped '<'`);
+            }
+            rawAttrs.push({ qname: aname, value: decode(raw, `The value of ${aname}`) });
+            // Defence: per-element attribute cap. Namespace declarations are
+            // attributes, and an element carrying tens of thousands of them builds a
+            // namespace map that every descendant lookup has to walk.
+            if (rawAttrs.length > lim.maxAttributes) {
+                throw new XmlSecurityError("xml_too_many_attributes", `<${qname}> carries more than ${lim.maxAttributes} attributes. Raise the ` +
+                    `maxAttributes option only if a document this unusual is genuinely ` +
+                    `expected; an EN 16931 element carries a handful.`);
+            }
+            i = end + 1;
+        }
+        // Namespace declarations first: an element's own prefix may be declared on
+        // the element itself.
+        let nsMap = parent ? parent.nsMap : emptyNsMap();
+        let declared = false;
+        for (const a of rawAttrs) {
+            const isDefault = a.qname === "xmlns";
+            const isPrefixed = a.qname.startsWith("xmlns:");
+            if (!isDefault && !isPrefixed)
+                continue;
+            if (!declared) {
+                // Chain, do not copy: copying the inherited map on every element that
+                // declares a prefix is quadratic in the number of declarations in
+                // scope. `Object.create` is O(1) and lookups still find inherited
+                // prefixes, because the whole chain is ours and bottoms out at a
+                // null-prototype map.
+                nsMap = Object.create(nsMap);
+                declared = true;
+            }
+            const prefix = isDefault ? "" : a.qname.slice(6);
+            if (isPrefixed && a.value === "") {
+                fail("xml_bad_namespace", `Cannot undeclare the prefix ${prefix}`);
+            }
+            nsMap[prefix] = a.value;
+        }
+        const resolve = (name, forAttribute) => {
+            const colon = name.indexOf(":");
+            if (colon < 0) {
+                // An unprefixed attribute is in no namespace; an unprefixed element is
+                // in the default namespace.
+                return [forAttribute ? "" : (nsMap[""] ?? ""), name];
+            }
+            const prefix = name.slice(0, colon);
+            const local = name.slice(colon + 1);
+            if (prefix === "xmlns")
+                return [XMLNS_URI, local];
+            const uri = nsMap[prefix];
+            if (uri === undefined) {
+                fail("xml_unbound_prefix", `The namespace prefix "${prefix}" is used but never declared`);
+            }
+            return [uri, local];
+        };
+        const [ns, local] = resolve(qname, false);
+        const attributes = rawAttrs.map((a) => {
+            const [ans, alocal] = resolve(a.qname, true);
+            return { namespace: ans, local: alocal, qname: a.qname, value: a.value };
+        });
+        // XML 1.0 well-formedness: no element may carry the same attribute twice.
+        // "The same" is the expanded name — namespace URI plus local name — not the
+        // text as written, so `a:x` and `b:x` are one attribute written twice when
+        // both prefixes are bound to one URI, while the same local name under two
+        // genuinely different namespaces is legal and stays accepted. That is why
+        // this runs here rather than over `rawAttrs`: only after `resolve` is the
+        // namespace context of this element known.
+        //
+        // Accepting a duplicate is not a cosmetic fault. `attr()` returns the first
+        // match, so a document stating two different @currencyID or @schemeID values
+        // on one element would be read by position, and whichever value lost is
+        // gone from the invoice with nothing raised.
+        const seen = new Map();
+        for (const a of attributes) {
+            // NUL separates the two halves unambiguously: it is refused as an illegal
+            // character everywhere else, so it cannot be smuggled into a namespace URI
+            // to forge or hide a collision.
+            const key = `${a.namespace}\u0000${a.local}`;
+            const first = seen.get(key);
+            if (first !== undefined) {
+                fail("xml_duplicate_attribute", first === a.qname
+                    ? `<${qname}> carries the attribute ${a.qname} twice`
+                    : `<${qname}> carries both ${first} and ${a.qname}, which are the same ` +
+                        `attribute once their prefixes are resolved`);
+            }
+            seen.set(key, a.qname);
+        }
+        // The `[n]` index counts preceding siblings of the same name. Counting them
+        // by rescanning `parent.el.children` is O(siblings) per element and so
+        // quadratic over the document: a flat 200,000-element file took over two
+        // minutes, entirely inside this one line, and no cap bounded it because
+        // maxElements is only checked once the element is already being built.
+        // A per-frame tally is O(1) and produces byte-identical paths.
+        let sameName = 0;
+        if (parent) {
+            sameName = parent.counts.get(qname) ?? 0;
+            parent.counts.set(qname, sameName + 1);
+        }
+        const step = sameName > 0 ? `${qname}[${sameName + 1}]` : qname;
+        const path = parent ? `${parent.el.path}/${step}` : `/${qname}`;
+        const el = {
+            namespace: ns,
+            local,
+            qname,
+            path,
+            line,
+            column,
+            attributes,
+            children: [],
+            text: "",
+        };
+        if (parent) {
+            parent.el.children.push(el);
+        }
+        else if (root) {
+            fail("xml_multiple_roots", "A document may have only one root element");
+        }
+        else {
+            root = el;
+        }
+        if (selfClosing) {
+            continue;
+        }
+        const frame = { el, nsMap, counts: new Map(), text: [] };
+        stack.push(frame);
+        // Defence: nesting depth cap. Without it, a few kilobytes of open tags
+        // build a tree hundreds of thousands of levels deep and any recursive
+        // consumer of it overflows the stack.
+        if (stack.length > lim.maxDepth) {
+            throw new XmlSecurityError("xml_too_deep", `The document nests more than ${lim.maxDepth} elements deep. A UBL invoice ` +
+                `nests about eight levels; a document this deep is either broken or ` +
+                `hostile. Raise the maxDepth option only if you know why it is that deep.`);
+        }
+    }
+    if (stack.length > 0) {
+        throw new XmlSyntaxError("xml_unbalanced", `The document ends while <${stack[stack.length - 1].el.qname}> is still open.`);
+    }
+    if (!root) {
+        throw new XmlSyntaxError("xml_no_root", "The document contains no root element.");
+    }
+    return root;
+}
+function closeFrame(frame) {
+    const text = frame.text.join("");
+    if (frame.el.children.length > 0) {
+        if (text.trim() !== "") {
+            throw new XmlSyntaxError("xml_mixed_content", `<${frame.el.qname}> holds both child elements and text ("${text.trim().slice(0, 40)}"). ` +
+                `UBL never mixes the two, so this parser refuses the document rather than ` +
+                `guessing which of the two carries the value.`);
+        }
+        frame.el.text = "";
+        return;
+    }
+    frame.el.text = text;
+}
+/**
+ * The five predefined entities, and nothing else.
+ *
+ * Null-prototype on purpose. As an object literal this table also answered to
+ * every member of `Object.prototype`: `&constructor;` resolved to the `Object`
+ * constructor and was substituted into the document as the string
+ * `"function Object() { [native code] }"`, so an invoice number written
+ * `&constructor;` parsed, validated and was billed for without a single
+ * finding. `&toString;`, `&valueOf;` and `&__proto__;` did the same. Every one
+ * of those names is short enough to pass the length guard in `decodeEntities`.
+ */
+const PREDEFINED = Object.assign(Object.create(null), {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+});
+/**
+ * Decode the five predefined entities and numeric character references.
+ *
+ * Every other entity reference is refused. Custom entities are what the
+ * billion-laughs attack expands, and external entities are what XXE
+ * dereferences; neither is decoded here, and neither is quietly dropped —
+ * dropping one would change the text of a tax document without saying so.
+ *
+ * Numeric character references are safe to expand: each produces exactly one
+ * character and cannot refer to another reference, so there is no expansion to
+ * run away.
+ */
+function decodeEntities(raw, where) {
+    let out = "";
+    let i = 0;
+    for (;;) {
+        const amp = raw.indexOf("&", i);
+        if (amp < 0) {
+            out += raw.slice(i);
+            return out;
+        }
+        out += raw.slice(i, amp);
+        const semi = raw.indexOf(";", amp + 1);
+        // A reference longer than this is not one of ours and not a code point.
+        if (semi < 0 || semi - amp > 12) {
+            throw new XmlSyntaxError("xml_bare_ampersand", `${where} contains a bare "&". In XML it must be written "&amp;".`);
+        }
+        const name = raw.slice(amp + 1, semi);
+        out += resolveEntity(name, where);
+        i = semi + 1;
+    }
+}
+function resolveEntity(name, where) {
+    // Own-property check as well as the null prototype: two independent guards,
+    // because getting this wrong substitutes attacker-chosen text into a tax
+    // document without raising anything.
+    if (Object.hasOwn(PREDEFINED, name))
+        return PREDEFINED[name];
+    if (name.startsWith("#")) {
+        const hex = name[1] === "x" || name[1] === "X";
+        const digits = hex ? name.slice(2) : name.slice(1);
+        if (digits === "" || !/^[0-9a-fA-F]+$/.test(digits) || (!hex && !/^[0-9]+$/.test(digits))) {
+            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the malformed character reference "&${name};".`);
+        }
+        const code = Number.parseInt(digits, hex ? 16 : 10);
+        if (!Number.isFinite(code) ||
+            code > 0x10ffff ||
+            (code >= 0xd800 && code <= 0xdfff)) {
+            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the character reference "&${name};", which is not a ` +
+                `valid Unicode code point.`);
+        }
+        return String.fromCodePoint(code);
+    }
+    throw new XmlSecurityError("xml_entity_forbidden", `${where} refers to the entity "&${name};". Only the five predefined entities ` +
+        `(&amp; &lt; &gt; &quot; &apos;) and numeric character references are decoded. ` +
+        `Custom entities are refused because expanding them is how the billion-laughs ` +
+        `denial of service works, and because an external entity would read a local ` +
+        `file or make a network request (the XXE attack).`);
+}
+/** First child element with this namespace and local name. */
+function firstChild(el, namespace, local) {
+    return el.children.find((c) => c.local === local && c.namespace === namespace);
+}
+/** Every child element with this namespace and local name, in document order. */
+function childrenNamed(el, namespace, local) {
+    return el.children.filter((c) => c.local === local && c.namespace === namespace);
+}
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xmp.js
+/**
+ * Reading a PDF's XMP metadata packet, for the few properties a Factur-X /
+ * ZUGFeRD file declares there: its PDF/A identification, and the four
+ * properties the format adds (DocumentType, DocumentFileName, Version,
+ * ConformanceLevel).
+ *
+ * XMP is RDF written as XML (ISO 16684-1), and a simple property can be
+ * written two ways, both of which producers use: as an element inside an
+ * `rdf:Description` (`<pdfaid:part>3</pdfaid:part>`, as the factur-x Python
+ * library that made FeRD's MINIMUM sample, and this project's own PDF writer,
+ * do) or as an attribute of it (`pdfaid:part="3"`, as FeRD's own BASIC and
+ * EN 16931 sample files do). The packet may sit in an `x:xmpmeta` wrapper or be a bare
+ * `rdf:RDF` (FeRD's samples again). Both forms and both shapes are read, and
+ * properties are matched by namespace URI, never by prefix, which is only a
+ * spelling.
+ *
+ * THIS IS NOT A PDF/A CHECK. It reads the claim a file makes; whether the file
+ * keeps it (embedded fonts, colour profiles, the `pdfaExtension` description
+ * PDF/A requires for the Factur-X namespace, the rest of ISO 19005-3) is a
+ * question for a PDF/A validator such as veraPDF, and nothing here answers it.
+ *
+ * The packet goes through `parseXml`, this package's one hardened XML reader,
+ * with limits sized for metadata: a real packet is a few kilobytes, and one
+ * that carries a thumbnail a few hundred. The `<?xpacket?>` processing
+ * instructions around it are skipped, as every processing instruction is.
+ */
+
+const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const PDFAID = "http://www.aiim.org/pdfa/ns/id/";
+/**
+ * The namespaces the formats have defined for their XMP properties.
+ *
+ * `factur-x` is Factur-X's, which ZUGFeRD adopted from 2.1 on; `zugferd-2.0`
+ * and `zugferd-1.0` are those two releases' own. The same URIs are what
+ * Mustang, the open-source ZUGFeRD library, writes for each
+ * (`ZUGFeRDExporterFromA3.getNamespaceForVersion`).
+ */
+const FACTURX_XMP_NAMESPACES = {
+    "factur-x": "urn:factur-x:pdfa:CrossIndustryDocument:invoice:1p0#",
+    "zugferd-2.0": "urn:zugferd:pdfa:CrossIndustryDocument:invoice:2p0#",
+    "zugferd-1.0": "urn:ferd:pdfa:CrossIndustryDocument:invoice:1p0#",
+};
+/** The four properties, by local name, in the order the format lists them. */
+const FACTURX_XMP_PROPERTIES = ["DocumentType", "DocumentFileName", "Version", "ConformanceLevel"];
+/** Caps for a metadata packet: far above any real one, far below the defaults for an invoice. */
+const XMP_LIMITS = {
+    maxCharacters: 4_000_000,
+    maxElements: 20_000,
+    maxDepth: 64,
+};
+/** An element's text, its descendants' included, as an XPath string value reads it. */
+function textOf(el) {
+    return el.children.length === 0 ? el.text : el.children.map(textOf).join("");
+}
+/** The `rdf:RDF` element: the root itself, or the first one below it. */
+function findRdf(el) {
+    if (el.namespace === RDF && el.local === "RDF")
+        return el;
+    for (const child of el.children) {
+        const found = findRdf(child);
+        if (found)
+            return found;
+    }
+    return undefined;
+}
+/**
+ * Read the properties a Factur-X / ZUGFeRD file declares in its XMP metadata.
+ *
+ * @throws {ParseError} when the packet is not well-formed XML (an
+ *   `XmlSyntaxError` or `XmlSecurityError` from `parseXml`), or is XML with no
+ *   `rdf:RDF` element, code `xmp_no_rdf`. Nothing else: a property that is
+ *   missing is absent from the result, never an error.
+ */
+function readXmp(text) {
+    const root = xml_parse_parseXml(text, XMP_LIMITS);
+    const rdf = findRdf(root);
+    if (!rdf) {
+        throw new ParseError("xmp_no_rdf", `The metadata is XML, but not XMP: it has no rdf:RDF element (its root element is <${root.qname}>).`);
+    }
+    // namespace → local name → value. The first statement of a property wins,
+    // as it does for an attribute stated twice.
+    const properties = new Map();
+    const state = (namespace, local, value) => {
+        let inNamespace = properties.get(namespace);
+        if (!inNamespace)
+            properties.set(namespace, (inNamespace = new Map()));
+        const trimmed = value.trim();
+        if (trimmed !== "" && !inNamespace.has(local))
+            inNamespace.set(local, trimmed);
+    };
+    for (const description of rdf.children) {
+        if (description.namespace !== RDF || description.local !== "Description")
+            continue;
+        for (const a of description.attributes) {
+            // rdf:about and the namespace declarations are not properties; an
+            // unprefixed attribute is in no namespace and so cannot be one either.
+            if (a.namespace === "" || a.namespace === RDF || a.qname === "xmlns" || a.qname.startsWith("xmlns:"))
+                continue;
+            state(a.namespace, a.local, a.value);
+        }
+        for (const property of description.children)
+            state(property.namespace, property.local, textOf(property));
+    }
+    const result = {};
+    const pdfaid = properties.get(PDFAID);
+    const part = pdfaid?.get("part");
+    const conformance = pdfaid?.get("conformance");
+    if (part !== undefined)
+        result.pdfaPart = part;
+    if (conformance !== undefined)
+        result.pdfaConformance = conformance;
+    const hasAny = (values) => FACTURX_XMP_PROPERTIES.some((name) => values.has(name));
+    let found;
+    for (const [schema, namespace] of Object.entries(FACTURX_XMP_NAMESPACES)) {
+        const values = properties.get(namespace);
+        if (values && hasAny(values)) {
+            found = { namespace, schema, values };
+            break;
+        }
+    }
+    // Mustang's validator finds these properties by local name alone, in any
+    // namespace. A file that relies on that is read here too, so its values are
+    // still checked, and reported as sitting in a namespace no format defines.
+    // Only the two names no other schema uses qualify a namespace: "Version" or
+    // "DocumentType" alone is as likely to be some producer's own metadata.
+    if (!found) {
+        for (const [namespace, values] of properties) {
+            if (namespace !== PDFAID && (values.has("ConformanceLevel") || values.has("DocumentFileName"))) {
+                found = { namespace, values };
+                break;
+            }
+        }
+    }
+    if (found) {
+        result.namespace = found.namespace;
+        if (found.schema)
+            result.schema = found.schema;
+        const { values } = found;
+        const value = (name) => values.get(name);
+        const documentType = value("DocumentType");
+        const documentFileName = value("DocumentFileName");
+        const version = value("Version");
+        const conformanceLevel = value("ConformanceLevel");
+        if (documentType !== undefined)
+            result.documentType = documentType;
+        if (documentFileName !== undefined)
+            result.documentFileName = documentFileName;
+        if (version !== undefined)
+            result.version = version;
+        if (conformanceLevel !== undefined)
+            result.conformanceLevel = conformanceLevel;
+    }
+    return result;
+}
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/facturx-findings.js
+/**
+ * The Factur-X / ZUGFeRD container's own findings: what the PDF around the
+ * invoice XML says about that XML, checked against what the formats ask.
+ *
+ * `extractFacturX` has noticed some of this since 0.7.0 — a house name for
+ * the attachment, a missing `/AFRelationship`, a media type that is not XML —
+ * and said so in `warnings`, a list of sentences only the browser checker
+ * showed. `validate()` dropped them, so the API, the command line and the
+ * GitHub Action judged the XML and said nothing about the file it came in.
+ * Every observation now has a stable `id`, a severity, a message that says why
+ * it matters and a fix, and `validate()` reports it under one of six `AW-PDF-*`
+ * ids, one per part of the file a producer fixes:
+ *
+ *   AW-PDF-ATTACHMENT    the XML attachment itself: its name, whether it is the
+ *                        only one, its encoding declaration, whether it is CII
+ *   AW-PDF-AF            where it is registered: the catalog's /AF array and
+ *                        the EmbeddedFiles name tree
+ *   AW-PDF-RELATIONSHIP  its /AFRelationship
+ *   AW-PDF-MIME          its media type, the embedded file's /Subtype
+ *   AW-PDF-XMP           the XMP metadata: there, readable, claiming PDF/A-3,
+ *                        carrying the four Factur-X properties, naming the
+ *                        attachment that is there
+ *   AW-PDF-XMP-PROFILE   the profile the metadata declares: a level the format
+ *                        defines, and the one the XML's BT-24 declares
+ *
+ * Most are decided by the PDF alone and come from `extractFacturX`. Two need
+ * the XML's BT-24, which only a parse of the XML knows, and come from
+ * `facturXProfileFindings`, which `validate()` calls with the BT-24 it read:
+ * the metadata's level against BT-24's, and an /AFRelationship of Data or
+ * Source on a profile Germany asks Alternative for.
+ *
+ * NONE IS FATAL. `fatal` means the document is rejected, and none of these can
+ * say that with certainty: every one describes a file this reader could read,
+ * and whether another reader can depends on how it looks for the invoice. Each
+ * severity is justified where it is set.
+ *
+ * NO LOCATION. A finding's `location` is a line and column in the file (or in
+ * the attachment `location.attachment` names), and a PDF dictionary key has
+ * neither. The hosted API documents, and its tests hold, that an `AW-` finding
+ * carries no `location`, `xpath` or `docsUrl`; the GitHub Action reads
+ * `location.line` wherever a `location` exists. So each message names the
+ * place instead: the attachment by its name, the PDF key and the XMP property
+ * by their own.
+ *
+ * NOT A PDF/A VERDICT. These read the claims a file makes about itself and
+ * check them against the XML beside them. Whether the file is the PDF/A-3 it
+ * claims to be (fonts, colour, the rest of ISO 19005-3) is veraPDF's question.
+ */
+
+/** The `validate()` finding ids for the container. Ordered as `validate()` lists them. */
+const FACTURX_RULES = [
+    "AW-PDF-ATTACHMENT",
+    "AW-PDF-AF",
+    "AW-PDF-RELATIONSHIP",
+    "AW-PDF-MIME",
+    "AW-PDF-XMP",
+    "AW-PDF-XMP-PROFILE",
+];
+/** Every observation id, grouped by the rule it is reported under. */
+const FACTURX_OBSERVATIONS = (/* unused pure expression or super */ null && ([
+    "attachment_name",
+    "attachment_ambiguous",
+    "attachment_extra",
+    "attachment_encoding",
+    "attachment_not_cii",
+    "af_streams_differ",
+    "af_missing",
+    "af_name_tree_missing",
+    "relationship_missing",
+    "relationship_unexpected",
+    "relationship_not_alternative",
+    "mime_not_xml",
+    "mime_missing",
+    "xmp_missing",
+    "xmp_unreadable",
+    "xmp_pdfa_missing",
+    "xmp_pdfa_part",
+    "xmp_pdfa_conformance",
+    "xmp_facturx_missing",
+    "xmp_facturx_incomplete",
+    "xmp_facturx_namespace",
+    "xmp_document_type",
+    "xmp_file_name",
+    "xmp_level_unknown",
+    "xmp_level_mismatch",
+]));
+const finding = (rule, id, severity, message, fix, field = "document") => ({ rule, id, field, severity, message, fix });
+/** Container findings in `FACTURX_RULES` order, each rule's in the order they were raised. */
+function sortFacturXFindings(findings) {
+    const rank = (f) => {
+        const at = FACTURX_RULES.indexOf(f.rule);
+        return at === -1 ? FACTURX_RULES.length : at;
+    };
+    return findings
+        .map((f, i) => ({ f, i }))
+        .sort((a, b) => rank(a.f) - rank(b.f) || a.i - b.i)
+        .map(({ f }) => f);
+}
+const quoted = (names) => names.map((n) => `"${n}"`).join(", ");
+const NAME_FIX = "Attach the invoice XML as factur-x.xml (xrechnung.xml for the XRECHNUNG profile), and give the " +
+    "XMP property DocumentFileName the same name.";
+const RELATIONSHIP_FIX = "Set /AFRelationship /Alternative on the XML's file specification, which Germany requires for the " +
+    "BASIC, EN 16931, EXTENDED and XRECHNUNG profiles, or /Data for MINIMUM and BASIC WL.";
+const MIME_FIX = "Set /Subtype /text#2Fxml (text/xml) on the embedded file stream.";
+// ---------------------------------------------------------------------------
+// AW-PDF-ATTACHMENT: the XML attachment itself
+// ---------------------------------------------------------------------------
+/**
+ * The XML is attached under a name the formats do not define.
+ *
+ * A warning, not fatal: this reader, like others, takes the only XML attachment
+ * whatever it is called, so some receivers do find the invoice. A receiver that
+ * looks it up by name does not, and Mustang's validator reports the
+ * DocumentFileName that goes with it as an error.
+ */
+function attachmentName(name) {
+    return finding("AW-PDF-ATTACHMENT", "attachment_name", "warning", `The invoice XML is attached as "${name}", which is not a name the formats define: factur-x.xml, ` +
+        `zugferd-invoice.xml (older ZUGFeRD files) or xrechnung.xml (the XRECHNUNG profile). It was read ` +
+        `here anyway, but a receiver that looks the invoice up by name, as Factur-X readers do, finds none ` +
+        `in this file.`, NAME_FIX);
+}
+/**
+ * Several XML attachments, and nothing says which is the invoice: none has a
+ * standard name, or more than one has.
+ *
+ * A warning: two receivers can read two different documents from this file, and
+ * the verdict here is about the one this reader chose. Not fatal, because each
+ * receiver still finds an invoice.
+ */
+function attachmentAmbiguous(names, chosen, standard) {
+    return finding("AW-PDF-ATTACHMENT", "attachment_ambiguous", "warning", `This PDF carries ${names.length} XML attachments (${quoted(names)}), and nothing in it says which ` +
+        `one is the invoice: ${standard === 0 ? "none has a standard name" : `${standard} have a standard name`}. ` +
+        `"${chosen}" was read here. A receiver that picks another one validates and books a different ` +
+        `document from the one checked here.`, "Keep exactly one XML attachment under a standard name: factur-x.xml, or xrechnung.xml for the " +
+        "XRECHNUNG profile. Give supporting XML files other names.");
+}
+/**
+ * Several XML attachments, exactly one under a standard name, and that one was
+ * read.
+ *
+ * Information: Factur-X allows other attachments, and the one under the
+ * standard name is the one a receiver reads, so this is a fact about the file,
+ * not a defect. It is reported because nothing here checked the others.
+ */
+function attachmentExtra(names, chosen) {
+    return finding("AW-PDF-ATTACHMENT", "attachment_extra", "information", `This PDF carries ${names.length} XML attachments (${quoted(names)}). The invoice was read from ` +
+        `"${chosen}", the only one under a standard name and the one a receiver reads; the others were ` +
+        `not read, and nothing here checked them.`, "Nothing to change if the other XML files are supporting documents. An /AFRelationship of " +
+        "/Supplement on each says so to every reader.");
+}
+/**
+ * The attachment declares an encoding other than UTF-8 and holds only ASCII.
+ *
+ * A warning: today every receiver reads the same invoice, because ASCII reads
+ * the same in both encodings, but the declaration contradicts the format, and
+ * the producer behind it ships a different invoice to different receivers the
+ * first time a name carries an umlaut.
+ */
+function attachmentEncoding(name, label) {
+    return finding("AW-PDF-ATTACHMENT", "attachment_encoding", "warning", `The attachment "${name}" declares encoding "${label}", but Factur-X and ZUGFeRD attachments are ` +
+        `UTF-8. This one holds only ASCII, which reads the same either way, so every receiver sees the same ` +
+        `invoice today. The first "ß" or "é" its producer writes will read differently in a receiver that ` +
+        `follows the declaration and in one that reads UTF-8, as the format says to.`, `Have the producer write the XML in UTF-8 and declare it as encoding="UTF-8".`);
+}
+/**
+ * The attachment is not a CII CrossIndustryInvoice.
+ *
+ * A warning, not fatal: the verdict below is about whatever the XML is (a UBL
+ * invoice is judged as one; a ZUGFeRD 1.0 document is refused as unreadable
+ * on its own), and some exchanges do carry other XML in a PDF. A receiver that
+ * expects Factur-X cannot process it.
+ */
+function attachmentNotCii(name) {
+    return finding("AW-PDF-ATTACHMENT", "attachment_not_cii", "warning", `The attachment "${name}" is not a UN/CEFACT CII CrossIndustryInvoice, which is what Factur-X and ` +
+        `ZUGFeRD 2 carry: it may be a ZUGFeRD 1.0 CrossIndustryDocument, which this validator does not read, ` +
+        `a UBL invoice, or not an invoice at all. A receiver that reads the file as Factur-X finds no ` +
+        `invoice it can process.`, "Attach the invoice as UN/CEFACT CII, with the root element rsm:CrossIndustryInvoice, which is the " +
+        "syntax Factur-X and ZUGFeRD receivers read.");
+}
+// ---------------------------------------------------------------------------
+// AW-PDF-AF: where the attachment is registered
+// ---------------------------------------------------------------------------
+/**
+ * The name tree and /AF name the same attachment and point at different files.
+ *
+ * A warning: two readers can see two different invoices in one PDF. Not fatal,
+ * because each of them does find one.
+ */
+function afStreamsDiffer(name) {
+    return finding("AW-PDF-AF", "af_streams_differ", "warning", `The EmbeddedFiles name tree and the /AF array both list "${name}" but point at different embedded ` +
+        `files, so this PDF holds two versions of the invoice XML. The name tree's copy was read here; a ` +
+        `reader that follows /AF reads the other one, and may see a different invoice.`, "Reference one embedded file from both places: the name tree entry and the /AF entry should be the " +
+        "same file specification.");
+}
+/**
+ * The attachment is in the name tree and not in /AF.
+ *
+ * A warning: /AF is how PDF/A-3 associates an embedded file with the document,
+ * and Factur-X requires the XML in both places. Most readers also search the
+ * name tree, so the invoice is usually still found; one that follows /AF alone
+ * finds nothing.
+ */
+function afMissing(name) {
+    return finding("AW-PDF-AF", "af_missing", "warning", `The attachment "${name}" is registered in the EmbeddedFiles name tree but not in the catalog's /AF ` +
+        `array. PDF/A-3 associates an embedded file with the document through /AF, and Factur-X requires the ` +
+        `invoice XML to be listed there as well as in the name tree: a reader that looks only at /AF finds ` +
+        `no invoice in this file.`, "Add the attachment's file specification to the catalog's /AF array.");
+}
+/**
+ * The attachment is in /AF and not in the name tree.
+ *
+ * A warning for the mirror reason: viewers and many readers list attachments
+ * from the name tree, and Factur-X requires the XML there too.
+ */
+function afNameTreeMissing(name) {
+    return finding("AW-PDF-AF", "af_name_tree_missing", "warning", `The attachment "${name}" is listed in the catalog's /AF array but not in the EmbeddedFiles name ` +
+        `tree. PDF viewers show attachments from that name tree, and Factur-X requires the invoice XML to be ` +
+        `registered there as well as in /AF: a reader that looks only at the name tree finds no invoice in ` +
+        `this file.`, `Register the file specification in the catalog's /Names /EmbeddedFiles name tree, under "${name}".`);
+}
+// ---------------------------------------------------------------------------
+// AW-PDF-RELATIONSHIP: /AFRelationship
+// ---------------------------------------------------------------------------
+/**
+ * No /AFRelationship on the XML's file specification.
+ *
+ * A warning: ISO 19005-3 makes the key required on an associated file, so the
+ * file is not valid PDF/A-3, which Factur-X is defined on. Not fatal: a reader
+ * that only wants the XML still finds it.
+ */
+function relationshipMissing(name) {
+    return finding("AW-PDF-RELATIONSHIP", "relationship_missing", "warning", `The file specification of "${name}" has no /AFRelationship. PDF/A-3 requires the key on every ` +
+        `associated file, and Factur-X requires Data, Source or Alternative on the invoice XML, so the file ` +
+        `is not valid PDF/A-3 and a reader cannot tell how the XML relates to the page.`, RELATIONSHIP_FIX);
+}
+/**
+ * An /AFRelationship other than Data, Source or Alternative.
+ *
+ * A warning: Supplement, Unspecified and the rest say the XML is not the
+ * invoice, which a receiver may take at its word. Not fatal: the XML is still
+ * there to read.
+ */
+function relationshipUnexpected(name, relationship) {
+    return finding("AW-PDF-RELATIONSHIP", "relationship_unexpected", "warning", `The file specification of "${name}" declares /AFRelationship /${relationship}. For the invoice XML, ` +
+        `Factur-X allows Data, Source or Alternative: the XML is the data behind the page, its source, or ` +
+        `the same invoice in another form. /${relationship} says it is none of these, so a receiver may not ` +
+        `treat the attachment as the invoice.`, RELATIONSHIP_FIX);
+}
+/** The profiles for which Germany asks Alternative: the ones that are invoices. */
+const ALTERNATIVE_IN_GERMANY = new Set(["BASIC", "EN 16931", "EXTENDED", "XRECHNUNG"]);
+/**
+ * /AFRelationship Data or Source on an invoice whose BT-24 declares BASIC,
+ * EN 16931, EXTENDED or XRECHNUNG.
+ *
+ * Factur-X allows Data, Source and Alternative for these profiles, and so do
+ * French receivers. For use in Germany the specification requires Alternative
+ * with them, which says the page and the XML are the same invoice in two
+ * forms. The sources, as far as they can be read from here (the specification
+ * itself ships inside FeRD's download package):
+ *
+ *   - Mustang, the open-source ZUGFeRD library, writes Alternative for every
+ *     profile except MINIMUM and BASIC WL, which get Data, citing "ZUGFeRD
+ *     2.1.1 Technical Supplement | Part A | 2.2.2. Data Relationship"
+ *     (ZUGFeRDExporterFromA3.java in github.com/ZUGFeRD/mustangproject,
+ *     master, read 2026-09-25).
+ *   - Section 6.2.2 of the Factur-X specification, as quoted in the Prince
+ *     forum's AFRelationship thread (princexml.com/forum/topic/5033,
+ *     2024-08-28): for use in Germany "it is imperative to use the value
+ *     Alternative".
+ *   - PDFlib's ZUGFeRD and Factur-X knowledge-base page reads ZUGFeRD 2.1 the
+ *     same way, and allows Source for BASIC, EN 16931 and EXTENDED when the
+ *     recipient is outside Germany and the PDF was generated from the XML.
+ *
+ * INFORMATION, NOT A WARNING. The requirement is Germany's, not the format's,
+ * and nothing in the file says where it is going. Files that ignore it are
+ * common and are received: FeRD's own sample files use Data (PDFlib noted it
+ * of the 2.1 samples; the BASIC and EN 16931 samples in fixtures/facturx
+ * still do).
+ */
+function relationshipNotAlternative(name, relationship, level) {
+    return finding("AW-PDF-RELATIONSHIP", "relationship_not_alternative", "information", `The invoice XML "${name}" is attached with /AFRelationship /${relationship}, and its BT-24 declares the ` +
+        `${level} profile. Factur-X accepts ${relationship} there, and so does France, but for invoices in ` +
+        `Germany the ZUGFeRD specification requires Alternative with the BASIC, EN 16931, EXTENDED and ` +
+        `XRECHNUNG profiles: it says the page and the XML are the same invoice in two forms.`, `For an invoice to a receiver in Germany, set /AFRelationship /Alternative on the XML's file ` +
+        `specification. For France, /${relationship} can stay.`);
+}
+// ---------------------------------------------------------------------------
+// AW-PDF-MIME: the embedded file's /Subtype
+// ---------------------------------------------------------------------------
+/**
+ * A media type that is not XML.
+ *
+ * A warning: Factur-X asks for text/xml and a reader that selects attachments
+ * by media type skips this one; most look at the name, so the invoice is
+ * usually found.
+ */
+function mimeNotXml(name, subtype) {
+    return finding("AW-PDF-MIME", "mime_not_xml", "warning", `The embedded file "${name}" declares the media type ${subtype} (its /Subtype), which is not an XML ` +
+        `type. Factur-X asks for text/xml, and a reader that picks attachments by media type passes over ` +
+        `this one.`, MIME_FIX);
+}
+/**
+ * No media type at all.
+ *
+ * A warning: PDF/A-3 requires an embedded file to state its media type, so the
+ * file is not valid PDF/A-3. Not fatal, for the reason above.
+ */
+function mimeMissing(name) {
+    return finding("AW-PDF-MIME", "mime_missing", "warning", `The embedded file "${name}" declares no media type: its stream has no /Subtype. PDF/A-3 requires ` +
+        `every embedded file to state one, and Factur-X asks for text/xml.`, MIME_FIX);
+}
+/**
+ * BT-24 → the Factur-X / ZUGFeRD profile it declares, spelled as the XMP
+ * ConformanceLevel property spells it, or undefined when it declares none this
+ * recognises (Peppol BIS, say, or Factur-X's French EXTENDED-CTC-FR, whose
+ * metadata level this build does not assert).
+ *
+ * This is the reading the engine already gave BT-24, in one place. MINIMUM and
+ * BASIC WL match by the patterns AW-PROFILE-SUBSET has always used, and
+ * `validate` now asks this function for that finding too, so the two cannot
+ * disagree. XRECHNUNG is recognised by the word, as the CII reader recognises
+ * the xrechnung-cii profile, and EN 16931 by its exact identifier. BASIC and
+ * EXTENDED by the Factur-X and ZUGFeRD 2.0 identifiers FeRD's samples and
+ * Mustang's profile list use (`urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:basic`,
+ * `…#conformant#urn:factur-x.eu:1p0:extended`). The level names are the ones
+ * Mustang writes into the metadata (`Profile.getXMPName`: BASICWL is "BASIC
+ * WL", EN16931 is "EN 16931").
+ */
+function facturXLevel(customizationId) {
+    const id = (customizationId ?? "").trim().toLowerCase();
+    if (id === "")
+        return undefined;
+    if (/factur-x\.eu:1p0:minimum|zugferd.*:minimum/.test(id))
+        return "MINIMUM";
+    if (/factur-x\.eu:1p0:basicwl|zugferd.*:basicwl/.test(id))
+        return "BASIC WL";
+    if (/(factur-x\.eu:1p0|zugferd\.de:2p0):basic$/.test(id))
+        return "BASIC";
+    if (/(factur-x\.eu:1p0|zugferd\.de:2p0):extended$/.test(id))
+        return "EXTENDED";
+    if (id.includes("xrechnung"))
+        return "XRECHNUNG";
+    if (id === "urn:cen.eu:en16931:2017")
+        return "EN 16931";
+    return undefined;
+}
+/**
+ * The ConformanceLevel values each metadata schema defines. Factur-X's is the
+ * list Mustang's validator accepts, without the two it keeps for older files
+ * (COMFORT, which is ZUGFeRD 1.0's, and CIUS); ZUGFeRD 1.0 had three profiles.
+ */
+const XMP_LEVELS = {
+    "factur-x": ["MINIMUM", "BASIC WL", "BASIC", "EN 16931", "EXTENDED", "XRECHNUNG"],
+    "zugferd-2.0": ["MINIMUM", "BASIC WL", "BASIC", "EN 16931", "EXTENDED"],
+    "zugferd-1.0": ["BASIC", "COMFORT", "EXTENDED"],
+};
+/** The levels a packet's schema defines; every one of them when the namespace is not a format's. */
+function levelsOf(schema) {
+    return schema ? XMP_LEVELS[schema] : [...new Set(Object.values(XMP_LEVELS).flat())];
+}
+const SCHEMA_NAME = {
+    "factur-x": "Factur-X",
+    "zugferd-2.0": "ZUGFeRD 2.0",
+    "zugferd-1.0": "ZUGFeRD 1.0",
+};
+/** A level's usual misspellings, by the letters left once case, spaces, hyphens and underscores go. */
+const LEVEL_BY_LETTERS = {
+    MINIMUM: "MINIMUM",
+    BASICWL: "BASIC WL",
+    BASIC: "BASIC",
+    EN16931: "EN 16931",
+    EXTENDED: "EXTENDED",
+    XRECHNUNG: "XRECHNUNG",
+    COMFORT: "COMFORT",
+};
+/** " It is spelled EN 16931." and the like, or nothing. */
+function spellingHint(level, known) {
+    const meant = LEVEL_BY_LETTERS[level.toUpperCase().replace(/[\s_-]+/g, "")];
+    if (meant === "COMFORT" && !known.includes("COMFORT")) {
+        return " COMFORT is ZUGFeRD 1.0's name for the profile Factur-X and later ZUGFeRD call EN 16931.";
+    }
+    return meant !== undefined && known.includes(meant) ? ` The level is spelled ${meant}.` : "";
+}
+// ---------------------------------------------------------------------------
+// AW-PDF-XMP: the XMP metadata
+// ---------------------------------------------------------------------------
+const XMP_FIX = "Produce the PDF with XMP metadata that identifies it as PDF/A-3 (pdfaid:part 3, pdfaid:conformance B) " +
+    "and carries the Factur-X properties DocumentType, DocumentFileName, Version and ConformanceLevel.";
+/**
+ * No XMP metadata at all.
+ *
+ * A warning: PDF/A requires it, and it is where Factur-X declares the
+ * attachment and its profile; Mustang's validator reports its absence as an
+ * error. Not fatal: the invoice XML is still there, and read.
+ */
+function xmpMissing() {
+    return finding("AW-PDF-XMP", "xmp_missing", "warning", "This PDF has no XMP metadata: its catalog has no /Metadata stream. That metadata is where a file " +
+        "claims to be PDF/A-3, which Factur-X and ZUGFeRD are defined on, and where it declares the invoice " +
+        "attachment's name and profile. A file without it claims neither, and validators of the format, " +
+        "Mustang among them, reject it.", XMP_FIX);
+}
+/**
+ * Metadata that is there and cannot be read: not a stream, a filter this
+ * reader lacks, bytes that are not text, XML that is not well-formed, or XML
+ * that is not XMP. Never an exception: the invoice was read, and this is a
+ * fact about the file around it.
+ *
+ * A warning, for the reason `xmpMissing` is one: to a reader, unreadable
+ * metadata claims nothing. Mustang reports unparseable metadata as an error.
+ */
+function xmpUnreadable(detail) {
+    const said = detail.trim();
+    return finding("AW-PDF-XMP", "xmp_unreadable", "warning", `The PDF's XMP metadata (/Metadata) could not be read: ${/[.!?]$/.test(said) ? said : `${said}.`} A ` +
+        `receiver reads the file's PDF/A claim and its Factur-X profile from there, so to it this file claims ` +
+        `neither.`, "Have the PDF producer write the metadata as a well-formed XMP packet: UTF-8 XML, an rdf:RDF element " +
+        "(inside x:xmpmeta) holding rdf:Description elements.");
+}
+/**
+ * No `pdfaid:part`: the file does not claim to be PDF/A.
+ *
+ * A warning: Factur-X and ZUGFeRD are PDF/A-3 files, and Mustang reports one
+ * that is not as an error. Not fatal, for the reason above.
+ */
+function xmpPdfaMissing(conformance) {
+    return finding("AW-PDF-XMP", "xmp_pdfa_missing", "warning", `The XMP metadata has no PDF/A identification: no pdfaid:part` +
+        (conformance === undefined ? " and no pdfaid:conformance" : ` (only pdfaid:conformance ${conformance})`) +
+        `. So this file does not claim to be PDF/A at all, while Factur-X and ZUGFeRD are defined as PDF/A-3 ` +
+        `files, and a validator of the format rejects one that does not claim it.`, "Produce the PDF as PDF/A-3, which writes pdfaid:part 3 and pdfaid:conformance (B for most generated " +
+        "invoices) to its XMP metadata.");
+}
+/**
+ * A PDF/A part other than 3.
+ *
+ * A warning: the formats are defined on PDF/A-3, the part that lets any file
+ * be embedded. PDF/A-1 forbids embedded files and PDF/A-2 admits only PDF/A
+ * ones, so a validator judging the file by the part it claims fails it for the
+ * invoice XML; Mustang reports "Not a PDF/A-3".
+ */
+function xmpPdfaPart(part) {
+    const consequence = part === "1"
+        ? " PDF/A-1 forbids embedded files, so a PDF/A validator judging this file as it claims fails it for carrying the invoice XML."
+        : part === "2"
+            ? " PDF/A-2 allows only PDF/A files to be embedded, so a PDF/A validator judging this file as it claims fails it for carrying the invoice XML."
+            : " A validator of the format checks for PDF/A-3 and finds a claim to something else.";
+    return finding("AW-PDF-XMP", "xmp_pdfa_part", "warning", `The XMP metadata identifies this file as PDF/A-${part} (pdfaid:part ${part}), but Factur-X and ZUGFeRD ` +
+        `are defined as PDF/A-3 files, the part that allows any file to be embedded.${consequence}`, "Produce the PDF as PDF/A-3 and write pdfaid:part 3 to its XMP metadata.");
+}
+/**
+ * PDF/A-3 with no conformance level, or one PDF/A-3 does not have.
+ *
+ * A warning: the claim is incomplete, and a validator needs the level to know
+ * which rules it claims to meet.
+ */
+function xmpPdfaConformance(conformance) {
+    return finding("AW-PDF-XMP", "xmp_pdfa_conformance", "warning", `The XMP metadata identifies PDF/A-3 with ` +
+        (conformance === undefined
+            ? "no conformance level (pdfaid:conformance)"
+            : `the conformance level "${conformance}" (pdfaid:conformance)`) +
+        `. PDF/A-3 has three, A, B and U, and a validator needs the one the file claims to know which rules ` +
+        `to apply.`, "Write the level the file meets to pdfaid:conformance: B for most generated invoices, U when all its " +
+        "text maps to Unicode, A when it is also tagged.");
+}
+/**
+ * None of the four Factur-X properties.
+ *
+ * A warning: the metadata does not say the file is Factur-X at all, and
+ * Mustang's validator reports each missing property as an error. FeRD's own
+ * BASIC and EN 16931 sample files (fixtures/facturx) are like this. Not fatal: a reader
+ * that looks for the attachment by name still finds the invoice.
+ */
+function xmpFacturXMissing(attachment) {
+    return finding("AW-PDF-XMP", "xmp_facturx_missing", "warning", "The XMP metadata does not declare this file as Factur-X or ZUGFeRD: none of the four properties the " +
+        "format adds to it (DocumentType, DocumentFileName, Version, ConformanceLevel) is there. Receivers " +
+        "read them to find the invoice attachment and its profile without opening the XML, and Mustang " +
+        "rejects a file that lacks them.", `Write the Factur-X properties in the namespace ${FACTURX_XMP_NAMESPACES["factur-x"]}: DocumentType ` +
+        `INVOICE, DocumentFileName ${attachment}, Version 1.0, and ConformanceLevel with the profile the XML ` +
+        `declares (EN 16931, for example). PDF/A also requires the namespace to be described in a ` +
+        `pdfaExtension:schemas block.`);
+}
+/**
+ * Some of the four Factur-X properties, not all.
+ *
+ * A warning: the format requires all four, and Mustang reports each missing
+ * one as an error.
+ */
+function xmpFacturXIncomplete(missing, namespace) {
+    const list = missing.join(", ");
+    return finding("AW-PDF-XMP", "xmp_facturx_incomplete", "warning", `The XMP metadata declares Factur-X properties but not ${list}. The format requires all four, ` +
+        `DocumentType, DocumentFileName, Version and ConformanceLevel, and Mustang reports each missing one as ` +
+        `an error.`, `Add ${list} to the XMP metadata, in the namespace ${namespace}.`);
+}
+/**
+ * The properties are there, in a namespace none of the formats defines.
+ *
+ * A warning: XMP and PDF/A tools match properties by namespace and do not see
+ * these, although Mustang, which matches by local name, does.
+ */
+function xmpFacturXNamespace(namespace) {
+    return finding("AW-PDF-XMP", "xmp_facturx_namespace", "warning", `The XMP metadata has Factur-X properties in the namespace "${namespace}", which is none of the ` +
+        `three the formats define (${Object.values(FACTURX_XMP_NAMESPACES).join(", ")}). A reader that ` +
+        `matches them by namespace, as XMP and PDF/A tools do, does not see them.`, `Write the properties in the namespace ${FACTURX_XMP_NAMESPACES["factur-x"]}, and describe it in the ` +
+        `pdfaExtension:schemas block.`);
+}
+/**
+ * A DocumentType other than INVOICE.
+ *
+ * A warning: it is the property that tells an invoice from an Order-X order,
+ * and Mustang reports a value it does not know as an error.
+ */
+function xmpDocumentType(value) {
+    return finding("AW-PDF-XMP", "xmp_document_type", "warning", `The XMP metadata declares DocumentType "${value}", but an invoice, credit notes included, declares ` +
+        `INVOICE. A receiver that sorts hybrid documents by this property will not treat this file as an ` +
+        `invoice.`, "Write INVOICE to DocumentType.");
+}
+/**
+ * DocumentFileName names an attachment that is not the one there.
+ *
+ * A warning: a reader that follows the metadata to the attachment finds
+ * nothing. Not fatal: a reader that looks the name up itself does.
+ */
+function xmpFileName(declared, actual) {
+    return finding("AW-PDF-XMP", "xmp_file_name", "warning", `The XMP metadata names the invoice attachment "${declared}" (DocumentFileName), but the XML is ` +
+        `attached as "${actual}". A receiver that follows the metadata to the attachment looks for a file ` +
+        `this PDF does not contain.`, "Make DocumentFileName and the attachment's name the same, and make it the standard one: factur-x.xml, " +
+        "or xrechnung.xml for the XRECHNUNG profile.");
+}
+// ---------------------------------------------------------------------------
+// AW-PDF-XMP-PROFILE: the profile the metadata declares
+// ---------------------------------------------------------------------------
+/**
+ * A ConformanceLevel the metadata schema does not define.
+ *
+ * A warning: Mustang reports an unknown level as an error, and a receiver
+ * that routes on the level cannot tell which profile this is.
+ */
+function xmpLevelUnknown(level, schema) {
+    const known = levelsOf(schema);
+    const defined = schema ? `the ${SCHEMA_NAME[schema]} metadata defines` : "Factur-X or ZUGFeRD defines";
+    return finding("AW-PDF-XMP-PROFILE", "xmp_level_unknown", "warning", `The XMP metadata declares the conformance level "${level}", which is not one ${defined} ` +
+        `(${known.join(", ")}).${spellingHint(level, known)} Mustang rejects a level it does not know, and a ` +
+        `receiver that routes on it cannot tell which profile this is.`, `Write the level of the profile the XML declares, spelled as the format spells it: ${known.join(", ")}.`);
+}
+/**
+ * The metadata declares one profile and BT-24 another.
+ *
+ * A warning: a receiver can take the profile from the metadata without
+ * opening the XML, and then applies another profile's rules to this invoice.
+ * Not fatal: which of the two a receiver believes is its own choice, and the
+ * rules here judged the XML.
+ */
+function xmpLevelMismatch(declared, expected, customizationId) {
+    return finding("AW-PDF-XMP-PROFILE", "xmp_level_mismatch", "warning", `The XMP metadata declares the ${declared} profile (ConformanceLevel), but the XML declares ` +
+        `${expected}: its BT-24 is "${customizationId.trim()}". A receiver that takes the profile from the ` +
+        `metadata, which it can read without opening the XML, applies another profile's rules to this invoice.`, `Write ${expected} to the XMP ConformanceLevel. If ${declared} is the profile you meant, export the XML ` +
+        `at that profile instead.`, "BT-24");
+}
+// ---------------------------------------------------------------------------
+// Which of them apply
+// ---------------------------------------------------------------------------
+const STANDARD_NAME = /^(factur-x|xrechnung|zugferd-invoice)\.xml$/i;
+/**
+ * The metadata's own findings: everything that can be said from the packet
+ * and the attachment's name, without the XML. `extractFacturX` returns these.
+ */
+function xmpFindings(xmp, attachment) {
+    const out = [];
+    if (xmp.pdfaPart === undefined)
+        out.push(xmpPdfaMissing(xmp.pdfaConformance));
+    else if (xmp.pdfaPart !== "3")
+        out.push(xmpPdfaPart(xmp.pdfaPart));
+    else if (!["A", "B", "U"].includes(xmp.pdfaConformance ?? ""))
+        out.push(xmpPdfaConformance(xmp.pdfaConformance));
+    if (xmp.namespace === undefined) {
+        out.push(xmpFacturXMissing(STANDARD_NAME.test(attachment) ? attachment : "factur-x.xml"));
+        return out;
+    }
+    if (xmp.schema === undefined)
+        out.push(xmpFacturXNamespace(xmp.namespace));
+    const stated = {
+        DocumentType: xmp.documentType,
+        DocumentFileName: xmp.documentFileName,
+        Version: xmp.version,
+        ConformanceLevel: xmp.conformanceLevel,
+    };
+    const missing = FACTURX_XMP_PROPERTIES.filter((name) => stated[name] === undefined);
+    if (missing.length > 0)
+        out.push(xmpFacturXIncomplete(missing, xmp.namespace));
+    if (xmp.documentType !== undefined && xmp.documentType !== "INVOICE")
+        out.push(xmpDocumentType(xmp.documentType));
+    if (xmp.documentFileName !== undefined && xmp.documentFileName !== attachment) {
+        out.push(xmpFileName(xmp.documentFileName, attachment));
+    }
+    if (xmp.conformanceLevel !== undefined && !levelsOf(xmp.schema).includes(xmp.conformanceLevel)) {
+        out.push(xmpLevelUnknown(xmp.conformanceLevel, xmp.schema));
+    }
+    return out;
+}
+/**
+ * The container findings that need the XML's BT-24: the profile the metadata
+ * declares against the one the XML does, and an /AFRelationship of Data or
+ * Source on a profile Germany asks Alternative for.
+ *
+ * `extractFacturX` cannot know BT-24 without parsing the XML, which is
+ * `validate`'s job, and parsing it twice would double the cost of the most
+ * expensive step on a large invoice. So `validate` calls this with the BT-24
+ * it read; a caller holding `extractFacturX`'s result and a BT-24 of its own
+ * can call it the same way. Nothing is reported when BT-24 declares no profile
+ * this recognises (`facturXLevel`), or when the metadata's level is one
+ * `xmpFindings` has already called unknown.
+ */
+function facturXProfileFindings(container, customizationId) {
+    const level = facturXLevel(customizationId);
+    if (level === undefined || customizationId === undefined)
+        return [];
+    const out = [];
+    const relationship = container.relationship;
+    if ((relationship === "Data" || relationship === "Source") && ALTERNATIVE_IN_GERMANY.has(level)) {
+        out.push(relationshipNotAlternative(container.attachmentName, relationship, level));
+    }
+    const declared = container.xmp?.conformanceLevel;
+    if (declared !== undefined && levelsOf(container.xmp?.schema).includes(declared) && declared !== level) {
+        out.push(xmpLevelMismatch(declared, level, customizationId));
+    }
+    return out;
+}
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-decode.js
 /**
  * Bytes to XML text, the way an XML processor reads them.
@@ -62076,12 +63442,16 @@ function isMultiByteUtf8(bytes) {
  *
  * ## What it parses
  *
- * Enough PDF to find an attachment, and no more: classic cross-reference
- * tables, cross-reference streams (PDF 1.5+), object streams, `/Prev` chains,
- * and the `FlateDecode` filter with PNG predictors. It does not render, does
- * not decrypt, and does not implement `LZWDecode`, `/Crypt` or any of the image
- * filters — it names them and refuses instead, because a wrong answer about the
- * contents of a tax document is worse than no answer.
+ * Enough PDF to find an attachment and the catalog's XMP metadata, and no
+ * more: classic cross-reference tables, cross-reference streams (PDF 1.5+),
+ * object streams, `/Prev` chains, and the `FlateDecode` filter with PNG
+ * predictors. It does not render, does not decrypt, and does not implement
+ * `LZWDecode`, `/Crypt` or any of the image filters — it names them and refuses
+ * instead, because a wrong answer about the contents of a tax document is worse
+ * than no answer. What the container says about the attachment, and what the
+ * metadata claims, come back as findings (facturx-findings.ts, xmp.ts): the
+ * claims are read and checked, and whether the file keeps them as PDF/A is not
+ * this module's question.
  *
  * ## The attachment's text: UTF-8, or a refusal that names the encoding
  *
@@ -62134,6 +63504,9 @@ function isMultiByteUtf8(bytes) {
  *   the byte it came from. `maxObjectNodes` is the cap that corresponds to what
  *   a Cloudflare Worker actually runs out of.
  */
+
+
+
 
 const DEFAULT_PDF_LIMITS = {
     maxStreamBytes: 32 * 1024 * 1024,
@@ -63473,10 +64846,59 @@ function decodePdfTextString(value) {
     return value;
 }
 /**
+ * The catalog's XMP metadata, read and checked.
+ *
+ * Read after the attachment, so a metadata stream cannot spend the inflate
+ * budget the invoice needs, and never thrown out of: a stream that is missing,
+ * uses a filter this reader lacks, hits a limit, or holds something other than
+ * XMP is a finding about a file whose invoice was read, not a reason to return
+ * no invoice. `FlateDecode` is inflated with the same code as the attachment.
+ */
+function inspectXmp(doc, root, attachment) {
+    const unreadable = (detail) => ({ xmp: null, findings: [xmpUnreadable(detail)] });
+    let raw;
+    try {
+        const metadata = doc.dictGet(root, "Metadata");
+        if (metadata === null)
+            return { xmp: null, findings: [xmpMissing()] };
+        if (!(metadata instanceof PdfStream)) {
+            return unreadable("the catalog's /Metadata is not a stream, so it holds no XMP packet.");
+        }
+        raw = doc.decodeStream(metadata);
+    }
+    catch (error) {
+        if (error instanceof PdfUnsupportedFilterError) {
+            return unreadable(`it is encoded with the ${error.filter} filter, which this reader does not implement.`);
+        }
+        if (error instanceof PdfError)
+            return unreadable(error.message);
+        throw error;
+    }
+    const decoded = decodeXml(raw);
+    if ("problem" in decoded) {
+        return unreadable(decoded.problem === "unsupported"
+            ? `it declares the encoding "${decoded.label}", which this runtime cannot decode.`
+            : `its bytes are not valid ${decoded.label}, so it is not the text its producer meant.`);
+    }
+    let xmp;
+    try {
+        xmp = readXmp(decoded.text);
+    }
+    catch (error) {
+        if (error instanceof ParseError)
+            return unreadable(error.message);
+        throw error;
+    }
+    return { xmp, findings: xmpFindings(xmp, attachment) };
+}
+/**
  * Pull the invoice XML out of a Factur-X / ZUGFeRD / XRechnung-CII PDF.
  *
  * Extraction only — this never writes a PDF. The returned `xml` is the
- * attachment's UTF-8 text and is suitable input for `parseCiiInvoice`.
+ * attachment's UTF-8 text and is suitable input for `parseCiiInvoice`. What
+ * the container says about that attachment — its name, where it is registered,
+ * its `/AFRelationship` and media type — comes back in `findings`, never as a
+ * throw: those are facts about a file that was read (see facturx-findings.ts).
  *
  * Throws `FacturXNotFoundError` when the document carries no XML attachment,
  * `FacturXEncodingError` when the attachment is not UTF-8 (see "The
@@ -63499,7 +64921,12 @@ function extractFacturX(bytes, limits = {}) {
         throw new PdfParseError("pdf_no_header", "The input does not begin with %PDF-. A Factur-X file is a PDF; if you have the " +
             "XML on its own, pass it to parseCiiInvoice instead of this function.");
     }
+    // Two views of one set of observations: `warnings` keeps the sentences this
+    // function has always returned, word for word, and `findings` carries every
+    // observation with an id, a severity and a fix. Where both apply they are
+    // pushed together, so the two cannot drift apart.
     const warnings = [];
+    const findings = [];
     const doc = new PdfDocument(bytes, lim);
     const root = doc.resolve(doc.trailer.get("Root") ?? null);
     if (!(root instanceof Map)) {
@@ -63532,6 +64959,7 @@ function extractFacturX(bytes, limits = {}) {
     // /AF, which is correct and not worth a warning. Two *different* streams
     // under one name is worth one.
     const unique = [];
+    const twoCopies = new Set();
     for (const candidate of candidates) {
         const twin = unique.find((u) => u.name.toLowerCase() === candidate.name.toLowerCase());
         if (!twin) {
@@ -63542,6 +64970,10 @@ function extractFacturX(bytes, limits = {}) {
             warnings.push(`The name tree and the /AF array both name "${candidate.name}" but point at different ` +
                 `embedded streams. The name-tree copy was used. A conformant file has one attachment ` +
                 `referenced from both places.`);
+            // Once per attachment, however many times /AF repeats the other copy.
+            if (!twoCopies.has(twin))
+                findings.push(afStreamsDiffer(candidate.name));
+            twoCopies.add(twin);
         }
     }
     const xmlCandidates = unique.filter((c) => /\.xml$/i.test(c.name));
@@ -63561,22 +64993,47 @@ function extractFacturX(bytes, limits = {}) {
         warnings.push(`This PDF carries ${ranked.length} XML attachments (${ranked
             .map((c) => `"${c.name}"`)
             .join(", ")}). "${chosen.name}" was returned. A conformant Factur-X file has exactly one.`);
+        // Exactly one under a standard name is how a receiver tells the invoice
+        // from a supporting document, so only then is the choice unambiguous.
+        const standard = ranked.filter((c) => PREFERRED_NAMES.includes(c.name.toLowerCase())).length;
+        const names = ranked.map((c) => c.name);
+        findings.push(standard === 1
+            ? attachmentExtra(names, chosen.name)
+            : attachmentAmbiguous(names, chosen.name, standard));
     }
     if (!PREFERRED_NAMES.includes(chosen.name.toLowerCase())) {
         warnings.push(`The XML is attached as "${chosen.name}", which is not one of the standard names ` +
             `(${PREFERRED_NAMES.join(", ")}). The XML was returned anyway, but a receiver that ` +
             `looks the attachment up by name — as Factur-X readers are entitled to — will not find it.`);
+        findings.push(attachmentName(chosen.name));
+    }
+    // The name tree and /AF, as Factur-X asks for both. An entry counts when it
+    // names the attachment or holds its stream, so a file specification that
+    // /AF lists without a name of its own is still found. Neither is a legacy
+    // warning: until these findings existed, a file with only one of them was
+    // read without comment, and `warnings` keeps saying what it always said.
+    const isChosen = (c) => c.stream === chosen.stream || c.name.toLowerCase() === chosen.name.toLowerCase();
+    if (!candidates.some((c) => c.source === "AF" && isChosen(c)))
+        findings.push(afMissing(chosen.name));
+    if (!candidates.some((c) => c.source === "name-tree" && isChosen(c))) {
+        findings.push(afNameTreeMissing(chosen.name));
     }
     if (chosen.relationship === undefined) {
         warnings.push(`The attachment declares no /AFRelationship. PDF/A-3 requires one, and Germany requires ` +
             `"Alternative" for the BASIC, EN 16931, EXTENDED and XRECHNUNG profiles.`);
+        findings.push(relationshipMissing(chosen.name));
     }
     else if (!["Alternative", "Data", "Source"].includes(chosen.relationship)) {
         warnings.push(`The attachment declares /AFRelationship "${chosen.relationship}". Factur-X expects ` +
             `"Alternative" (the XML and the page image are the same invoice).`);
+        findings.push(relationshipUnexpected(chosen.name, chosen.relationship));
     }
     if (chosen.subtype && !/xml/i.test(chosen.subtype)) {
         warnings.push(`The embedded file's /Subtype is "${chosen.subtype}" rather than an XML media type.`);
+        findings.push(mimeNotXml(chosen.name, chosen.subtype));
+    }
+    else if (!chosen.subtype) {
+        findings.push(mimeMissing(chosen.name));
     }
     const raw = doc.decodeStream(chosen.stream);
     if (raw.length > lim.maxAttachmentBytes) {
@@ -63597,6 +65054,7 @@ function extractFacturX(bytes, limits = {}) {
         warnings.push(`The attachment "${chosen.name}" declares encoding "${decoded.label}". Factur-X and ZUGFeRD ` +
             `attachments are UTF-8. This one holds only ASCII, which reads the same in both, so it was ` +
             `returned; the first non-ASCII character its producer writes will not read the same.`);
+        findings.push(attachmentEncoding(chosen.name, decoded.label));
     }
     // The byte-order mark is not part of the XML. A second one would be: it
     // stays, as it does when validate() reads a file.
@@ -63605,15 +65063,30 @@ function extractFacturX(bytes, limits = {}) {
         warnings.push(`The attachment "${chosen.name}" does not begin with an XML declaration and contains no ` +
             `CrossIndustryInvoice element, so it may not be an invoice at all. It was returned ` +
             `unchanged for you to inspect.`);
+        findings.push(attachmentNotCii(chosen.name));
     }
     else if (!/CrossIndustryInvoice/i.test(xml)) {
         warnings.push(`The attachment is XML but has no rsm:CrossIndustryInvoice root. Factur-X and ZUGFeRD 2.x ` +
             `carry UN/CEFACT CII; this may be a ZUGFeRD 1.0 document or another syntax entirely.`);
+        findings.push(attachmentNotCii(chosen.name));
     }
-    return { xml, attachmentName: chosen.name, warnings };
+    // The metadata last, once the invoice is safely out.
+    const metadata = inspectXmp(doc, root, chosen.name);
+    findings.push(...metadata.findings);
+    const result = {
+        xml,
+        attachmentName: chosen.name,
+        warnings,
+        findings: sortFacturXFindings(findings),
+        xmp: metadata.xmp,
+    };
+    if (chosen.relationship !== undefined)
+        result.relationship = chosen.relationship;
+    return result;
 }
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/generate.js
+
 
 
 
@@ -63985,13 +65458,22 @@ function taxTotalNode(totals, currency) {
  *
  * The check is separate so that a caller who only generates does not ship the
  * whole rule set: this function alone bundles to a few kilobytes.
+ *
+ * **Business facts are accepted** (0.14.0): an `InvoiceFacts` input, with a
+ * `vatScenario` in place of VAT codes or no payment means code beside an
+ * IBAN, is turned into codes first, exactly as `applyDefaults` does, so the
+ * XML is byte for byte what the explicit invoice produces.
  */
-function generateXRechnungUBL(inv, options = {}) {
+function generateXRechnungUBL(input, options = {}) {
     // Refuse before doing any work: a wrong syntax is not something the rest of
     // this function can compensate for.
-    if (!UBL_GENERATABLE_PROFILES.includes(inv?.profile)) {
-        throw new UnsupportedProfileError(String(inv?.profile));
+    if (!UBL_GENERATABLE_PROFILES.includes(input?.profile)) {
+        throw new UnsupportedProfileError(String(input?.profile));
     }
+    // Business facts become codes first, exactly as `applyDefaults` writes
+    // them, so the facts and their codes produce the same bytes. An input with
+    // nothing to fill in is the same object afterwards.
+    const inv = expandDefaults(input);
     const typeCode = resolveTypeCode(inv.invoiceTypeCode);
     const creditNote = documentKindOf(inv.invoiceTypeCode) === "credit-note";
     const totals = computeTotals(inv);
@@ -64436,6 +65918,7 @@ function generateXRechnungUBL(inv, options = {}) {
 
 
 
+
 /**
  * JSON → UN/CEFACT Cross Industry Invoice (CII), D16B.
  *
@@ -64752,11 +66235,19 @@ function invoicedObjectNode(identifier) {
  * **It does not validate**, for the same reason as `generateXRechnungUBL`: an
  * invoice with fatal findings still comes out as well-formed XML. Call
  * `validateInput` first and generate only when `result.valid` is true.
+ *
+ * **Business facts are accepted** (0.14.0), as by `generateXRechnungUBL`: an
+ * `InvoiceFacts` input becomes codes first, exactly as `applyDefaults` writes
+ * them, and the XML is byte for byte the explicit invoice's.
  */
-function generateCii(inv, options = {}) {
-    if (!CII_GENERATABLE_PROFILES.includes(inv?.profile)) {
-        throw new UnsupportedCiiProfileError(String(inv?.profile));
+function generateCii(input, options = {}) {
+    if (!CII_GENERATABLE_PROFILES.includes(input?.profile)) {
+        throw new UnsupportedCiiProfileError(String(input?.profile));
     }
+    // Business facts become codes first, exactly as `applyDefaults` writes
+    // them, so the facts and their codes produce the same bytes. An input with
+    // nothing to fill in is the same object afterwards.
+    const inv = expandDefaults(input);
     const typeCode = resolveTypeCode(inv.invoiceTypeCode);
     const totals = computeTotals(inv);
     const currency = (inv.currency || "EUR").toUpperCase();
@@ -65689,7 +67180,7 @@ const isCharge = (el) => {
  * which is quadratic. A WeakMap keeps the index exactly as long as the tree.
  */
 const byName = new WeakMap();
-function childrenNamed(parent, ns, local) {
+function locate_childrenNamed(parent, ns, local) {
     let index = byName.get(parent);
     if (!index) {
         index = new Map();
@@ -65707,9 +67198,9 @@ function childrenNamed(parent, ns, local) {
 }
 /** Pick the child a step names. Undefined when it is missing or cannot be told apart. */
 function choose(parent, step) {
-    let named = childrenNamed(parent, step.ns, step.local);
+    let named = locate_childrenNamed(parent, step.ns, step.local);
     if (step.or) {
-        const also = step.or.flatMap((local) => childrenNamed(parent, step.ns, local));
+        const also = step.or.flatMap((local) => locate_childrenNamed(parent, step.ns, local));
         // Back in document order, which is what "the only one" and a position mean.
         if (also.length > 0)
             named = [...named, ...also].sort((a, b) => parent.children.indexOf(a) - parent.children.indexOf(b));
@@ -65991,589 +67482,6 @@ function cii_tax_point_code_taxPointCodeToCii(code) {
     return MODEL_TO_CII[code.trim()] ?? code;
 }
 
-;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-parse.js
-/**
- * Minimal, hardened XML reader for the UBL subset.
- *
- * This package ships with zero runtime dependencies, so it cannot pull in a
- * general XML parser — and it should not want to. A general parser accepts far
- * more than UBL needs (DTDs, entities, mixed content, notations), and every one
- * of those features is an attack surface when the document comes from a third
- * party.
- *
- * What this reader accepts:
- *   - one root element, with nested elements, attributes and text
- *   - namespace declarations (`xmlns` and `xmlns:prefix`), resolved to URIs
- *   - the five predefined entities (`&amp; &lt; &gt; &quot; &apos;`) and
- *     numeric character references
- *   - CDATA sections, comments and processing instructions
- *
- * What it refuses, loudly:
- *   - any document containing `<!DOCTYPE` or `<!ENTITY`
- *   - any entity reference that is not one of the five predefined ones
- *   - documents deeper, longer or larger than the limits below
- *   - mixed content: an element with both child elements and text
- *
- * Refusing is deliberate. A parser that guesses at a construct it does not
- * understand produces a wrong invoice, and a wrong invoice is a tax problem.
- */
-/** Base class for every failure this reader and the UBL mapper raise. */
-class ParseError extends Error {
-    code;
-    constructor(code, message) {
-        super(message);
-        this.name = new.target.name;
-        this.code = code;
-    }
-}
-/** The document is not well-formed XML, or uses a construct outside the subset. */
-class XmlSyntaxError extends ParseError {
-}
-/**
- * The document tripped one of the limits that exist to stop a hostile file
- * from exhausting memory or CPU. Never a comment on the invoice itself.
- */
-class XmlSecurityError extends ParseError {
-}
-const DEFAULT_XML_LIMITS = {
-    maxCharacters: 8_000_000,
-    maxDepth: 100,
-    maxElements: 50_000,
-    maxAttributes: 256,
-};
-/** Attribute lookup by namespace and local name. */
-function attr(el, local, namespace = "") {
-    for (const a of el.attributes) {
-        if (a.local === local && a.namespace === namespace)
-            return a.value;
-    }
-    return undefined;
-}
-const NAME_START = /[A-Za-z_]/;
-const NAME_CHAR = /[A-Za-z0-9._\-]/;
-/**
- * Characters XML 1.0 does not permit at all. They cannot be escaped, so a
- * document containing one is not well-formed however it was produced. Checked
- * on decoded text and attribute values, which is also where a numeric
- * character reference to a control character would land.
- */
-// eslint-disable-next-line no-control-regex
-const ILLEGAL_XML_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/;
-const XMLNS_URI = "http://www.w3.org/2000/xmlns/";
-const XML_URI = "http://www.w3.org/XML/1998/namespace";
-/** A namespace map with no prototype at all — see {@link Frame.nsMap}. */
-function emptyNsMap() {
-    const map = Object.create(null);
-    map[""] = "";
-    map["xml"] = XML_URI;
-    return map;
-}
-/**
- * Parse a UBL-shaped XML document into a tree.
- *
- * @throws {XmlSecurityError} on a DOCTYPE, a non-predefined entity, or a
- *   document over any of the limits.
- * @throws {XmlSyntaxError} on anything that is not well-formed, or that uses a
- *   construct outside the accepted subset.
- */
-function xml_parse_parseXml(source, limits = {}) {
-    const lim = { ...DEFAULT_XML_LIMITS, ...limits };
-    if (typeof source !== "string") {
-        throw new XmlSyntaxError("xml_not_a_string", "Expected the XML document as a string.");
-    }
-    // Defence: input size cap. Refuses a hostile or accidental upload before any
-    // allocation, rather than running out of memory building the tree.
-    if (source.length > lim.maxCharacters) {
-        throw new XmlSecurityError("xml_too_large", `The document is ${source.length} characters, over the ${lim.maxCharacters} ` +
-            `character limit. Raise it with the maxCharacters option if you really do ` +
-            `need to parse a document this size, or check that you are not passing a ` +
-            `whole archive where one invoice was expected.`);
-    }
-    // Defence against XXE and against billion-laughs style entity expansion: no
-    // DTD is processed at all, and a document that carries one is refused rather
-    // than parsed with the declarations ignored. Ignoring them would silently
-    // change the meaning of every entity reference in the body. The check runs on
-    // the raw text, so it also fires for a DOCTYPE hidden inside a CDATA section
-    // — a false positive we accept, because no invoice needs one.
-    const doctypeAt = source.indexOf("<!DOCTYPE");
-    if (doctypeAt >= 0) {
-        throw new XmlSecurityError("xml_doctype_forbidden", "This document contains a DOCTYPE declaration, which this parser refuses to " +
-            "process. A DTD can declare external entities (the XXE attack, which reads " +
-            "local files or makes network requests) and nested internal entities (the " +
-            "billion-laughs attack, which exhausts memory). No EN 16931 invoice needs a " +
-            "DOCTYPE. Remove the declaration and parse the document again.");
-    }
-    const entityAt = source.indexOf("<!ENTITY");
-    if (entityAt >= 0) {
-        throw new XmlSecurityError("xml_entity_declaration_forbidden", "This document declares an XML entity. Custom entities are never expanded by " +
-            "this parser, because entity expansion is how the billion-laughs denial of " +
-            "service works. Remove the declaration.");
-    }
-    let i = 0;
-    // A byte order mark is legal and invisible; drop it rather than treating it
-    // as text before the root element.
-    if (source.charCodeAt(0) === 0xfeff)
-        i = 1;
-    const stack = [];
-    let root;
-    let elementCount = 0;
-    // Line and column of an offset. Elements are met in document order, so the
-    // scan only ever moves forward and the whole document is walked once: O(n)
-    // in total, not O(n) per element. A line ends at LF, CRLF or a lone CR, as
-    // XML 1.0 section 2.11 and every editor have it: a file saved with classic
-    // Mac line endings is not one long line.
-    let scanned = i;
-    let lineNo = 1;
-    let lineStart = i;
-    const position = (at) => {
-        for (; scanned < at; scanned += 1) {
-            const ch = source.charCodeAt(scanned);
-            if (ch === 10 || (ch === 13 && source.charCodeAt(scanned + 1) !== 10)) {
-                lineNo += 1;
-                lineStart = scanned + 1;
-            }
-        }
-        return [lineNo, at - lineStart + 1];
-    };
-    const fail = (code, message) => {
-        throw new XmlSyntaxError(code, `${message} (at character ${i})`);
-    };
-    const readName = () => {
-        const start = i;
-        if (i >= source.length || !NAME_START.test(source[i])) {
-            fail("xml_bad_name", "Expected an element or attribute name");
-        }
-        i += 1;
-        let colons = 0;
-        while (i < source.length) {
-            const ch = source[i];
-            if (ch === ":") {
-                colons += 1;
-                if (colons > 1) {
-                    fail("xml_bad_name", "A qualified name may contain at most one colon");
-                }
-                i += 1;
-                if (i >= source.length || !NAME_START.test(source[i])) {
-                    fail("xml_bad_name", "Expected a local name after the namespace prefix");
-                }
-                i += 1;
-                continue;
-            }
-            if (!NAME_CHAR.test(ch))
-                break;
-            i += 1;
-        }
-        return source.slice(start, i);
-    };
-    const skipSpace = () => {
-        while (i < source.length && /[\s]/.test(source[i]))
-            i += 1;
-    };
-    const decode = (raw, where) => {
-        const decoded = raw.includes("&") ? decodeEntities(raw, where) : raw;
-        if (ILLEGAL_XML_CHARS.test(decoded)) {
-            throw new XmlSyntaxError("xml_illegal_character", `${where} contains a control character that XML 1.0 does not permit. ` +
-                `Such a character cannot be escaped: the document is not well-formed.`);
-        }
-        return decoded;
-    };
-    const current = () => stack[stack.length - 1];
-    while (i < source.length) {
-        const lt = source.indexOf("<", i);
-        if (lt < 0) {
-            // Trailing text after the last tag.
-            const rest = source.slice(i);
-            if (rest.trim() !== "") {
-                fail("xml_text_outside_root", "Text after the root element");
-            }
-            break;
-        }
-        if (lt > i) {
-            const raw = source.slice(i, lt);
-            const frame = current();
-            if (!frame) {
-                if (raw.trim() !== "") {
-                    fail("xml_text_outside_root", "Text outside the root element");
-                }
-            }
-            else {
-                frame.text.push(decode(raw, `The content of <${frame.el.qname}>`));
-            }
-            i = lt;
-        }
-        // --- comment ------------------------------------------------------------
-        if (source.startsWith("<!--", i)) {
-            const end = source.indexOf("-->", i + 4);
-            if (end < 0)
-                fail("xml_unterminated_comment", "Unterminated comment");
-            // XML 1.0 forbids the literal string "--" anywhere inside a comment.
-            // "-->" is the only terminator there is, so a comment carrying "--" has
-            // no single reading: a writer who meant it as text and a reader who takes
-            // it as the start of the terminator disagree about where the comment ends
-            // — and therefore about how much of the document is markup. Refusing is
-            // the only answer that cannot silently drop or resurrect content.
-            const body = source.slice(i + 4, end);
-            const dashes = body.indexOf("--");
-            if (dashes >= 0) {
-                fail("xml_bad_comment", `A comment contains "--" ${dashes + 4} characters in, which XML 1.0 does ` +
-                    `not permit anywhere inside a comment`);
-            }
-            // The same rule seen from the other end: a comment may not finish with a
-            // hyphen, because that writes the close as "--->". Single hyphens
-            // separated by other characters are legal and stay legal — "<!-- a- -b -->"
-            // parses.
-            if (body.endsWith("-")) {
-                fail("xml_bad_comment", `A comment ends "--->" ${body.length + 4} characters in; a comment may not ` +
-                    `end with a hyphen`);
-            }
-            // The Char production covers comments too: a control character here is
-            // as ill-formed as one in text, and a reader that skips it would accept a
-            // file that every schema validator refuses.
-            if (ILLEGAL_XML_CHARS.test(body)) {
-                fail("xml_illegal_character", "A comment contains a control character that XML 1.0 does not permit");
-            }
-            i = end + 3;
-            continue;
-        }
-        // --- CDATA --------------------------------------------------------------
-        if (source.startsWith("<![CDATA[", i)) {
-            const end = source.indexOf("]]>", i + 9);
-            if (end < 0)
-                fail("xml_unterminated_cdata", "Unterminated CDATA section");
-            const frame = current();
-            const raw = source.slice(i + 9, end);
-            if (!frame) {
-                fail("xml_text_outside_root", "CDATA outside the root element");
-            }
-            else {
-                // No entity decoding inside CDATA — that is what CDATA means.
-                if (ILLEGAL_XML_CHARS.test(raw)) {
-                    throw new XmlSyntaxError("xml_illegal_character", "A CDATA section contains a control character that XML 1.0 does not permit.");
-                }
-                frame.text.push(raw);
-            }
-            i = end + 3;
-            continue;
-        }
-        // --- processing instruction (including the XML declaration) -------------
-        if (source.startsWith("<?", i)) {
-            const end = source.indexOf("?>", i + 2);
-            if (end < 0) {
-                fail("xml_unterminated_pi", "Unterminated processing instruction");
-            }
-            // Processing instructions are skipped, never acted on. A stylesheet PI in
-            // particular must not cause this library to fetch anything. Skipped is
-            // not unchecked: the same characters are forbidden here as in text.
-            if (ILLEGAL_XML_CHARS.test(source.slice(i + 2, end))) {
-                fail("xml_illegal_character", "A processing instruction contains a control character that XML 1.0 does not permit");
-            }
-            i = end + 2;
-            continue;
-        }
-        // --- other declarations -------------------------------------------------
-        if (source.startsWith("<!", i)) {
-            fail("xml_unsupported_declaration", "Unsupported markup declaration; only comments and CDATA sections are accepted");
-        }
-        // --- end tag ------------------------------------------------------------
-        if (source.startsWith("</", i)) {
-            i += 2;
-            const qname = readName();
-            skipSpace();
-            if (source[i] !== ">")
-                fail("xml_bad_end_tag", "Expected '>' to close an end tag");
-            i += 1;
-            const frame = stack.pop();
-            if (!frame)
-                fail("xml_unbalanced", `Stray end tag </${qname}>`);
-            if (frame.el.qname !== qname) {
-                fail("xml_unbalanced", `End tag </${qname}> does not match the open element <${frame.el.qname}>`);
-            }
-            closeFrame(frame);
-            continue;
-        }
-        // --- start tag ----------------------------------------------------------
-        const [line, column] = position(i);
-        i += 1;
-        const qname = readName();
-        elementCount += 1;
-        // Defence: element-count cap. A flat document of millions of empty
-        // elements passes the depth check and can still exhaust memory.
-        if (elementCount > lim.maxElements) {
-            throw new XmlSecurityError("xml_too_many_elements", `The document has more than ${lim.maxElements} elements. Raise the ` +
-                `maxElements option if a document this large is genuinely expected.`);
-        }
-        const parent = current();
-        const rawAttrs = [];
-        let selfClosing = false;
-        for (;;) {
-            skipSpace();
-            if (i >= source.length)
-                fail("xml_unterminated_tag", "Unterminated start tag");
-            if (source[i] === ">") {
-                i += 1;
-                break;
-            }
-            if (source.startsWith("/>", i)) {
-                selfClosing = true;
-                i += 2;
-                break;
-            }
-            const aname = readName();
-            skipSpace();
-            if (source[i] !== "=") {
-                fail("xml_bad_attribute", `Attribute ${aname} has no value`);
-            }
-            i += 1;
-            skipSpace();
-            const quote = source[i];
-            if (quote !== '"' && quote !== "'") {
-                fail("xml_bad_attribute", `The value of ${aname} is not quoted`);
-            }
-            const end = source.indexOf(quote, i + 1);
-            if (end < 0)
-                fail("xml_bad_attribute", `Unterminated value for ${aname}`);
-            const raw = source.slice(i + 1, end);
-            if (raw.includes("<")) {
-                fail("xml_bad_attribute", `The value of ${aname} contains an unescaped '<'`);
-            }
-            rawAttrs.push({ qname: aname, value: decode(raw, `The value of ${aname}`) });
-            // Defence: per-element attribute cap. Namespace declarations are
-            // attributes, and an element carrying tens of thousands of them builds a
-            // namespace map that every descendant lookup has to walk.
-            if (rawAttrs.length > lim.maxAttributes) {
-                throw new XmlSecurityError("xml_too_many_attributes", `<${qname}> carries more than ${lim.maxAttributes} attributes. Raise the ` +
-                    `maxAttributes option only if a document this unusual is genuinely ` +
-                    `expected; an EN 16931 element carries a handful.`);
-            }
-            i = end + 1;
-        }
-        // Namespace declarations first: an element's own prefix may be declared on
-        // the element itself.
-        let nsMap = parent ? parent.nsMap : emptyNsMap();
-        let declared = false;
-        for (const a of rawAttrs) {
-            const isDefault = a.qname === "xmlns";
-            const isPrefixed = a.qname.startsWith("xmlns:");
-            if (!isDefault && !isPrefixed)
-                continue;
-            if (!declared) {
-                // Chain, do not copy: copying the inherited map on every element that
-                // declares a prefix is quadratic in the number of declarations in
-                // scope. `Object.create` is O(1) and lookups still find inherited
-                // prefixes, because the whole chain is ours and bottoms out at a
-                // null-prototype map.
-                nsMap = Object.create(nsMap);
-                declared = true;
-            }
-            const prefix = isDefault ? "" : a.qname.slice(6);
-            if (isPrefixed && a.value === "") {
-                fail("xml_bad_namespace", `Cannot undeclare the prefix ${prefix}`);
-            }
-            nsMap[prefix] = a.value;
-        }
-        const resolve = (name, forAttribute) => {
-            const colon = name.indexOf(":");
-            if (colon < 0) {
-                // An unprefixed attribute is in no namespace; an unprefixed element is
-                // in the default namespace.
-                return [forAttribute ? "" : (nsMap[""] ?? ""), name];
-            }
-            const prefix = name.slice(0, colon);
-            const local = name.slice(colon + 1);
-            if (prefix === "xmlns")
-                return [XMLNS_URI, local];
-            const uri = nsMap[prefix];
-            if (uri === undefined) {
-                fail("xml_unbound_prefix", `The namespace prefix "${prefix}" is used but never declared`);
-            }
-            return [uri, local];
-        };
-        const [ns, local] = resolve(qname, false);
-        const attributes = rawAttrs.map((a) => {
-            const [ans, alocal] = resolve(a.qname, true);
-            return { namespace: ans, local: alocal, qname: a.qname, value: a.value };
-        });
-        // XML 1.0 well-formedness: no element may carry the same attribute twice.
-        // "The same" is the expanded name — namespace URI plus local name — not the
-        // text as written, so `a:x` and `b:x` are one attribute written twice when
-        // both prefixes are bound to one URI, while the same local name under two
-        // genuinely different namespaces is legal and stays accepted. That is why
-        // this runs here rather than over `rawAttrs`: only after `resolve` is the
-        // namespace context of this element known.
-        //
-        // Accepting a duplicate is not a cosmetic fault. `attr()` returns the first
-        // match, so a document stating two different @currencyID or @schemeID values
-        // on one element would be read by position, and whichever value lost is
-        // gone from the invoice with nothing raised.
-        const seen = new Map();
-        for (const a of attributes) {
-            // NUL separates the two halves unambiguously: it is refused as an illegal
-            // character everywhere else, so it cannot be smuggled into a namespace URI
-            // to forge or hide a collision.
-            const key = `${a.namespace}\u0000${a.local}`;
-            const first = seen.get(key);
-            if (first !== undefined) {
-                fail("xml_duplicate_attribute", first === a.qname
-                    ? `<${qname}> carries the attribute ${a.qname} twice`
-                    : `<${qname}> carries both ${first} and ${a.qname}, which are the same ` +
-                        `attribute once their prefixes are resolved`);
-            }
-            seen.set(key, a.qname);
-        }
-        // The `[n]` index counts preceding siblings of the same name. Counting them
-        // by rescanning `parent.el.children` is O(siblings) per element and so
-        // quadratic over the document: a flat 200,000-element file took over two
-        // minutes, entirely inside this one line, and no cap bounded it because
-        // maxElements is only checked once the element is already being built.
-        // A per-frame tally is O(1) and produces byte-identical paths.
-        let sameName = 0;
-        if (parent) {
-            sameName = parent.counts.get(qname) ?? 0;
-            parent.counts.set(qname, sameName + 1);
-        }
-        const step = sameName > 0 ? `${qname}[${sameName + 1}]` : qname;
-        const path = parent ? `${parent.el.path}/${step}` : `/${qname}`;
-        const el = {
-            namespace: ns,
-            local,
-            qname,
-            path,
-            line,
-            column,
-            attributes,
-            children: [],
-            text: "",
-        };
-        if (parent) {
-            parent.el.children.push(el);
-        }
-        else if (root) {
-            fail("xml_multiple_roots", "A document may have only one root element");
-        }
-        else {
-            root = el;
-        }
-        if (selfClosing) {
-            continue;
-        }
-        const frame = { el, nsMap, counts: new Map(), text: [] };
-        stack.push(frame);
-        // Defence: nesting depth cap. Without it, a few kilobytes of open tags
-        // build a tree hundreds of thousands of levels deep and any recursive
-        // consumer of it overflows the stack.
-        if (stack.length > lim.maxDepth) {
-            throw new XmlSecurityError("xml_too_deep", `The document nests more than ${lim.maxDepth} elements deep. A UBL invoice ` +
-                `nests about eight levels; a document this deep is either broken or ` +
-                `hostile. Raise the maxDepth option only if you know why it is that deep.`);
-        }
-    }
-    if (stack.length > 0) {
-        throw new XmlSyntaxError("xml_unbalanced", `The document ends while <${stack[stack.length - 1].el.qname}> is still open.`);
-    }
-    if (!root) {
-        throw new XmlSyntaxError("xml_no_root", "The document contains no root element.");
-    }
-    return root;
-}
-function closeFrame(frame) {
-    const text = frame.text.join("");
-    if (frame.el.children.length > 0) {
-        if (text.trim() !== "") {
-            throw new XmlSyntaxError("xml_mixed_content", `<${frame.el.qname}> holds both child elements and text ("${text.trim().slice(0, 40)}"). ` +
-                `UBL never mixes the two, so this parser refuses the document rather than ` +
-                `guessing which of the two carries the value.`);
-        }
-        frame.el.text = "";
-        return;
-    }
-    frame.el.text = text;
-}
-/**
- * The five predefined entities, and nothing else.
- *
- * Null-prototype on purpose. As an object literal this table also answered to
- * every member of `Object.prototype`: `&constructor;` resolved to the `Object`
- * constructor and was substituted into the document as the string
- * `"function Object() { [native code] }"`, so an invoice number written
- * `&constructor;` parsed, validated and was billed for without a single
- * finding. `&toString;`, `&valueOf;` and `&__proto__;` did the same. Every one
- * of those names is short enough to pass the length guard in `decodeEntities`.
- */
-const PREDEFINED = Object.assign(Object.create(null), {
-    amp: "&",
-    lt: "<",
-    gt: ">",
-    quot: '"',
-    apos: "'",
-});
-/**
- * Decode the five predefined entities and numeric character references.
- *
- * Every other entity reference is refused. Custom entities are what the
- * billion-laughs attack expands, and external entities are what XXE
- * dereferences; neither is decoded here, and neither is quietly dropped —
- * dropping one would change the text of a tax document without saying so.
- *
- * Numeric character references are safe to expand: each produces exactly one
- * character and cannot refer to another reference, so there is no expansion to
- * run away.
- */
-function decodeEntities(raw, where) {
-    let out = "";
-    let i = 0;
-    for (;;) {
-        const amp = raw.indexOf("&", i);
-        if (amp < 0) {
-            out += raw.slice(i);
-            return out;
-        }
-        out += raw.slice(i, amp);
-        const semi = raw.indexOf(";", amp + 1);
-        // A reference longer than this is not one of ours and not a code point.
-        if (semi < 0 || semi - amp > 12) {
-            throw new XmlSyntaxError("xml_bare_ampersand", `${where} contains a bare "&". In XML it must be written "&amp;".`);
-        }
-        const name = raw.slice(amp + 1, semi);
-        out += resolveEntity(name, where);
-        i = semi + 1;
-    }
-}
-function resolveEntity(name, where) {
-    // Own-property check as well as the null prototype: two independent guards,
-    // because getting this wrong substitutes attacker-chosen text into a tax
-    // document without raising anything.
-    if (Object.hasOwn(PREDEFINED, name))
-        return PREDEFINED[name];
-    if (name.startsWith("#")) {
-        const hex = name[1] === "x" || name[1] === "X";
-        const digits = hex ? name.slice(2) : name.slice(1);
-        if (digits === "" || !/^[0-9a-fA-F]+$/.test(digits) || (!hex && !/^[0-9]+$/.test(digits))) {
-            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the malformed character reference "&${name};".`);
-        }
-        const code = Number.parseInt(digits, hex ? 16 : 10);
-        if (!Number.isFinite(code) ||
-            code > 0x10ffff ||
-            (code >= 0xd800 && code <= 0xdfff)) {
-            throw new XmlSyntaxError("xml_bad_character_reference", `${where} contains the character reference "&${name};", which is not a ` +
-                `valid Unicode code point.`);
-        }
-        return String.fromCodePoint(code);
-    }
-    throw new XmlSecurityError("xml_entity_forbidden", `${where} refers to the entity "&${name};". Only the five predefined entities ` +
-        `(&amp; &lt; &gt; &quot; &apos;) and numeric character references are decoded. ` +
-        `Custom entities are refused because expanding them is how the billion-laughs ` +
-        `denial of service works, and because an external entity would read a local ` +
-        `file or make a network request (the XXE attack).`);
-}
-/** First child element with this namespace and local name. */
-function firstChild(el, namespace, local) {
-    return el.children.find((c) => c.local === local && c.namespace === namespace);
-}
-/** Every child element with this namespace and local name, in document order. */
-function xml_parse_childrenNamed(el, namespace, local) {
-    return el.children.filter((c) => c.local === local && c.namespace === namespace);
-}
-
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/xml-reader.js
 /**
  * Bookkeeping shared by the two document readers.
@@ -66755,7 +67663,7 @@ class TreeReader {
     /** Every matching child, each marked as read. */
     leafAll(parent, namespace, local) {
         this.visited.add(parent);
-        const found = xml_parse_childrenNamed(parent, namespace, local);
+        const found = childrenNamed(parent, namespace, local);
         for (const el of found) {
             this.consumed.add(el);
             if (el.children.length > 0)
@@ -66774,7 +67682,7 @@ class TreeReader {
     /** Every matching child, each marked as walked into. */
     groupAll(parent, namespace, local) {
         this.visited.add(parent);
-        const found = xml_parse_childrenNamed(parent, namespace, local);
+        const found = childrenNamed(parent, namespace, local);
         for (const el of found)
             this.visited.add(el);
         return found;
@@ -71309,7 +72217,122 @@ const EAS_SCHEME_CODES = Object.freeze([
 /** Membership lookup for {@link EAS_SCHEME_CODES}. */
 const EAS_SCHEME_CODES_SET = new Set(EAS_SCHEME_CODES);
 
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/units.js
+/**
+ * Unit words to UN/ECE Recommendation 20 codes.
+ *
+ * `BR-CL-23` refuses a unit of measure (BT-130) that is not a Rec 20 code, and
+ * the values it refuses are almost always words: "Stk", "Std.", "hours",
+ * "pièces". This table says which code such a word means, so the finding can
+ * hand back the code instead of a list to search, and a caller can convert its
+ * own units before they reach an invoice.
+ *
+ * **H87 or C62.** Both are valid Rec 20 codes and every validator accepts
+ * either. Rec 20 names H87 "piece" and C62 "one", a unit of count of anything.
+ * This table follows the split XRechnung practice makes: "Stück", "piece" and
+ * "pièce" are H87; "Einheit", "unit" and "unité", a generic unit, are C62.
+ *
+ * Deliberately small and literal. It holds words that mean one unit and
+ * nothing else, in English, German and French, with their plurals written out
+ * rather than derived by stripping an ending: a suffix rule reads the English
+ * "tags" as the German "Tag", a day. An abbreviation that could be read two
+ * ways ("d", "mo", "ton", whose US sense is not the tonne) is not in it,
+ * because a wrong code is worse than none.
+ */
+/** The Rec 20 name of each code this table resolves to. */
+const UNIT_NAMES = Object.freeze({
+    H87: "piece",
+    C62: "one",
+    HUR: "hour",
+    DAY: "day",
+    WEE: "week",
+    MON: "month",
+    ANN: "year",
+    MIN: "minute [unit of time]",
+    KGM: "kilogram",
+    GRM: "gram",
+    TNE: "tonne (metric ton)",
+    KMT: "kilometre",
+    MTR: "metre",
+    CMT: "centimetre",
+    MMT: "millimetre",
+    MTK: "square metre",
+    MTQ: "cubic metre",
+    LTR: "litre",
+    KWH: "kilowatt hour",
+    LS: "lump sum",
+});
+/** The words for each code, lower-cased, singular and plural. */
+const WORDS = {
+    H87: ["stk", "stck", "st", "stück", "stücke", "stueck", "stuecke", "pc", "pcs", "pce", "piece", "pieces", "pièce", "pièces"],
+    C62: ["einheit", "einheiten", "unit", "units", "unité", "unités"],
+    HUR: ["std", "stunde", "stunden", "h", "hr", "hrs", "hour", "hours", "heure", "heures"],
+    DAY: ["tag", "tage", "day", "days", "jour", "jours"],
+    WEE: ["woche", "wochen", "week", "weeks", "wk", "wks", "semaine", "semaines"],
+    MON: ["monat", "monate", "month", "months", "mois"],
+    ANN: ["jahr", "jahre", "year", "years", "yr", "yrs", "an", "ans", "année", "années"],
+    MIN: ["min", "mins", "minute", "minuten", "minutes"],
+    KGM: ["kg", "kgs", "kilogramm", "kilogram", "kilograms", "kilogramme", "kilogrammes"],
+    GRM: ["g", "gramm", "gram", "grams", "gramme", "grammes"],
+    TNE: ["t", "tonne", "tonnen", "tonnes"],
+    KMT: ["km", "kms", "kilometer", "kilometers", "kilometre", "kilometres", "kilomètre", "kilomètres"],
+    MTR: ["m", "meter", "meters", "metre", "metres", "mètre", "mètres"],
+    CMT: ["cm", "zentimeter", "centimeter", "centimeters", "centimetre", "centimetres", "centimètre", "centimètres"],
+    MMT: ["mm", "millimeter", "millimeters", "millimetre", "millimetres", "millimètre", "millimètres"],
+    MTK: ["m2", "m²", "qm", "sqm", "quadratmeter", "square metre", "square metres", "square meter", "square meters"],
+    MTQ: ["m3", "m³", "cbm", "kubikmeter", "cubic metre", "cubic metres", "cubic meter", "cubic meters"],
+    LTR: ["l", "liter", "liters", "litre", "litres"],
+    KWH: ["kwh"],
+    LS: ["pauschal", "pauschale", "psch", "flat", "flat rate", "lump sum", "forfait"],
+};
+/** Word, and each code itself lower-cased, to code. */
+const ALIASES = (() => {
+    const map = new Map();
+    for (const [code, words] of Object.entries(WORDS)) {
+        map.set(code.toLowerCase(), code);
+        for (const word of words)
+            map.set(word, code);
+    }
+    return map;
+})();
+/** A plural written in brackets after the word: "piece(s)", "Stunde(n)", "Einheit(en)". */
+const BRACKETED_PLURAL = /\((?:s|e|n|en|es)\)(?=[\s.,;:!?]*$)/;
+/** Punctuation and whitespace around a unit word: "Std.", "(Stk)", "pcs,". */
+const EDGE_PUNCTUATION = /^[\s.,;:!?'"()[\]{}]+|[\s.,;:!?'"()[\]{}]+$/g;
+/**
+ * The UN/ECE Recommendation 20 code a unit word stands for, or undefined when
+ * the word is not one this table knows.
+ *
+ * Case-insensitive. Surrounding punctuation and whitespace are ignored, and so
+ * is a plural written in brackets ("Stunde(n)", "piece(s)"); written-out
+ * plurals are in the table ("Stunden", "units", "heures"). The code itself
+ * resolves too, in any case: "hur" is HUR.
+ *
+ * ```ts
+ * resolveUnitCode("Stk.")     // { code: "H87", name: "piece" }
+ * resolveUnitCode("Stunden")  // { code: "HUR", name: "hour" }
+ * resolveUnitCode("m²")       // { code: "MTK", name: "square metre" }
+ * resolveUnitCode("Palette")  // undefined
+ * ```
+ */
+function resolveUnitCode(text) {
+    if (typeof text !== "string")
+        return undefined;
+    const word = text
+        .normalize("NFC")
+        .trim()
+        .toLowerCase()
+        .replace(BRACKETED_PLURAL, "")
+        .replace(EDGE_PUNCTUATION, "")
+        .replace(/\s+/g, " ");
+    const code = ALIASES.get(word);
+    return code === undefined ? undefined : { code, name: UNIT_NAMES[code] };
+}
+/** Every code {@link resolveUnitCode} can return, for the test that checks each is in the Rec 20 list. */
+const RESOLVABLE_UNIT_CODES = Object.freeze(Object.keys(UNIT_NAMES));
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-codelists.js
+
 
 
 
@@ -71328,7 +72351,7 @@ const EAS_SCHEME_CODES_SET = new Set(EAS_SCHEME_CODES);
  * ConnectingEurope/eInvoicing-EN16931 @ validation-1.3.16.
  */
 /** Codes worth naming in a message, so the fix is actionable without the spec. */
-const COMMON_UNITS = '"C62" one/piece, "HUR" hour, "DAY" day, "MON" month, "ANN" year, "KGM" kilogram, "MTR" metre, "MTK" square metre, "LTR" litre, "KWH" kilowatt hour, "E48" service unit, "P1" percent';
+const COMMON_UNITS = '"H87" piece, "C62" one (a unit of anything), "HUR" hour, "DAY" day, "MON" month, "ANN" year, "KGM" kilogram, "MTR" metre, "MTK" square metre, "LTR" litre, "KWH" kilowatt hour, "LS" lump sum, "E48" service unit, "P1" percent';
 const COMMON_CURRENCIES = '"EUR", "USD", "GBP", "CHF", "SEK", "DKK", "NOK", "PLN"';
 /** A short, deterministic sample of a list, for messages. */
 const sample = (codes, n) => codes.slice(0, n).map((c) => `"${c}"`).join(", ");
@@ -71573,13 +72596,22 @@ const codelistRules = [
             const code = normalise(line.unitCode);
             if (UNIT_CODES_SET.has(code))
                 continue;
+            // A unit word this package can name the code for ("Stk", "hours",
+            // "pièces"): the fix and the example carry that code rather than a list
+            // to search. units.ts has the table, and why "Stück" is H87 and not C62.
+            const resolved = resolveUnitCode(code);
+            const quantity = typeof line.quantity === "number" && Number.isFinite(line.quantity) ? line.quantity : 10;
             out.push({
                 rule: "BR-CL-23",
                 field: "BT-130",
                 severity: "fatal",
                 message: `Line ${index + 1} has a unit of measure code (BT-130) of "${code}", which is not in UN/ECE Recommendation 20 (with the Rec 21 extension).${wrongCaseHint(line.unitCode, UNIT_CODES_SET)} The unit is a code, not a word: "hours", "Stk", "each" and "pcs" are all rejected, and so is a valid code in the wrong case.`,
-                fix: `Set line.unitCode to the Rec 20 code. The ones you will actually use: ${COMMON_UNITS}. The full list is large — if you cannot find your unit, "C62" (one/piece) with the unit named in the item description is the conventional fallback.`,
-                example: `"quantity": 10, "unitCode": "HUR"`,
+                fix: resolved
+                    ? `Set line.unitCode to "${resolved.code}" (Rec 20: "${resolved.name}"), which is what "${code}" stands for.${resolved.code === "H87" || resolved.code === "C62"
+                        ? ' "H87" (piece) and "C62" (one) are both valid for a count; this package reads pieces as H87 and a generic unit as C62.'
+                        : ""} resolveUnitCode() in this package does the same for the common English, German and French unit words, so a unit your system stores as a word can be converted before it reaches the invoice.`
+                    : `Set line.unitCode to the Rec 20 code. The ones you will actually use: ${COMMON_UNITS}. The full list is large — if you cannot find your unit, "C62" (one) with the unit named in the item description is the conventional fallback.`,
+                example: `"quantity": ${resolved ? quantity : 10}, "unitCode": "${resolved ? resolved.code : "HUR"}"`,
                 xpath: `/ubl:Invoice/cac:InvoiceLine[${index + 1}]/cbc:InvoicedQuantity/@unitCode`,
                 docsUrl: `${DOCS}/BR-CL-23`,
             });
@@ -72638,6 +73670,974 @@ const decimalRules = [
     },
 ];
 
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/payment-means.js
+
+/**
+ * The payment means code (BT-81), inferred from the payment account.
+ *
+ * BR-49 (and XRechnung's BR-DE-1) make a means code mandatory, and a caller
+ * who has an IBAN has no reason to know that UNTDID 4461 wants "58" for it.
+ * The account already says what kind of payment it is, so when the code is
+ * left out it is filled in from the account, and reported, and never when it
+ * is stated.
+ *
+ * Only a code that is *absent* (`undefined`) is inferred. An empty string is
+ * an explicit value, as it is everywhere in this model, and BR-49 judges it:
+ * that is also what a document read from XML carries when its payment means
+ * code is missing, so `validate()` on a file is untouched by this module.
+ */
+/**
+ * IBAN country prefixes in the SEPA schemes' geographical scope, from the
+ * IBAN column of EPC409-09 "EPC list of Countries in the SEPA Schemes'
+ * Geographical Scope", version 8.0, issued 24 December 2025. It is a list of
+ * prefixes rather than countries because territories bank under their
+ * parent's: Åland under FI, the French overseas departments and collectivities
+ * under FR, Guernsey, Jersey and the Isle of Man under GB. Albania, Moldova,
+ * Montenegro and North Macedonia joined with an operational readiness date of
+ * 5 October 2025, Serbia with one of May 2026.
+ */
+const SEPA_IBAN_COUNTRIES = new Set([
+    "AD", "AL", "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES",
+    "FI", "FR", "GB", "GI", "GR", "HR", "HU", "IE", "IS", "IT", "LI", "LT",
+    "LU", "LV", "MC", "MD", "ME", "MK", "MT", "NL", "NO", "PL", "PT", "RO",
+    "RS", "SE", "SI", "SK", "SM", "VA",
+]);
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const given = (value) => value !== undefined && value !== null && String(value).trim() !== "";
+/** The two-letter country prefix of an IBAN, or "" when it has none. */
+const ibanCountry = (iban) => {
+    if (typeof iban !== "string")
+        return "";
+    const prefix = iban.replace(/\s+/g, "").slice(0, 2).toUpperCase();
+    return /^[A-Z]{2}$/.test(prefix) ? prefix : "";
+};
+/**
+ * The code the payment instructions imply, or undefined when there is nothing
+ * to infer: no payment group, a stated code, or neither a mandate nor an IBAN.
+ *
+ * A mandate reference means the seller collects, so it decides first: `59`,
+ * SEPA direct debit, which exists in euro only, or `49`, direct debit, for
+ * any other currency or a debited account outside SEPA. Otherwise an IBAN
+ * means the buyer pays: `58`, SEPA credit transfer, in euro to a SEPA
+ * account, or `30`, credit transfer, for everything else.
+ */
+function payment_means_inferPaymentMeans(input) {
+    if (!isObject(input))
+        return undefined;
+    const payment = input.payment;
+    if (!isObject(payment) || payment.meansCode !== undefined)
+        return undefined;
+    const currency = typeof input.currency === "string" ? input.currency.trim().toUpperCase() : "";
+    const debit = payment.directDebit;
+    if (isObject(debit) && given(debit.mandateReference)) {
+        const country = ibanCountry(debit.debitedAccount);
+        const sepa = currency === "EUR" && (country === "" || SEPA_IBAN_COUNTRIES.has(country));
+        return { code: sepa ? "59" : "49", currency, country, mandate: true };
+    }
+    if (given(payment.iban)) {
+        const country = ibanCountry(payment.iban);
+        const sepa = currency === "EUR" && SEPA_IBAN_COUNTRIES.has(country);
+        return { code: sepa ? "58" : "30", currency, country, mandate: false };
+    }
+    return undefined;
+}
+/** The input with the inferred code written in. The same object when nothing is inferred. */
+function payment_means_expandPaymentMeans(input) {
+    const inference = payment_means_inferPaymentMeans(input);
+    if (!inference)
+        return input;
+    return { ...input, payment: { ...input.payment, meansCode: inference.code } };
+}
+const MEANS_NAMES = {
+    "58": "SEPA credit transfer",
+    "30": "credit transfer",
+    "59": "SEPA direct debit",
+    "49": "direct debit",
+};
+/** Why the inference came out as it did, in one clause. */
+function because(inference) {
+    const { code, currency, country, mandate } = inference;
+    const shown = currency === "" ? "not stated" : currency;
+    if (mandate) {
+        if (code === "59") {
+            return `the payment instructions carry a direct-debit mandate reference (BT-89) and the invoice is in euro${country === "" ? "" : `, debiting an account in ${country}, which takes part in the SEPA scheme`}`;
+        }
+        return `the payment instructions carry a direct-debit mandate reference (BT-89), but ${currency !== "EUR"
+            ? `the invoice currency (BT-5) is ${shown}, and SEPA direct debits are in euro only`
+            : `the debited account's country, ${country}, is not in the SEPA scheme`}`;
+    }
+    if (code === "58") {
+        return `there is an IBAN (BT-84), the invoice currency (BT-5) is EUR, and the IBAN's country, ${country}, takes part in the SEPA scheme`;
+    }
+    return `there is an IBAN (BT-84), but ${currency !== "EUR"
+        ? `the invoice currency (BT-5) is ${shown}, and SEPA credit transfers are in euro only`
+        : country === ""
+            ? "it does not start with a country code"
+            : `its country, ${country}, is not in the SEPA scheme`}`;
+}
+/** The `ATW-PAYMENT-MEANS-INFERRED` note for an inference. */
+function payment_means_paymentMeansNote(input, inference) {
+    const { code } = inference;
+    return {
+        rule: "ATW-PAYMENT-MEANS-INFERRED",
+        field: "BT-81",
+        severity: "information",
+        message: `payment.meansCode was not given, so the payment means type code (BT-81) was set to "${code}", ${MEANS_NAMES[code]}: ${because(inference)}. This is the code validateInput judged and the generators write.`,
+        fix: "Nothing needs fixing. If the buyer should pay another way, state payment.meansCode yourself; a stated code is never replaced.",
+        example: inference.mandate
+            ? `"payment": { "meansCode": "${code}", "directDebit": { "mandateReference": "MANDAT-2026-01" } }`
+            : `"payment": { "meansCode": "${code}", "iban": "DE02120300000000202051" }`,
+        xpath: `${xpathRoot(input)}/cac:PaymentMeans/cbc:PaymentMeansCode`,
+        docsUrl: "https://github.com/attestwire/en16931#not-implemented-yet",
+    };
+}
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/vat-scenarios.js
+/**
+ * VAT scenarios: the business fact in, the EN 16931 codes out.
+ *
+ * VAT category and exemption logic is a recurring theme in the CEN and KoSIT
+ * rule trackers, and the reason is that the input asks the wrong question. A
+ * developer knows that the customer is a business in France; the standard
+ * wants `AE`, `VATEX-EU-AE` and "Autoliquidation", and the rules that check
+ * them (BR-AE-02, -05, -10) only say afterwards which of the three was wrong. A scenario is asked for instead, and everything below derives the
+ * codes from it. `validateInput` and both generators run this first, so a
+ * scenario and the codes it stands for produce the same document, byte for
+ * byte.
+ *
+ * Nothing here is a tax engine. The caller decides which scenario applies;
+ * this module only refuses to let a correct decision be encoded wrongly.
+ * Rates are never guessed: `"domestic"` takes the caller's rate or reports
+ * that there is none.
+ *
+ * WHERE EACH CODE AND TEXT COMES FROM
+ *
+ * Cross-border scenarios (the codes are the CEF VATEX list's own, and its
+ * descriptions say "Only use with VAT category code AE / K / G"):
+ *   - Reverse charge: "Reverse charge" is the mention Article 226(11a) of
+ *     Directive 2006/112/EC prescribes; "Steuerschuldnerschaft des
+ *     Leistungsempfängers" is § 14a Abs. 5 UStG's; "Autoliquidation" is
+ *     article 242 nonies A, I-13° of annexe II to the CGI.
+ *   - Intra-community supply and export: an exempt supply's invoice has to
+ *     say that it is exempt (§ 14 Abs. 4 Satz 1 Nr. 8 UStG) or cite the
+ *     exempting provision (article 242 nonies A, I-12° annexe II CGI:
+ *     article 262 ter I for intra-community supplies, 262 I for exports). The
+ *     English texts are the standard ones BR-IC-10 and BR-G-10 name, and the
+ *     same as `DEFAULT_EXEMPTION_REASONS`.
+ *
+ * Small-business exemption, established 2026-09-25 (the README's "Say what
+ * happened, not the code" section records the same):
+ *   - Germany. Category E, rate 0, no BT-121 code, because the VATEX list has
+ *     no German code. Category E is KoSIT's own answer: XRechnung change
+ *     request #32, implemented in XRechnung 1.2, specifies BT-118 "E", BT-119
+ *     0 and a BT-120 text for § 19 UStG
+ *     (https://projekte.kosit.org/xrechnung/xrechnung/-/issues/32). Since
+ *     1 January 2025 § 19 Abs. 1 UStG says outright that the turnover "ist
+ *     steuerfrei", so E (exempt) is also what the law says. The text follows
+ *     the most authoritative source on invoice wording rather than KoSIT's
+ *     2018 wording ("Kein Ausweis von Umsatzsteuer, da Kleinunternehmer gemäß
+ *     § 19 UStG") or the common "Gemäß § 19 UStG wird keine Umsatzsteuer
+ *     berechnet.", both written for the old regime, in which the tax was
+ *     merely not levied: § 34a Satz 1 Nr. 5 UStDV requires a note "dass für
+ *     die Lieferung oder sonstige Leistung die Steuerbefreiung für
+ *     Kleinunternehmer gilt", and the BMF letter of 18 March 2025 (III C 3 -
+ *     S 7360/00027/044/105, UStAE 14.7a Abs. 1) accepts any wording that
+ *     names that exemption unambiguously. The text below names it in the
+ *     regulation's own words.
+ *   - France. Category E, `VATEX-FR-FRANCHISE` ("France domestic VAT franchise
+ *     in base" in the CEF VATEX list, which this build ships for BR-CL-22),
+ *     and the mention BOFiP BOI-TVA-DECLA-40-10-20 § 50 prescribes, "TVA non
+ *     applicable, article 293 B du CGI". No French rule ties the code to a
+ *     category (the FNFE-MPE BR-FR schematrons do not mention it), so EN
+ *     16931 decides: BR-Z-10 forbids any exemption reason on Z, and BR-O-10
+ *     requires O's to mean "not subject to VAT", which leaves E. One vendor's
+ *     documentation maps the franchise to Z; carrying the code there fails
+ *     BR-Z-10, so that is not followed.
+ *   - Anywhere else: refused with `ATW-VAT-SCENARIO-UNSUPPORTED`, because each
+ *     member state's scheme has its own wording, and guessing it is how a
+ *     wrong invoice gets written with confidence.
+ */
+/** The five scenarios, in the order the README lists them. */
+const VAT_SCENARIOS = Object.freeze([
+    "domestic",
+    "intra-eu-goods",
+    "intra-eu-services",
+    "export",
+    "small-business-exemption",
+]);
+const SCENARIO_SET = new Set(VAT_SCENARIOS);
+/** True for one of the five scenario names, exactly as written. */
+const isVatScenario = (value) => typeof value === "string" && SCENARIO_SET.has(value);
+/** The VAT category each scenario stands for. */
+const SCENARIO_CATEGORY = {
+    domestic: "S",
+    "intra-eu-goods": "K",
+    "intra-eu-services": "AE",
+    export: "G",
+    "small-business-exemption": "E",
+};
+/** What each scenario means, for messages. */
+const SCENARIO_MEANING = {
+    domestic: "a taxed supply inside the seller's own country",
+    "intra-eu-goods": "goods sent to a VAT-registered business in another EU member state",
+    "intra-eu-services": "a service to a business in another EU member state, which accounts for the VAT itself",
+    export: "goods leaving the EU",
+    "small-business-exemption": "the seller's small-business exemption",
+};
+/**
+ * Categories whose rate is fixed at zero (BR-IC-05, BR-AE-05, BR-G-05,
+ * BR-E-05). A scenario for one of them writes `vatRate: 0` when the item
+ * states none; a stated rate is kept, and the `-05` rule judges it.
+ */
+const ZERO_RATED = new Set(["K", "AE", "G", "E"]);
+/** German for a seller in DE or AT, French for FR, English otherwise. */
+const scenarioLanguage = (sellerCountry) => sellerCountry === "DE" || sellerCountry === "AT"
+    ? "de"
+    : sellerCountry === "FR"
+        ? "fr"
+        : "en";
+const LANGUAGE_NAMES = {
+    de: "German",
+    fr: "French",
+    en: "English",
+};
+/** The three cross-border scenarios' codes and texts. Sources: module comment. */
+const CROSS_BORDER = {
+    "intra-eu-goods": {
+        code: "VATEX-EU-IC",
+        text: {
+            en: "Intra-Community supply",
+            de: "Steuerfreie innergemeinschaftliche Lieferung",
+            fr: "Exonération de TVA, article 262 ter I du CGI",
+        },
+    },
+    "intra-eu-services": {
+        code: "VATEX-EU-AE",
+        text: {
+            en: "Reverse charge",
+            de: "Steuerschuldnerschaft des Leistungsempfängers",
+            fr: "Autoliquidation",
+        },
+    },
+    export: {
+        code: "VATEX-EU-G",
+        text: {
+            en: "Export outside the EU",
+            de: "Steuerfreie Ausfuhrlieferung",
+            fr: "Exonération de TVA, article 262 I du CGI",
+        },
+    },
+};
+/**
+ * The small-business exemptions this build implements, by the seller's
+ * country (BT-40). Sources and the reasoning behind each: module comment.
+ */
+const SMALL_BUSINESS_EXEMPTIONS = {
+    DE: {
+        text: "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG",
+        scheme: "§ 19 UStG",
+    },
+    FR: {
+        code: "VATEX-FR-FRANCHISE",
+        text: "TVA non applicable, article 293 B du CGI",
+        scheme: "the franchise en base, article 293 B du CGI",
+    },
+};
+/**
+ * The exemption a scenario states for a seller in `sellerCountry`.
+ * Undefined for `"domestic"`, whose category S carries none (BR-S-10), and for
+ * a small business outside the countries above.
+ */
+function scenarioExemption(scenario, sellerCountry) {
+    if (scenario === "domestic")
+        return undefined;
+    if (scenario === "small-business-exemption") {
+        const exemption = SMALL_BUSINESS_EXEMPTIONS[sellerCountry];
+        if (!exemption)
+            return undefined;
+        return exemption.code === undefined
+            ? { text: exemption.text }
+            : { code: exemption.code, text: exemption.text };
+    }
+    const entry = CROSS_BORDER[scenario];
+    return { code: entry.code, text: entry.text[scenarioLanguage(sellerCountry)] };
+}
+const vat_scenarios_isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+/** Null and undefined both mean "not stated", as JSON callers use them. */
+const stated = (value) => value !== undefined && value !== null;
+const carriesScenario = (entry) => vat_scenarios_isObject(entry) && entry.vatScenario !== undefined;
+/** True when the input, one of its lines or one of its allowances or charges carries `vatScenario`. */
+function hasVatScenario(input) {
+    if (!vat_scenarios_isObject(input))
+        return false;
+    if (input.vatScenario !== undefined)
+        return true;
+    for (const list of [input.lines, input.allowances, input.charges]) {
+        if (Array.isArray(list) && list.some(carriesScenario))
+            return true;
+    }
+    return false;
+}
+const normaliseCountry = (value) => typeof value === "string" ? value.trim().toUpperCase() : "";
+/**
+ * Work out what the scenarios on this input say, item by item, without writing
+ * anything. Never throws: anything that is not the shape it expects is left
+ * for the rules to report.
+ */
+function planVatScenarios(input) {
+    const facts = input;
+    const sellerCountry = normaliseCountry(facts?.seller?.address?.countryCode);
+    const plan = {
+        present: hasVatScenario(facts),
+        invoiceScenario: vat_scenarios_isObject(facts) ? facts.vatScenario : undefined,
+        sellerCountry,
+        language: scenarioLanguage(sellerCountry),
+        items: [],
+        fills: {},
+    };
+    if (!plan.present || !vat_scenarios_isObject(facts))
+        return plan;
+    const invoiceGiven = stated(plan.invoiceScenario);
+    const lists = [
+        ["line", facts.lines],
+        ["allowance", facts.allowances],
+        ["charge", facts.charges],
+    ];
+    for (const [kind, list] of lists) {
+        if (!Array.isArray(list))
+            continue;
+        list.forEach((entry, index) => {
+            if (!vat_scenarios_isObject(entry))
+                return;
+            const ownGiven = stated(entry.vatScenario);
+            if (!ownGiven && !invoiceGiven)
+                return;
+            const scenario = ownGiven ? entry.vatScenario : plan.invoiceScenario;
+            const item = {
+                kind,
+                index,
+                scenario,
+                inherited: !ownGiven,
+                outcome: "unknown",
+                rateFilled: false,
+            };
+            const statedCategory = entry.vatCategory;
+            if (stated(statedCategory))
+                item.stated = statedCategory;
+            if (isVatScenario(scenario)) {
+                const category = SCENARIO_CATEGORY[scenario];
+                item.category = category;
+                if (scenario === "small-business-exemption" &&
+                    SMALL_BUSINESS_EXEMPTIONS[sellerCountry] === undefined) {
+                    item.outcome = "unsupported";
+                }
+                else if (!stated(statedCategory)) {
+                    item.outcome = "applied";
+                }
+                else if (statedCategory === category) {
+                    item.outcome = "agrees";
+                }
+                else {
+                    item.outcome = item.inherited ? "overridden" : "conflict";
+                }
+                if ((item.outcome === "applied" || item.outcome === "agrees") &&
+                    ZERO_RATED.has(category) &&
+                    entry.vatRate === undefined) {
+                    item.rateFilled = true;
+                }
+            }
+            plan.items.push(item);
+        });
+    }
+    // BT-120 and BT-121 are per breakdown group, that is per category, so a
+    // category's exemption is filled once, from the scenario that produced it.
+    // Each half is filled only where the caller left it out: a stated code or
+    // text always wins. A stated code other than the scenario's means the caller
+    // has a different exemption in mind, so the scenario's text is not put
+    // beside it either.
+    const codes = facts.vatExemptionReasonCodes;
+    const texts = facts.vatExemptionReasons;
+    const codesWritable = codes === undefined || vat_scenarios_isObject(codes);
+    const textsWritable = texts === undefined || vat_scenarios_isObject(texts);
+    for (const item of plan.items) {
+        if (item.outcome !== "applied" && item.outcome !== "agrees")
+            continue;
+        const category = item.category;
+        if (category in plan.fills)
+            continue;
+        const exemption = scenarioExemption(item.scenario, sellerCountry);
+        if (!exemption)
+            continue;
+        const statedCode = vat_scenarios_isObject(codes) ? codes[category] : undefined;
+        const statedText = vat_scenarios_isObject(texts) ? texts[category] : undefined;
+        const fill = {};
+        if (exemption.code !== undefined && statedCode === undefined && codesWritable) {
+            fill.code = exemption.code;
+        }
+        const codeAgrees = statedCode === undefined ||
+            (typeof statedCode === "string" &&
+                exemption.code !== undefined &&
+                statedCode.trim().toUpperCase() === exemption.code);
+        if (statedText === undefined && codeAgrees && textsWritable)
+            fill.text = exemption.text;
+        if (fill.code !== undefined || fill.text !== undefined)
+            plan.fills[category] = fill;
+    }
+    return plan;
+}
+// ---------------------------------------------------------------------------
+// Writing the explicit invoice
+// ---------------------------------------------------------------------------
+const itemKey = (kind, index) => `${kind}:${index}`;
+/** True when the scenario's codes go on this item. */
+const takesScenario = (item) => item.outcome === "applied" || item.outcome === "agrees";
+function rewriteEntry(entry, item) {
+    if (!vat_scenarios_isObject(entry))
+        return entry;
+    if (entry.vatScenario === undefined && (!item || !takesScenario(item)))
+        return entry;
+    const { vatScenario: _dropped, ...rest } = entry;
+    if (!item || !takesScenario(item))
+        return rest;
+    const next = { ...rest, vatCategory: item.category };
+    if (item.rateFilled)
+        next.vatRate = 0;
+    return next;
+}
+/** The input with the plan written into it. The same object when there is nothing to write. */
+function explicitInvoice(input, plan) {
+    if (!plan.present || !vat_scenarios_isObject(input))
+        return input;
+    const facts = input;
+    const items = new Map(plan.items.map((item) => [itemKey(item.kind, item.index), item]));
+    const rewrite = (kind, list) => Array.isArray(list)
+        ? list.map((entry, index) => rewriteEntry(entry, items.get(itemKey(kind, index))))
+        : list;
+    const { vatScenario: _dropped, ...rest } = facts;
+    const out = { ...rest, lines: rewrite("line", facts.lines) };
+    if (facts.allowances !== undefined)
+        out.allowances = rewrite("allowance", facts.allowances);
+    if (facts.charges !== undefined)
+        out.charges = rewrite("charge", facts.charges);
+    const codes = {};
+    const texts = {};
+    for (const [category, fill] of Object.entries(plan.fills)) {
+        if (fill?.code !== undefined)
+            codes[category] = fill.code;
+        if (fill?.text !== undefined)
+            texts[category] = fill.text;
+    }
+    if (Object.keys(codes).length > 0) {
+        out.vatExemptionReasonCodes = { ...facts.vatExemptionReasonCodes, ...codes };
+    }
+    if (Object.keys(texts).length > 0) {
+        out.vatExemptionReasons = { ...facts.vatExemptionReasons, ...texts };
+    }
+    return out;
+}
+/**
+ * The explicit invoice a scenario input stands for, and nothing else. This is
+ * what the generators call: the same writing as `applyVatScenarios`, without
+ * building the notes they would throw away.
+ */
+function expandVatScenarios(input) {
+    if (!hasVatScenario(input))
+        return input;
+    return explicitInvoice(input, planVatScenarios(input));
+}
+// ---------------------------------------------------------------------------
+// Notes: what was filled in, as `information` findings
+// ---------------------------------------------------------------------------
+const vat_scenarios_LIMITS_DOCS = "https://github.com/attestwire/en16931#not-implemented-yet";
+const CATEGORY_LABELS = {
+    S: "standard rated",
+    K: "intra-community supply",
+    AE: "reverse charge",
+    G: "export outside the EU",
+    E: "exempt from VAT",
+};
+/** "a", "a and b", "a, b and c". */
+const joinWords = (words) => words.length <= 1
+    ? words.join("")
+    : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+/** "line 1", "lines 1 and 2", "the document level charge charges[0]", joined. */
+function describeItems(items) {
+    const parts = [];
+    const lines = items.filter((item) => item.kind === "line").map((item) => String(item.index + 1));
+    if (lines.length > 0)
+        parts.push(`${lines.length === 1 ? "line" : "lines"} ${joinWords(lines)}`);
+    for (const kind of ["allowance", "charge"]) {
+        const paths = items
+            .filter((item) => item.kind === kind)
+            .map((item) => `${kind}s[${item.index}]`);
+        if (paths.length > 0) {
+            parts.push(`the document level ${kind}${paths.length === 1 ? "" : "s"} ${joinWords(paths)}`);
+        }
+    }
+    return joinWords(parts);
+}
+/** The business terms for an item's category and rate. */
+const TERMS = {
+    line: { category: "BT-151", rate: "BT-152" },
+    allowance: { category: "BT-95", rate: "BT-96" },
+    charge: { category: "BT-102", rate: "BT-103" },
+};
+/** "vatScenario "x" (what it means)", naming the scheme for a small business. */
+function scenarioPhrase(scenario, sellerCountry) {
+    const scheme = SMALL_BUSINESS_EXEMPTIONS[sellerCountry]?.scheme;
+    const meaning = scenario === "small-business-exemption" && scheme
+        ? `${SCENARIO_MEANING[scenario]}, ${scheme}`
+        : SCENARIO_MEANING[scenario];
+    return `vatScenario "${scenario}" (${meaning})`;
+}
+/**
+ * One `ATW-VAT-SCENARIO-APPLIED` note per scenario that filled anything in,
+ * listing each field it filled. `validateInput` reports the same notes as
+ * `information`, which never affects `valid`.
+ */
+function scenarioNotes(input, plan) {
+    if (!plan.present)
+        return [];
+    const notes = [];
+    for (const scenario of VAT_SCENARIOS) {
+        const active = plan.items.filter((item) => item.scenario === scenario && takesScenario(item));
+        if (active.length === 0)
+            continue;
+        const category = SCENARIO_CATEGORY[scenario];
+        const categoryFilled = active.filter((item) => item.outcome === "applied");
+        const rateFilled = active.filter((item) => item.rateFilled);
+        const fill = plan.fills[category];
+        if (categoryFilled.length === 0 && rateFilled.length === 0 && !fill)
+            continue;
+        const filled = [];
+        const fields = new Set();
+        // Category and rate on the same items read as one clause, which is the
+        // ordinary case: an item that states neither gets both.
+        const together = categoryFilled.length > 0 &&
+            categoryFilled.length === rateFilled.length &&
+            categoryFilled.every((item) => item.rateFilled);
+        if (categoryFilled.length > 0) {
+            filled.push(`vatCategory "${category}" (${CATEGORY_LABELS[category]})${together ? " and vatRate 0" : ""} on ${describeItems(categoryFilled)}${scenario === "domestic" ? ", at the rate each states" : ""}`);
+            for (const item of categoryFilled)
+                fields.add(TERMS[item.kind].category);
+        }
+        if (rateFilled.length > 0) {
+            if (!together)
+                filled.push(`vatRate 0 on ${describeItems(rateFilled)}`);
+            for (const item of rateFilled)
+                fields.add(TERMS[item.kind].rate);
+        }
+        if (fill?.code !== undefined) {
+            filled.push(`vatExemptionReasonCodes.${category} "${fill.code}" (BT-121)`);
+            fields.add("BT-121");
+        }
+        if (fill?.text !== undefined) {
+            filled.push(`vatExemptionReasons.${category} "${fill.text}" (BT-120)`);
+            fields.add("BT-120");
+        }
+        const language = fill?.text === undefined
+            ? ""
+            : ` The text is in ${LANGUAGE_NAMES[plan.language]} because ${plan.sellerCountry === ""
+                ? "the invoice states no seller country (BT-40)"
+                : `the seller's country (BT-40) is ${plan.sellerCountry}`}${plan.language === "en" ? "; German is used for DE and AT, French for FR" : ""}.`;
+        const exampleParts = [`"vatCategory": "${category}"`];
+        if (rateFilled.length > 0)
+            exampleParts.push(`"vatRate": 0`);
+        const example = [
+            ...exampleParts,
+            ...(fill?.code === undefined ? [] : [`"vatExemptionReasonCodes": { "${category}": "${fill.code}" }`]),
+            ...(fill?.text === undefined ? [] : [`"vatExemptionReasons": { "${category}": "${fill.text}" }`]),
+        ].join(", ");
+        notes.push({
+            rule: "ATW-VAT-SCENARIO-APPLIED",
+            field: [...fields],
+            severity: "information",
+            message: `${scenarioPhrase(scenario, plan.sellerCountry)} was turned into codes. Filled in: ${joinWords(filled)}.${language} These are the codes validateInput judged and the generators write, and applyVatScenarios returns them as an explicit invoice.`,
+            fix: `Nothing needs fixing. To write something else, state it yourself: an explicit vatCategory, vatRate, vatExemptionReasons.${category} or vatExemptionReasonCodes.${category} always wins over a scenario.`,
+            example,
+            docsUrl: vat_scenarios_LIMITS_DOCS,
+        });
+    }
+    return notes;
+}
+/**
+ * Turn every `vatScenario` into the codes it stands for.
+ *
+ * Returns the explicit invoice, with no `vatScenario` left in it, and one
+ * `information` note (`ATW-VAT-SCENARIO-APPLIED`) per scenario that filled
+ * anything in. Pure: the input is not modified, and an input with no
+ * `vatScenario` anywhere comes back as the very same object with no notes.
+ *
+ * What each scenario fills, where the item does not state it already:
+ *
+ * | scenario | category | rate | BT-121 | BT-120 |
+ * |---|---|---|---|---|
+ * | `"domestic"` | S | yours; never guessed | — | — |
+ * | `"intra-eu-goods"` | K | 0 | VATEX-EU-IC | e.g. "Intra-Community supply" |
+ * | `"intra-eu-services"` | AE | 0 | VATEX-EU-AE | e.g. "Reverse charge" |
+ * | `"export"` | G | 0 | VATEX-EU-G | e.g. "Export outside the EU" |
+ * | `"small-business-exemption"` | E | 0 | VATEX-FR-FRANCHISE in France | § 19 UStG / art. 293 B CGI wording |
+ *
+ * Explicit values always win: a stated `vatCategory`, `vatRate`,
+ * `vatExemptionReasons` entry or `vatExemptionReasonCodes` entry is kept. An
+ * item whose own `vatScenario` and own `vatCategory` disagree keeps its
+ * category, gets nothing from the scenario, and is the fatal
+ * `ATW-VAT-SCENARIO-CONFLICT` in `validateInput`. Missing facts (a VAT
+ * identifier, the deliver-to country, a domestic rate) are not filled or
+ * invented: `validateInput` reports each as `ATW-VAT-SCENARIO-FACT-MISSING`,
+ * so the returned invoice may still be incomplete, and is typed as the
+ * explicit form it will be once they are supplied.
+ */
+function vat_scenarios_applyVatScenarios(input) {
+    const plan = planVatScenarios(input);
+    return { invoice: explicitInvoice(input, plan), notes: scenarioNotes(input, plan) };
+}
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-defaults.js
+
+
+
+
+const facts = (inv) => inv;
+/** "Line 2", "The document level charge at charges[0]". */
+const label = (item) => item.kind === "line"
+    ? `Line ${item.index + 1}`
+    : `The document level ${item.kind} at ${item.kind}s[${item.index}]`;
+/** "lines[1]", "charges[0]": the path a fix names. */
+const pathOf = (item) => `${item.kind === "line" ? "lines" : `${item.kind}s`}[${item.index}]`;
+/** The UBL element for a line's category or rate; undefined for allowances and charges. */
+const lineXpath = (inv, item, leaf) => item.kind === "line"
+    ? `${xpathRoot(inv)}/cac:${isCreditNote(inv) ? "CreditNoteLine" : "InvoiceLine"}[${item.index + 1}]/cac:Item/cac:ClassifiedTaxCategory/${leaf}`
+    : undefined;
+/** A value as a message quotes it. */
+const quote = (value) => typeof value === "string"
+    ? JSON.stringify(value)
+    : value === null
+        ? "null"
+        : Array.isArray(value)
+            ? "an array"
+            : typeof value === "object"
+                ? "an object"
+                : String(value);
+const SCENARIO_LIST = joinWords(VAT_SCENARIOS.map((s) => `"${s}"`));
+/** Plain Levenshtein distance; the strings are a few dozen characters at most. */
+function editDistance(a, b) {
+    let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+        const current = [i];
+        for (let j = 1; j <= b.length; j++) {
+            current[j] = Math.min((previous[j] ?? 0) + 1, (current[j - 1] ?? 0) + 1, (previous[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1));
+        }
+        previous = current;
+    }
+    return previous[b.length] ?? Math.max(a.length, b.length);
+}
+/** The scenario a misspelt value most likely meant, if one is close. */
+function closestScenario(value) {
+    if (typeof value !== "string")
+        return undefined;
+    const normalised = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (isVatScenario(normalised))
+        return normalised;
+    let best;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const scenario of VAT_SCENARIOS) {
+        const distance = editDistance(normalised, scenario);
+        if (distance < bestDistance) {
+            best = scenario;
+            bestDistance = distance;
+        }
+    }
+    return bestDistance <= 3 ? best : undefined;
+}
+const FACTS = {
+    sellerVatId: {
+        field: ["BT-31", "BT-63"],
+        what: "the seller's VAT identifier (BT-31), or its tax representative's (BT-63)",
+        present: (inv) => !blank(inv.seller?.vatId) || !blank(inv.taxRepresentative?.vatId),
+        fix: 'Set seller.vatId to your VAT identifier with its country prefix, e.g. "DE123456789". A tax number in seller.taxRegistrationId does not stand in for it here. If a fiscal representative holds your VAT registration, set taxRepresentative with its name, vatId and address instead.',
+        example: `"seller": { "vatId": "DE123456789" }`,
+        xpath: "/cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID",
+    },
+    sellerTaxId: {
+        field: ["BT-31", "BT-32"],
+        what: "a tax identifier for the seller, its VAT identifier (BT-31) or its tax registration number (BT-32)",
+        present: (inv) => !blank(inv.seller?.vatId) ||
+            !blank(inv.seller?.taxRegistrationId) ||
+            !blank(inv.taxRepresentative?.vatId),
+        fix: 'Set seller.taxRegistrationId to your tax number (in Germany the Steuernummer, e.g. "181/815/08155"), or seller.vatId if you have a VAT identifier.',
+        example: `"seller": { "taxRegistrationId": "181/815/08155" }`,
+        xpath: "/cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID",
+    },
+    buyerVatId: {
+        field: "BT-48",
+        what: "the buyer's VAT identifier (BT-48)",
+        present: (inv) => !blank(inv.buyer?.vatId),
+        fix: "Set buyer.vatId to the customer's VAT identifier in its own member state, with the country prefix, and check it in VIES on the day you invoice.",
+        example: `"buyer": { "vatId": "FR12345678901" }`,
+        xpath: "/cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID",
+    },
+    deliverToCountry: {
+        field: "BT-80",
+        what: "the country the goods were delivered to (BT-80)",
+        present: (inv) => !blank(inv.deliverTo?.countryCode),
+        fix: "Set deliverTo.countryCode to the member state the goods went to. Under XRechnung, deliverTo also needs city and postalCode (BR-DE-10, BR-DE-11).",
+        example: `"deliverTo": { "city": "Lyon", "postalCode": "69001", "countryCode": "FR" }`,
+        xpath: "/cac:Delivery/cac:DeliveryLocation/cac:Address/cac:Country/cbc:IdentificationCode",
+    },
+    deliveryDateOrPeriod: {
+        field: ["BT-72", "BG-14"],
+        what: "the actual delivery date (BT-72) or an invoicing period (BG-14)",
+        present: (inv) => !blank(inv.deliveryDate) ||
+            !blank(inv.invoicingPeriod?.startDate) ||
+            !blank(inv.invoicingPeriod?.endDate) ||
+            !blank(inv.invoicingPeriod?.descriptionCode),
+        fix: 'Set deliveryDate to the day the goods were dispatched, as "YYYY-MM-DD", or state the invoicing period the supplies fall in (invoicingPeriod.startDate and endDate).',
+        example: `"deliveryDate": "2026-08-05"`,
+        xpath: "/cac:Delivery/cbc:ActualDeliveryDate",
+    },
+};
+/**
+ * Which facts each scenario needs, and why, in the order they are reported.
+ * `"domestic"` needs a rate per item instead, checked separately.
+ */
+const NEEDS = {
+    "intra-eu-goods": [
+        [
+            "sellerVatId",
+            "An intra-community supply is exempt only between two businesses registered for VAT in different member states, and the invoice has to show both numbers (Article 226(3) and (4) of Directive 2006/112/EC). EN 16931 asks for the same in BR-IC-02, which fires on this invoice too.",
+        ],
+        [
+            "buyerVatId",
+            "An intra-community supply is exempt only when the customer is registered for VAT in another member state, and its number is what the exemption, and your recapitulative statement, rest on (Article 226(4) of Directive 2006/112/EC). EN 16931 asks for it in BR-IC-02, which fires on this invoice too.",
+        ],
+        [
+            "deliverToCountry",
+            "The supply is exempt because the goods leave your member state, so the destination has to be on the invoice. EN 16931 asks for it in BR-IC-12, which fires on this invoice too.",
+        ],
+        [
+            "deliveryDateOrPeriod",
+            "The date decides the period in which you report the supply on your recapitulative statement. EN 16931 asks for it, or for an invoicing period, in BR-IC-11, which fires on this invoice too.",
+        ],
+    ],
+    "intra-eu-services": [
+        [
+            "sellerVatId",
+            "Under the reverse charge the customer accounts for the VAT, and the invoice has to show the VAT identifiers of both parties (Article 226(3) and (4) of Directive 2006/112/EC) so that each side can report the supply. EN 16931's BR-AE-02 would also accept a national tax number here; the scenario asks for what the Directive requires.",
+        ],
+        [
+            "buyerVatId",
+            "Under the reverse charge the customer accounts for the VAT, and its VAT identifier is what shows it is a business that can (Article 226(4) of Directive 2006/112/EC); you also report it on your recapitulative statement. EN 16931's BR-AE-02 would also accept a legal registration number here; the scenario asks for what the Directive requires.",
+        ],
+    ],
+    export: [
+        [
+            "sellerVatId",
+            "Export zero-rating is claimed under a VAT registration, and the customs evidence is matched against it. EN 16931 asks for it in BR-G-02, which fires on this invoice too.",
+        ],
+    ],
+    "small-business-exemption": [
+        [
+            "sellerTaxId",
+            "EN 16931 requires an invoice with exempt lines to identify the seller for tax (BR-E-02, which fires on this invoice too), and a small business has a tax number even when it has no VAT identifier.",
+        ],
+    ],
+};
+/** The rule a standard-rated item with no rate fails, per kind. */
+const RATE_RULE = {
+    line: "BR-S-05",
+    allowance: "BR-S-06",
+    charge: "BR-S-07",
+};
+/** The items a known scenario's codes go on, grouped by scenario. */
+const activeItems = (plan, scenario) => plan.items.filter((item) => item.scenario === scenario && takesScenario(item));
+const planOf = (inv) => {
+    const plan = planVatScenarios(inv);
+    return plan.present ? plan : null;
+};
+const defaultsRules = [
+    // ATW-VAT-SCENARIO-UNKNOWN: not one of the five.
+    //
+    // A typo here is silent in the worst way: the line simply has no category,
+    // and BR-CO-04 then says "no VAT category" about a line whose author was
+    // sure they had given one.
+    (inv) => {
+        const plan = planOf(inv);
+        if (!plan)
+            return null;
+        const out = [];
+        const inheritors = plan.items.filter((item) => item.inherited && item.outcome === "unknown");
+        const invoiceScenario = plan.invoiceScenario;
+        if (invoiceScenario !== undefined && invoiceScenario !== null && !isVatScenario(invoiceScenario)) {
+            const guess = closestScenario(invoiceScenario);
+            out.push({
+                rule: "ATW-VAT-SCENARIO-UNKNOWN",
+                field: "BT-151",
+                severity: "fatal",
+                message: `The invoice states vatScenario ${quote(invoiceScenario)}, which is not one of the five scenarios this build knows: ${SCENARIO_LIST}. Nothing was filled in from it${inheritors.length > 0
+                    ? `, so ${describeItems(inheritors)}, which rely on it, have no VAT category`
+                    : "; every line states its own category or scenario, so nothing depends on it, but it is still a mistake in the input"}.`,
+                fix: `${guess ? `Did you mean "${guess}"? ` : ""}Set vatScenario to one of the five, or remove it and state vatCategory (and vatRate) on each line.`,
+                example: `"vatScenario": "${guess ?? "domestic"}"`,
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        for (const item of plan.items) {
+            if (item.inherited || item.outcome !== "unknown")
+                continue;
+            const guess = closestScenario(item.scenario);
+            out.push({
+                rule: "ATW-VAT-SCENARIO-UNKNOWN",
+                field: TERMS[item.kind].category,
+                severity: "fatal",
+                message: `${label(item)} states vatScenario ${quote(item.scenario)}, which is not one of the five scenarios this build knows: ${SCENARIO_LIST}. Nothing was filled in from it, ${item.stated === undefined
+                    ? `so the ${item.kind} has no VAT category`
+                    : `so the ${item.kind} keeps its own vatCategory ${quote(item.stated)} and nothing else`}.`,
+                fix: `${guess ? `Did you mean "${guess}"? ` : ""}Set ${pathOf(item)}.vatScenario to one of the five, or remove it and state vatCategory (and vatRate) yourself.`,
+                example: `"vatScenario": "${guess ?? "domestic"}"`,
+                ...(lineXpath(inv, item, "cbc:ID") ? { xpath: lineXpath(inv, item, "cbc:ID") } : {}),
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
+    // ATW-VAT-SCENARIO-CONFLICT: an item's own scenario and its own category
+    // disagree.
+    //
+    // Explicit values win over scenarios, so the category would be written and
+    // the scenario ignored. When both are stated on the same item one of them
+    // is a mistake, and nothing downstream can tell which: a reverse-charge
+    // service written as standard rated is a valid document that charges the
+    // wrong party. So this is fatal. An *inherited* scenario is different: the
+    // invoice's default fills gaps, and an item that states a category has none.
+    (inv) => {
+        const plan = planOf(inv);
+        if (!plan)
+            return null;
+        const out = [];
+        for (const item of plan.items) {
+            if (item.outcome !== "conflict" || item.category === undefined)
+                continue;
+            const scenario = item.scenario;
+            out.push({
+                rule: "ATW-VAT-SCENARIO-CONFLICT",
+                field: TERMS[item.kind].category,
+                severity: "fatal",
+                message: `${label(item)} states vatScenario "${scenario}", which stands for VAT category ${item.category} (${CATEGORY_NAMES[item.category]}), and also vatCategory ${quote(item.stated)}. The scenario says what happened and the category is its code, so one of the two is wrong. An explicit category wins over a scenario, so the document would say ${quote(item.stated)} and nothing from the scenario would be written.`,
+                fix: `Remove one of the two from ${pathOf(item)}: drop vatCategory to let the scenario decide the code, or drop vatScenario if ${quote(item.stated)} is what you meant.`,
+                example: `"vatScenario": "${scenario}"`,
+                ...(lineXpath(inv, item, "cbc:ID") ? { xpath: lineXpath(inv, item, "cbc:ID") } : {}),
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
+    // ATW-VAT-SCENARIO-UNSUPPORTED: a small-business exemption this build does
+    // not know. Every member state runs its own scheme with its own wording, and
+    // the two implemented here were each settled from the tax authority's own
+    // texts (vat-scenarios.ts). A seller with no country at all is a missing
+    // fact rather than an unsupported one.
+    (inv) => {
+        const plan = planOf(inv);
+        if (!plan)
+            return null;
+        const items = plan.items.filter((item) => item.outcome === "unsupported");
+        if (items.length === 0)
+            return null;
+        const root = xpathRoot(inv);
+        if (plan.sellerCountry === "") {
+            return {
+                rule: "ATW-VAT-SCENARIO-FACT-MISSING",
+                field: "BT-40",
+                severity: "fatal",
+                message: `vatScenario "small-business-exemption" on ${describeItems(items)} depends on where the seller is established, and the invoice states no seller country (BT-40). Each member state runs its own small-business scheme, with its own wording and, in an e-invoice, its own exemption code, so nothing was filled in.`,
+                fix: 'Set seller.address.countryCode, e.g. "DE" or "FR". The scenario is implemented for sellers in Germany (§ 19 UStG) and France (franchise en base).',
+                example: `"seller": { "address": { "city": "Berlin", "postalCode": "10115", "countryCode": "DE" } }`,
+                xpath: `${root}/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cac:Country/cbc:IdentificationCode`,
+                docsUrl: LIMITS_DOCS,
+            };
+        }
+        return {
+            rule: "ATW-VAT-SCENARIO-UNSUPPORTED",
+            field: ["BT-40", "BT-151"],
+            severity: "fatal",
+            message: `vatScenario "small-business-exemption" on ${describeItems(items)} is implemented for sellers established in Germany (§ 19 UStG) and France (the franchise en base, article 293 B du CGI), and the seller's country (BT-40) is ${quote(plan.sellerCountry)}. Each member state runs its own small-business scheme, with its own invoice wording and, in an e-invoice, its own exemption code, and this build does not guess them. Nothing was filled in.`,
+            fix: "State the codes yourself and remove vatScenario: usually vatCategory \"E\" with vatRate 0, and the wording your country's scheme requires in vatExemptionReasons.E. If the seller is in fact established in Germany or France, correct seller.address.countryCode instead.",
+            example: `"vatCategory": "E", "vatRate": 0`,
+            xpath: `${root}/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cac:Country/cbc:IdentificationCode`,
+            docsUrl: LIMITS_DOCS,
+        };
+    },
+    // ATW-VAT-SCENARIO-FACT-MISSING: a scenario whose treatment is lawful only
+    // with a fact the invoice does not state. Each finding names the scenario
+    // and the one field, because "report exactly what is missing" is the whole
+    // value over the regulation's own finding, which cannot name a scenario.
+    (inv) => {
+        const plan = planOf(inv);
+        if (!plan)
+            return null;
+        const stated = facts(inv);
+        const root = xpathRoot(inv);
+        const out = [];
+        for (const item of activeItems(plan, "domestic")) {
+            const list = item.kind === "line" ? stated.lines : item.kind === "allowance" ? stated.allowances : stated.charges;
+            const entry = Array.isArray(list) ? list[item.index] : undefined;
+            if (entry?.vatRate !== undefined && entry.vatRate !== null)
+                continue;
+            const term = TERMS[item.kind].rate;
+            const xpath = lineXpath(inv, item, "cbc:Percent");
+            out.push({
+                rule: "ATW-VAT-SCENARIO-FACT-MISSING",
+                field: term,
+                severity: "fatal",
+                message: `${label(item)} follows vatScenario "domestic"${item.inherited ? ", the invoice's," : ""} and states no vatRate. A domestic supply is taxed at the standard rate or at a reduced one, and which applies depends on what was sold, so the rate (${term}) is never guessed: it has to come from you. Without it the ${item.kind} is standard rated with no rate, which EN 16931 rejects (${RATE_RULE[item.kind]}).`,
+                fix: `Set ${pathOf(item)}.vatRate to the percentage that applies to it, for example 19 or 7 in Germany, or 20, 10 or 5.5 in France.`,
+                example: `"vatScenario": "domestic", "vatRate": 19`,
+                ...(xpath ? { xpath } : {}),
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        for (const scenario of VAT_SCENARIOS) {
+            if (scenario === "domestic")
+                continue;
+            const items = activeItems(plan, scenario);
+            if (items.length === 0)
+                continue;
+            for (const [key, why] of NEEDS[scenario]) {
+                const fact = FACTS[key];
+                if (fact.present(stated))
+                    continue;
+                out.push({
+                    rule: "ATW-VAT-SCENARIO-FACT-MISSING",
+                    field: fact.field,
+                    severity: "fatal",
+                    message: `${scenarioPhrase(scenario, plan.sellerCountry)} on ${describeItems(items)} needs ${fact.what}, and the invoice has none. ${why}`,
+                    fix: fact.fix,
+                    example: fact.example,
+                    xpath: `${root}${fact.xpath}`,
+                    docsUrl: LIMITS_DOCS,
+                });
+            }
+        }
+        return out;
+    },
+    // ATW-VAT-SCENARIO-APPLIED: what the scenarios filled in, one note per
+    // scenario. `information`, the level KoSIT uses for a finding the document
+    // passes with: the invoice is fine, and this says what it now contains.
+    (inv) => {
+        const plan = planOf(inv);
+        return plan ? scenarioNotes(inv, plan) : null;
+    },
+    // ATW-PAYMENT-MEANS-INFERRED: a payment means code filled in from the
+    // account, because the caller left it out. Only an absent code is inferred,
+    // and a document read from XML always carries one (empty when the file has
+    // none), so this never fires on `validate()`.
+    (inv) => {
+        const inference = payment_means_inferPaymentMeans(inv);
+        return inference ? payment_means_paymentMeansNote(inv, inference) : null;
+    },
+];
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-de.js
 
 
@@ -73129,6 +75129,548 @@ const germanRules = [
     // sees, because it takes the invoice and not the generate options. A rule
     // that cannot fail is not coverage. The same argument retires BR-01
     // (BT-24 shall be present) and BR-DE-13. See CHANGELOG 0.2.0.
+];
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/identifiers.js
+
+/**
+ * Check digits and formats of the identifiers an invoice is routed and paid
+ * on: the German Leitweg-ID, the IBAN and BIC, and the French SIREN and SIRET.
+ *
+ * None of these is a rule of EN 16931 or of a CIUS. The regulation asks for the
+ * identifier and does not recompute its check digits, so an invoice carrying a
+ * mistyped one validates clean everywhere and then fails where the identifier
+ * is used: the portal cannot route it, the bank returns the payment, the
+ * platform finds no such company. That is why the findings built on these
+ * functions (`rules-identifiers.ts`) are `ATW-` warnings and never errors.
+ *
+ * Deliberately absent:
+ *
+ *  - **VAT identifiers.** Their check digits differ per member state, several
+ *    states publish no algorithm, and the authority on whether a VAT number
+ *    exists is VIES, not arithmetic. `BR-CO-09` checks the country prefix.
+ *  - **The GLN (scheme 0088).** `PEPPOL-COMMON-R040` already checks its GS1
+ *    check digit, at the severity Peppol gives it (see `rules-peppol.ts`), and
+ *    a second finding about the same digit would say the same thing twice.
+ *
+ * Pure functions, no state: safe to call from a form that wants to check an
+ * IBAN before the invoice exists.
+ */
+// ---------------------------------------------------------------------------
+// ISO 7064 MOD 97-10
+// ---------------------------------------------------------------------------
+/**
+ * The MOD 97-10 remainder of a string of digits and capital letters, with each
+ * letter replaced by its position in the alphabet plus nine (A = 10 … Z = 35),
+ * as ISO 13616 does for the IBAN and the Leitweg-ID specification does for the
+ * Leitweg-ID. Null when the string holds anything else.
+ *
+ * Computed digit by digit: a 34-character IBAN expands to far more digits than
+ * a JavaScript number holds exactly.
+ */
+function mod97(value) {
+    let remainder = 0;
+    for (const char of value) {
+        const code = char.charCodeAt(0);
+        let digits;
+        if (code >= 48 && code <= 57)
+            digits = char;
+        else if (code >= 65 && code <= 90)
+            digits = String(code - 55);
+        else
+            return null;
+        for (const digit of digits)
+            remainder = (remainder * 10 + (digit.charCodeAt(0) - 48)) % 97;
+    }
+    return remainder;
+}
+// ---------------------------------------------------------------------------
+// Leitweg-ID
+// ---------------------------------------------------------------------------
+/**
+ * The form of a Leitweg-ID, per the Leitweg-ID format specification version
+ * 2.0.2 (Koordinierungsstelle für IT-Standards, 28 July 2021), sections 2.1 to
+ * 2.5: a coarse address (Grobadressierung) of 2 to 12 digits, an optional fine
+ * address (Feinadressierung) of up to 30 letters and digits, and two check
+ * digits, each part after the first introduced by a hyphen-minus (U+002D).
+ * Letters are not case-sensitive (section 2.3).
+ */
+const LEITWEG_ID_FORM = /^([0-9]{2,12})(?:-([A-Za-z0-9]{1,30}))?-([0-9]{2})$/;
+/**
+ * The codes a coarse address begins with (section 2.2.1): 01 Schleswig-Holstein
+ * to 16 Thüringen, and 99 for the federal level.
+ */
+const LEITWEG_ID_LAND_CODES = new Set([
+    "01", "02", "03", "04", "05", "06", "07", "08",
+    "09", "10", "11", "12", "13", "14", "15", "16", "99",
+]);
+/**
+ * The lengths a coarse address can have (section 2.1, table 1): the Land (2
+ * digits), then the Regierungsbezirk (1), the Landkreis (2) and the Gemeinde-
+ * verband or Gemeinde (3, 4 or 7), each required when a later one is given.
+ */
+const LEITWEG_ID_COARSE_LENGTHS = new Set([2, 3, 5, 8, 9, 12]);
+/**
+ * Whether `value` is not a Leitweg-ID, and why; null when it is one.
+ *
+ * Section 2.4: the check digits are computed with ISO/IEC 7064 MOD 97-10 over
+ * the coarse and fine address without the hyphens, letters replaced by their
+ * position in the alphabet from A = 10 to Z = 35, and a Leitweg-ID is valid
+ * when that string with the check digits appended leaves the remainder 1 on
+ * division by 97. The specification's own example, 04011000-1234512345-06,
+ * does. Surrounding whitespace is ignored; whitespace inside is not a hyphen.
+ */
+function leitwegIdProblem(value) {
+    const match = LEITWEG_ID_FORM.exec(value.trim());
+    if (!match)
+        return "form";
+    const coarse = match[1];
+    const fine = (match[2] ?? "").toUpperCase();
+    const check = match[3];
+    return mod97(`${coarse}${fine}${check}`) === 1 ? null : "check-digits";
+}
+/**
+ * True when `value` is a Leitweg-ID: the form of the Leitweg-ID format
+ * specification 2.0.2 (a coarse address of 2 to 12 digits, an optional fine
+ * address of up to 30 letters and digits, two check digits, separated by
+ * hyphens) with check digits that satisfy ISO/IEC 7064 MOD 97-10. It cannot
+ * tell whether a Leitweg-ID was ever issued to anybody.
+ */
+const isValidLeitwegId = (value) => leitwegIdProblem(value) === null;
+/**
+ * True when a buyer reference (BT-10) has the complete form of a Leitweg-ID and
+ * not merely something like it: the form above, a coarse address of one of the
+ * lengths the specification's table 1 allows, and first two digits that name a
+ * Land or the federal level. A business buyer may put any reference in BT-10,
+ * and a date such as `2026-07-31` must not be checked as a Leitweg-ID.
+ */
+function hasLeitwegIdForm(value) {
+    const match = LEITWEG_ID_FORM.exec(value.trim());
+    if (!match)
+        return false;
+    const coarse = match[1];
+    return LEITWEG_ID_COARSE_LENGTHS.has(coarse.length) && LEITWEG_ID_LAND_CODES.has(coarse.slice(0, 2));
+}
+// ---------------------------------------------------------------------------
+// IBAN
+// ---------------------------------------------------------------------------
+/**
+ * IBAN length per country, from the SWIFT IBAN Registry (ISO 13616).
+ *
+ * A country missing here is not refused: its IBAN is held to the check digits
+ * alone, so a country that joins the registry later is never reported for a
+ * length this table does not know.
+ */
+const IBAN_LENGTHS = Object.freeze({
+    AD: 24, AE: 23, AL: 28, AT: 20, AZ: 28, BA: 20, BE: 16, BG: 22, BH: 22, BI: 27,
+    BR: 29, BY: 28, CH: 21, CR: 22, CY: 28, CZ: 24, DE: 22, DJ: 27, DK: 18, DO: 28,
+    EE: 20, EG: 29, ES: 24, FI: 18, FK: 18, FO: 18, FR: 27, GB: 22, GE: 22, GI: 23,
+    GL: 18, GR: 27, GT: 28, HR: 21, HU: 28, IE: 22, IL: 23, IQ: 23, IS: 26, IT: 27,
+    JO: 30, KW: 30, KZ: 20, LB: 28, LC: 32, LI: 21, LT: 20, LU: 20, LV: 21, LY: 25,
+    MC: 27, MD: 24, ME: 22, MK: 19, MN: 20, MR: 27, MT: 31, MU: 30, NI: 28, NL: 18,
+    NO: 15, OM: 23, PK: 24, PL: 28, PS: 29, PT: 25, QA: 29, RO: 24, RS: 22, RU: 33,
+    SA: 24, SC: 31, SD: 18, SE: 24, SI: 19, SK: 24, SM: 27, SO: 23, ST: 25, SV: 28,
+    TL: 23, TN: 24, TR: 26, UA: 29, VA: 22, VG: 24, XK: 20,
+});
+/** The IBAN with every whitespace character removed, which is how it is compared. */
+const compactIban = (value) => value.replace(/\s/g, "");
+/** True when `value` starts the way an IBAN does: two letters, two digits. */
+const looksLikeIban = (value) => /^[A-Za-z]{2}[0-9]{2}/.test(compactIban(value));
+/** Whether `value` is not an IBAN, and why; null when it is one. */
+function ibanProblem(value) {
+    const compact = compactIban(value);
+    const upper = compact.toUpperCase();
+    if (!/^[A-Z]{2}[0-9]{2}[A-Z0-9]{1,30}$/.test(upper))
+        return { kind: "form" };
+    const expected = IBAN_LENGTHS[upper.slice(0, 2)];
+    if (expected !== undefined && upper.length !== expected) {
+        return { kind: "length", expected, actual: upper.length };
+    }
+    if (mod97(upper.slice(4) + upper.slice(0, 4)) !== 1)
+        return { kind: "check-digits" };
+    return compact === upper ? null : { kind: "case" };
+}
+/**
+ * True when `value` is an IBAN: two letters for the country, two check digits
+ * and the account number, in capitals, as long as the SWIFT IBAN Registry says
+ * that country's IBAN is, with check digits that satisfy ISO 7064 MOD 97-10.
+ * Spaces between the groups of four are ignored.
+ *
+ * Stricter than `BR-DE-19`, which transcribes KoSIT's test and checks the form
+ * and the check digits only: this also checks the length.
+ */
+const identifiers_isValidIban = (value) => ibanProblem(value) === null;
+/**
+ * Whether `value` is not a BIC, and why; null when it is one.
+ *
+ * ISO 9362 as ISO 20022 writes it, `[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?`:
+ * a four-character party prefix, the two-letter country, a two-character
+ * location and an optional three-character branch, 8 or 11 characters in all.
+ * The country must be an ISO 3166-1 code, or XK (Kosovo), which SWIFT uses.
+ * Surrounding whitespace is ignored.
+ */
+function bicProblem(value) {
+    const trimmed = value.trim();
+    const upper = trimmed.toUpperCase();
+    if (!/^[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(upper))
+        return "form";
+    const country = upper.slice(4, 6);
+    if (country !== "XK" && !COUNTRY_CODES_SET.has(country))
+        return "country";
+    return trimmed === upper ? null : "case";
+}
+/**
+ * True when `value` is a BIC: 8 or 11 capital letters and digits, of which the
+ * fifth and sixth are the letters of a country code.
+ */
+const isValidBic = (value) => bicProblem(value) === null;
+// ---------------------------------------------------------------------------
+// SIREN and SIRET
+// ---------------------------------------------------------------------------
+/** The Luhn check over a string of digits: true when it passes. */
+function luhn(digits) {
+    let sum = 0;
+    for (let i = 0; i < digits.length; i += 1) {
+        const digit = digits.charCodeAt(digits.length - 1 - i) - 48;
+        if (i % 2 === 1) {
+            const doubled = digit * 2;
+            sum += doubled > 9 ? doubled - 9 : doubled;
+        }
+        else {
+            sum += digit;
+        }
+    }
+    return sum % 10 === 0;
+}
+/** La Poste's SIREN. Its establishments' SIRETs do not satisfy the Luhn check. */
+const LA_POSTE_SIREN = "356000000";
+function frenchIdProblem(value, length) {
+    const trimmed = value.trim();
+    const compact = trimmed.replace(/\s/g, "");
+    if (compact.length !== length || !/^[0-9]+$/.test(compact))
+        return "form";
+    const valid = length === 9
+        ? luhn(compact)
+        : // INSEE: a SIRET is the SIREN and a five-digit establishment number
+            // (NIC) whose last digit makes all fourteen pass the Luhn check. La
+            // Poste's establishments are the exception: their SIRETs are built so
+            // that the digit sum is a multiple of 5. Its head office, 356 000 000
+            // 00048, passes the Luhn check as well, and either test is accepted.
+            luhn(compact.slice(0, 9)) &&
+                (luhn(compact) ||
+                    (compact.startsWith(LA_POSTE_SIREN) &&
+                        [...compact].reduce((sum, digit) => sum + Number(digit), 0) % 5 === 0));
+    if (!valid)
+        return "check-digit";
+    return compact === trimmed ? null : "spaces";
+}
+/** Whether `value` is not a SIREN, and why; null when it is one. */
+const sirenProblem = (value) => frenchIdProblem(value, 9);
+/** Whether `value` is not a SIRET, and why; null when it is one. */
+const siretProblem = (value) => frenchIdProblem(value, 14);
+/**
+ * True when `value` is a SIREN: the nine digits INSEE gives a French company,
+ * the last a Luhn check digit, written without spaces.
+ */
+const isValidSiren = (value) => sirenProblem(value) === null;
+/**
+ * True when `value` is a SIRET: fourteen digits, a SIREN and the establishment
+ * number, where the SIREN passes its own Luhn check and all fourteen digits
+ * pass the Luhn check, or, for La Poste (SIREN 356000000), add up to a
+ * multiple of 5. Written without spaces.
+ */
+const isValidSiret = (value) => siretProblem(value) === null;
+
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules-identifiers.js
+
+
+
+
+const rules_identifiers_text = (value) => typeof value === "string" && !blank(value);
+const pairExample = (key) => (schemeId, value) => `"${key}": { "schemeId": "${schemeId}", "value": "${value}" }`;
+const legalExample = (schemeId, value) => `"legalRegistrationId": "${value}", "legalRegistrationSchemeId": "${schemeId}"`;
+/**
+ * Every identifier with a scheme: the two electronic addresses, the party
+ * identifiers and legal registration identifiers of seller, buyer and payee,
+ * and the deliver-to location identifier. The values are read as written and
+ * the scheme trimmed, since a padded " 0204" still says what it means (other
+ * rules report the padding).
+ */
+function schemedSlots(inv) {
+    const root = xpathRoot(inv);
+    const out = [];
+    const push = (entry, spec) => {
+        if (!entry || !rules_identifiers_text(entry.schemeId) || !rules_identifiers_text(entry.value))
+            return;
+        out.push({ ...spec, schemeId: entry.schemeId.trim(), value: entry.value });
+    };
+    const parties = [
+        { key: "seller", party: inv.seller, who: "seller", endpoint: "BT-34", id: "BT-29", legal: "BT-30", xpath: `${root}/cac:AccountingSupplierParty/cac:Party` },
+        { key: "buyer", party: inv.buyer, who: "buyer", endpoint: "BT-49", id: "BT-46", legal: "BT-47", xpath: `${root}/cac:AccountingCustomerParty/cac:Party` },
+    ];
+    for (const p of parties) {
+        if (!p.party || typeof p.party !== "object")
+            continue;
+        push(p.party.electronicAddress, {
+            path: `${p.key}.electronicAddress`,
+            label: `${p.who} electronic address`,
+            field: p.endpoint,
+            xpath: `${p.xpath}/cbc:EndpointID`,
+            example: pairExample("electronicAddress"),
+        });
+        push(p.party.identifier, {
+            path: `${p.key}.identifier`,
+            label: `${p.who} identifier`,
+            field: p.id,
+            xpath: `${p.xpath}/cac:PartyIdentification/cbc:ID`,
+            example: pairExample("identifier"),
+        });
+        push({ schemeId: p.party.legalRegistrationSchemeId, value: p.party.legalRegistrationId }, {
+            path: `${p.key}.legalRegistrationId`,
+            label: `${p.who} legal registration identifier`,
+            field: p.legal,
+            xpath: `${p.xpath}/cac:PartyLegalEntity/cbc:CompanyID`,
+            example: legalExample,
+        });
+    }
+    push(inv.payee?.identifier, {
+        path: "payee.identifier",
+        label: "payee identifier",
+        field: "BT-60",
+        xpath: `${root}/cac:PayeeParty/cac:PartyIdentification/cbc:ID`,
+        example: pairExample("identifier"),
+    });
+    push(inv.payee?.legalRegistrationId, {
+        path: "payee.legalRegistrationId",
+        label: "payee legal registration identifier",
+        field: "BT-61",
+        xpath: `${root}/cac:PayeeParty/cac:PartyLegalEntity/cbc:CompanyID`,
+        example: pairExample("legalRegistrationId"),
+    });
+    push(inv.deliverToLocationId, {
+        path: "deliverToLocationId",
+        label: "deliver-to location identifier",
+        field: "BT-71",
+        xpath: `${root}/cac:Delivery/cac:DeliveryLocation/cbc:ID`,
+        example: pairExample("deliverToLocationId"),
+    });
+    return out;
+}
+// ---------------------------------------------------------------------------
+// Leitweg-ID
+// ---------------------------------------------------------------------------
+/** The specification's own example, which is a valid Leitweg-ID. */
+const LEITWEG_ID_EXAMPLE = "04011000-1234512345-06";
+const LEITWEG_ID_WHY = "The Leitweg-ID is how the German public sector addresses an e-invoice: the receiving portal routes on it, so an invoice carrying one that was issued to nobody cannot reach the authority it is meant for.";
+const LEITWEG_ID_CHECK_DIGITS = "its check digits do not match. The last two digits are computed from everything before them with ISO/IEC 7064 MOD 97-10, as the Leitweg-ID format specification 2.0.2 prescribes (section 2.4), so a digit or letter before them is almost certainly mistyped or swapped.";
+const LEITWEG_ID_FIX = "Copy the Leitweg-ID again from where the buyer gave it to you, such as the order, the contract or the authority's invoicing instructions, rather than retyping it. Do not recompute the check digits to silence this warning: a Leitweg-ID whose digits match but that nobody holds is just as undeliverable.";
+const NOT_A_RULE = "This is a warning of this library, not a rule of EN 16931 or of a CIUS, so it never makes the invoice invalid.";
+/** True when the invoice goes to a German buyer, the only place a Leitweg-ID means anything. */
+const addressedToGermany = (inv) => isXRechnung(inv) ||
+    (typeof inv.buyer?.address?.countryCode === "string" && inv.buyer.address.countryCode.trim().toUpperCase() === "DE") ||
+    (typeof inv.buyer?.electronicAddress?.schemeId === "string" && inv.buyer.electronicAddress.schemeId.trim() === "0204");
+/** Why a value under scheme 0204 is not in the form of a Leitweg-ID, when the reason is obvious. */
+function leitwegFormHint(value) {
+    const trimmed = value.trim();
+    if (/^[0-9A-Za-z]+$/.test(trimmed)) {
+        return " It has no hyphens, and they are part of the Leitweg-ID: without them the coarse address, the fine address and the check digits cannot be told apart.";
+    }
+    if (/\s/.test(trimmed))
+        return " It contains whitespace; the parts are separated by hyphen-minus characters and by nothing else.";
+    if (/[\u2010-\u2015\u2212]/.test(trimmed))
+        return " It contains a dash that is not the hyphen-minus (U+002D) the specification prescribes, as word processors substitute.";
+    return "";
+}
+// ---------------------------------------------------------------------------
+// IBAN and BIC
+// ---------------------------------------------------------------------------
+const IBAN_XPATH = "cac:PaymentMeans/cac:PayeeFinancialAccount/cbc:ID";
+const BIC_XPATH = "cac:PaymentMeans/cac:PayeeFinancialAccount/cac:FinancialInstitutionBranch/cbc:ID";
+function ibanWhat(problem, value, sepa) {
+    const country = value.replace(/\s/g, "").slice(0, 2).toUpperCase();
+    switch (problem.kind) {
+        case "form":
+            return sepa
+                ? `is not one: an IBAN is two letters for the country, two check digits and up to 30 letters and digits, with no punctuation, and a SEPA credit transfer (payment means code 58) pays into nothing else.`
+                : `starts like an IBAN but is not one: an IBAN is two letters for the country, two check digits and up to 30 letters and digits, with no punctuation.`;
+        case "length":
+            return `has ${problem.actual} characters, and an IBAN from ${country} has ${problem.expected} (ISO 13616, as the SWIFT IBAN Registry records it), so a character is missing or doubled.`;
+        case "check-digits":
+            return "fails the ISO 7064 MOD 97-10 check: the two digits after the country code are computed from the rest of the IBAN, so a mistyped or swapped character makes them disagree.";
+        case "case":
+            return "is written with lower-case letters. An IBAN is written in capitals (ISO 13616), and a system that compares it as written refuses the lower-case form; KoSIT's BR-DE-19 does.";
+    }
+}
+// ---------------------------------------------------------------------------
+// SIREN and SIRET
+// ---------------------------------------------------------------------------
+/** A valid SIREN and a valid SIRET built on it, for the examples. Neither belongs to a real company that we know of. */
+const SIREN_EXAMPLE = "123456782";
+const SIRET_EXAMPLE = "12345678200010";
+const FRENCH_ID_WHY = "French invoicing platforms, Chorus Pro among them, find the company or establishment by this number, so an invoice carrying one that does not exist cannot be matched to it.";
+function sirenWhat(problem, value) {
+    const digits = value.replace(/\s/g, "");
+    switch (problem) {
+        case "form":
+            return `is not nine digits.${/^[0-9]{14}$/.test(digits)
+                ? " Fourteen digits is a SIRET, which identifies one establishment and belongs under scheme 0009; the SIREN is its first nine digits."
+                : ""}`;
+        case "check-digit":
+            return "fails the Luhn check its ninth digit exists for, so a digit is almost certainly mistyped or swapped.";
+        case "spaces":
+            return "is written with spaces. The digits are right, but an identifier is compared as it is written, and a SIREN is nine digits with nothing between them.";
+    }
+}
+function siretWhat(problem, value) {
+    const digits = value.replace(/\s/g, "");
+    switch (problem) {
+        case "form":
+            return `is not fourteen digits.${/^[0-9]{9}$/.test(digits) ? " Nine digits is a SIREN, which identifies the company rather than one establishment and belongs under scheme 0002." : ""}`;
+        case "check-digit":
+            return "fails the check: all fourteen digits must pass the Luhn check, and so must the SIREN they begin with. (La Poste's establishments, SIREN 356000000, are the one exception INSEE makes: their digits add up to a multiple of 5 instead, and that is accepted.)";
+        case "spaces":
+            return "is written with spaces. The digits are right, but an identifier is compared as it is written, and a SIRET is fourteen digits with nothing between them.";
+    }
+}
+// ---------------------------------------------------------------------------
+// The rules
+// ---------------------------------------------------------------------------
+const identifierRules = [
+    // --- ATW-LEITWEG-ID-INVALID in the buyer reference (BT-10) ---------------
+    //
+    // Only a value with the complete form of a Leitweg-ID (`hasLeitwegIdForm`:
+    // the coarse address a Land code and a length table 1 allows) on an invoice
+    // addressed to Germany. Given that form, the only thing left to be wrong is
+    // the check digits.
+    (inv) => {
+        const value = inv.buyerReference;
+        if (!rules_identifiers_text(value) || !hasLeitwegIdForm(value) || !addressedToGermany(inv))
+            return null;
+        if (leitwegIdProblem(value) === null)
+            return null;
+        return {
+            rule: "ATW-LEITWEG-ID-INVALID",
+            field: "BT-10",
+            severity: "warning",
+            message: `The buyer reference (BT-10) "${value.trim()}" has the form of a Leitweg-ID, but ${LEITWEG_ID_CHECK_DIGITS} ${LEITWEG_ID_WHY} ${NOT_A_RULE} It applies only because the reference has the form of a Leitweg-ID: if it is another kind of reference your buyer gave you, the warning does not apply.`,
+            fix: LEITWEG_ID_FIX,
+            example: `"buyerReference": "${LEITWEG_ID_EXAMPLE}"`,
+            xpath: `${xpathRoot(inv)}/cbc:BuyerReference`,
+            docsUrl: LIMITS_DOCS,
+        };
+    },
+    // --- ATW-LEITWEG-ID-INVALID under scheme 0204 -----------------------------
+    //
+    // ISO 6523 ICD 0204 is the Leitweg-ID (specification, section 1.5), so a
+    // value under it is one by declaration, whatever field it is in.
+    (inv) => {
+        const out = [];
+        for (const slot of schemedSlots(inv)) {
+            if (slot.schemeId !== "0204")
+                continue;
+            const problem = leitwegIdProblem(slot.value);
+            if (problem === null)
+                continue;
+            out.push({
+                rule: "ATW-LEITWEG-ID-INVALID",
+                field: slot.field,
+                severity: "warning",
+                message: `The ${slot.label} (${slot.field}) is "${slot.value}" under scheme 0204, which makes it a Leitweg-ID, but ${problem === "form"
+                    ? `it does not have the form of one: a coarse address of 2 to 12 digits, an optional fine address of up to 30 letters and digits, and two check digits, joined by hyphens (Leitweg-ID format specification 2.0.2, section 2).${leitwegFormHint(slot.value)}`
+                    : LEITWEG_ID_CHECK_DIGITS} ${LEITWEG_ID_WHY} ${NOT_A_RULE}`,
+                fix: `${LEITWEG_ID_FIX} If the value is not a Leitweg-ID at all, change ${slot.path}'s scheme identifier to the scheme it belongs to.`,
+                example: slot.example("0204", LEITWEG_ID_EXAMPLE),
+                xpath: slot.xpath,
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
+    // --- ATW-IBAN-INVALID: the payment account identifier (BT-84) --------------
+    //
+    // BT-84 is an IBAN under a SEPA credit transfer (58) and may be any account
+    // number otherwise, so outside 58 only a value that starts like an IBAN is
+    // held to being one. On XRechnung with 58, BR-DE-19 already reports a value
+    // with the wrong form or check digits, at the same severity, and a second
+    // finding would say it twice; what BR-DE-19 does not check, and this does,
+    // is the length ISO 13616 gives the IBAN of each country.
+    (inv) => {
+        const payment = inv.payment;
+        if (!payment || typeof payment !== "object" || !rules_identifiers_text(payment.iban))
+            return null;
+        const value = payment.iban;
+        const sepa = typeof payment.meansCode === "string" && payment.meansCode.trim() === "58";
+        if (!sepa && !looksLikeIban(value))
+            return null;
+        if (sepa && isXRechnung(inv) && !isValidIban(value.trim()))
+            return null;
+        const problem = ibanProblem(value);
+        if (problem === null)
+            return null;
+        return {
+            rule: "ATW-IBAN-INVALID",
+            field: "BT-84",
+            severity: "warning",
+            message: `The payment account identifier (BT-84) "${value.trim()}" ${ibanWhat(problem, value, sepa)} The IBAN is where the buyer's payment goes, and a bank refuses or returns a transfer to one that does not exist. ${NOT_A_RULE}`,
+            fix: "Take the IBAN from the account holder's own record, such as the bank's account confirmation, rather than retyping it, and write it in capitals. Spaces between the groups of four are allowed.",
+            example: `"payment": { "meansCode": "58", "iban": "DE02120300000000202051" }`,
+            xpath: `${xpathRoot(inv)}/${IBAN_XPATH}`,
+            docsUrl: LIMITS_DOCS,
+        };
+    },
+    // --- ATW-BIC-INVALID: the payment service provider identifier (BT-86) -----
+    (inv) => {
+        const payment = inv.payment;
+        if (!payment || typeof payment !== "object" || !rules_identifiers_text(payment.bic))
+            return null;
+        const value = payment.bic;
+        const problem = bicProblem(value);
+        if (problem === null)
+            return null;
+        const trimmed = value.trim();
+        const what = problem === "form"
+            ? "is not a BIC: a BIC is 8 or 11 letters and digits, a four-character bank code, the two-letter country code, a two-character location code and an optional three-character branch code (ISO 9362), with no spaces."
+            : problem === "country"
+                ? `is not a BIC: its fifth and sixth characters, "${trimmed.slice(4, 6).toUpperCase()}", are where the bank's country code goes, and they are not one.`
+                : "is written with lower-case letters. A BIC is written in capitals, and the ISO 20022 payment formats a buyer's system builds from the invoice accept nothing else.";
+        return {
+            rule: "ATW-BIC-INVALID",
+            field: "BT-86",
+            severity: "warning",
+            message: `The payment service provider identifier (BT-86) "${trimmed}" ${what} It names the bank that holds the account; inside SEPA the IBAN alone is enough, but a malformed BIC is still copied into the buyer's payment. ${NOT_A_RULE}`,
+            fix: "Write the BIC as the bank gives it: 8 or 11 capital letters and digits, without spaces. Within SEPA you may also leave payment.bic out, because the IBAN alone identifies the account.",
+            example: `"payment": { "meansCode": "58", "iban": "DE02120300000000202051", "bic": "BYLADEM1001" }`,
+            xpath: `${xpathRoot(inv)}/${BIC_XPATH}`,
+            docsUrl: LIMITS_DOCS,
+        };
+    },
+    // --- ATW-SIREN-INVALID (scheme 0002) and ATW-SIRET-INVALID (0009) ---------
+    (inv) => {
+        const out = [];
+        for (const slot of schemedSlots(inv)) {
+            const siren = slot.schemeId === "0002";
+            if (!siren && slot.schemeId !== "0009")
+                continue;
+            const problem = siren ? sirenProblem(slot.value) : siretProblem(slot.value);
+            if (problem === null)
+                continue;
+            out.push({
+                rule: siren ? "ATW-SIREN-INVALID" : "ATW-SIRET-INVALID",
+                field: slot.field,
+                severity: "warning",
+                message: siren
+                    ? `The ${slot.label} (${slot.field}) is "${slot.value}" under scheme 0002, the French SIRENE register, which makes it a SIREN: the nine digits INSEE gives a company. This one ${sirenWhat(problem, slot.value)} ${FRENCH_ID_WHY} ${NOT_A_RULE}`
+                    : `The ${slot.label} (${slot.field}) is "${slot.value}" under scheme 0009, which makes it a SIRET: the fourteen digits that identify one establishment of a French company, its SIREN followed by a five-digit establishment number. This one ${siretWhat(problem, slot.value)} ${FRENCH_ID_WHY} ${NOT_A_RULE}`,
+                fix: siren
+                    ? `Take the SIREN from the company's registration, such as its Kbis extract or the SIRENE register, rather than retyping it, and write ${slot.path} as nine digits without spaces.`
+                    : `Take the SIRET from the SIRENE register or from the party it identifies, rather than retyping it, and write ${slot.path} as fourteen digits without spaces.`,
+                example: slot.example(siren ? "0002" : "0009", siren ? SIREN_EXAMPLE : SIRET_EXAMPLE),
+                xpath: slot.xpath,
+                docsUrl: LIMITS_DOCS,
+            });
+        }
+        return out;
+    },
 ];
 
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/codelists/peppol.js
@@ -75945,11 +78487,11 @@ function termOf(path) {
     return ROOT_TERMS[String(root)] ?? [];
 }
 const rules_representable_show = (path) => path.map((p, i) => (typeof p === "number" ? `[${p}]` : i === 0 ? p : `.${p}`)).join("");
-function finding(path, rule, severity, message, fix) {
+function rules_representable_finding(path, rule, severity, message, fix) {
     return { rule, field: termOf(path), severity, message, fix, docsUrl: LIMITS_DOCS };
 }
 function wrongType(path, expected, value) {
-    return finding(path, "ATW-INPUT-TYPE", "fatal", `${rules_representable_show(path)} should be ${expected}, but it is ${kindOf(value)}. The rules and the generators rely on the InvoiceInput types.`, `Set ${rules_representable_show(path)} to ${expected}, or leave it out. A value parsed from JSON or a form is the usual cause: "19" where 19 is expected, or null for a field that is simply absent.`);
+    return rules_representable_finding(path, "ATW-INPUT-TYPE", "fatal", `${rules_representable_show(path)} should be ${expected}, but it is ${kindOf(value)}. The rules and the generators rely on the InvoiceInput types.`, `Set ${rules_representable_show(path)} to ${expected}, or leave it out. A value parsed from JSON or a form is the usual cause: "19" where 19 is expected, or null for a field that is simply absent.`);
 }
 function rules_representable_walk(value, path, out, seen) {
     const key = path[path.length - 1];
@@ -75993,15 +78535,15 @@ function rules_representable_walk(value, path, out, seen) {
         // ceiling, is reported here, because the comparisons cannot compute it.
         const topLevel = path.length === 2;
         if (!Number.isFinite(value) && !topLevel) {
-            out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
+            out.push(rules_representable_finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
         }
         else if (Number.isFinite(value) && Math.abs(value) > MAX_MONETARY_AMOUNT) {
-            out.push(finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, beyond the ${MAX_MONETARY_AMOUNT} this library computes exactly.`, "Check the unit: a figure this size is almost always a slip upstream."));
+            out.push(rules_representable_finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, beyond the ${MAX_MONETARY_AMOUNT} this library computes exactly.`, "Check the unit: a figure this size is almost always a slip upstream."));
         }
         return;
     }
     if (inDeclared && key === "rate" && typeof value === "number" && !Number.isFinite(value)) {
-        out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
+        out.push(rules_representable_finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}, which no document can state.`, "Check the arithmetic that produced it."));
         return;
     }
     if (typeof value === "string") {
@@ -76010,7 +78552,7 @@ function rules_representable_walk(value, path, out, seen) {
             return;
         const left = value.replace(NOT_XML, "").trim();
         const codes = [...new Set(bad)].map((c) => `U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
-        out.push(finding(path, "ATW-TEXT-NOT-XML", left === "" ? "fatal" : "warning", `${rules_representable_show(path)} contains ${codes.join(", ")}, which an XML document cannot carry. The generators remove ` +
+        out.push(rules_representable_finding(path, "ATW-TEXT-NOT-XML", left === "" ? "fatal" : "warning", `${rules_representable_show(path)} contains ${codes.join(", ")}, which an XML document cannot carry. The generators remove ` +
             (left === ""
                 ? "them, and nothing is left: the field would be written empty."
                 : "them, so the document would say something slightly different from your input."), "Remove control characters and unpaired surrogates from the text before building the invoice. They usually come from a copy-paste or a broken encoding upstream."));
@@ -76019,14 +78561,14 @@ function rules_representable_walk(value, path, out, seen) {
     if (typeof value === "number") {
         const key = path[path.length - 1];
         if ((key === "vatRate" || key === "rate") && Number.isFinite(value) && Math.abs(value) > MAX_VAT_RATE) {
-            out.push(finding(path, "ATW-VAT-RATE-OUT-OF-RANGE", "fatal", `${rules_representable_show(path)} is ${value}%. No VAT regime charges more than the price itself, and a rate this size cannot be computed exactly.`, "Set the rate as a percentage: 19 for 19%, not 0.19 or 1900."));
+            out.push(rules_representable_finding(path, "ATW-VAT-RATE-OUT-OF-RANGE", "fatal", `${rules_representable_show(path)} is ${value}%. No VAT regime charges more than the price itself, and a rate this size cannot be computed exactly.`, "Set the rate as a percentage: 19 for 19%, not 0.19 or 1900."));
         }
         else if (typeof key === "string" && FORMATTED_NUMBERS.has(key)) {
             if (!Number.isFinite(value)) {
-                out.push(finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}. The XML type behind it, xs:decimal, has no NaN or infinity, so the document cannot be written.`, "Check the arithmetic that produced it: a division by zero, or a sum over a missing value, is the usual cause."));
+                out.push(rules_representable_finding(path, "ATW-NUMBER-NOT-FINITE", "fatal", `${rules_representable_show(path)} is ${value}. The XML type behind it, xs:decimal, has no NaN or infinity, so the document cannot be written.`, "Check the arithmetic that produced it: a division by zero, or a sum over a missing value, is the usual cause."));
             }
             else if (Math.abs(value) >= EXPONENT_LIMIT) {
-                out.push(finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, at or above 1e21, which cannot be written as an xs:decimal without exponent notation.`, "Check the unit: a value this size is almost always a slip upstream."));
+                out.push(rules_representable_finding(path, "ATW-NUMBER-TOO-LARGE", "fatal", `${rules_representable_show(path)} is ${value}, at or above 1e21, which cannot be written as an xs:decimal without exponent notation.`, "Check the unit: a value this size is almost always a slip upstream."));
             }
         }
         return;
@@ -76821,6 +79363,8 @@ const vatRules = [
 
 
 
+
+
 /**
  * The single integration point between `rules.ts` and the rule families added
  * from wave A onwards.
@@ -76844,10 +79388,64 @@ const extendedRules = [
     ...referenceRules,
     ...germanRules,
     ...peppolRules,
+    ...identifierRules,
     ...representableRules,
+    ...defaultsRules,
 ];
 
+;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/defaults.js
+
+
+/**
+ * Everything the engine fills in from business facts, in one pass.
+ *
+ * Two things today: the VAT scenarios (`applyVatScenarios`) and the payment
+ * means code inferred from the payment account (`payment-means.ts`). They are
+ * one function rather than two options because `validateInput` and both
+ * generators must apply exactly the same set, in the same order, or a caller
+ * would validate one document and send another. `applyVatScenarios` stays
+ * exported on its own for a caller who wants the VAT half only.
+ *
+ * The two halves touch disjoint fields (lines, allowances, charges and the
+ * exemption maps; `payment.meansCode`), so their order cannot change the
+ * result. An input neither applies to comes back as the same object.
+ */
+/**
+ * The explicit invoice, without the notes. What the generators and
+ * `runInputRules` call.
+ */
+function defaults_expandDefaults(input) {
+    return payment_means_expandPaymentMeans(expandVatScenarios(input));
+}
+/**
+ * Fill in every code the facts imply, and say what was filled.
+ *
+ * `applyVatScenarios`, then the payment means code: when `payment.meansCode`
+ * is left out (absent, not empty), it becomes `"59"` for a direct-debit
+ * mandate in euro (`"49"` otherwise), or, with an IBAN, `"58"` when the
+ * currency is EUR and the IBAN's country is in the SEPA scheme (`"30"`
+ * otherwise). Each inference is one `ATW-PAYMENT-MEANS-INFERRED` note, after
+ * the scenarios' `ATW-VAT-SCENARIO-APPLIED` notes.
+ *
+ * This is the pass `validateInput`, `generateXRechnungUBL` and `generateCii`
+ * apply before anything else, so `applyDefaults(facts).invoice` is the
+ * invoice they judge and write. Pure; an input with nothing to fill comes
+ * back as the same object with no notes.
+ */
+function applyDefaults(input) {
+    const vat = applyVatScenarios(input);
+    const inference = inferPaymentMeans(vat.invoice);
+    if (!inference)
+        return vat;
+    return {
+        invoice: expandPaymentMeans(vat.invoice),
+        notes: [...vat.notes, paymentMeansNote(vat.invoice, inference)],
+    };
+}
+
 ;// CONCATENATED MODULE: ./node_modules/@attestwire/en16931/dist/rules.js
+
+
 
 
 
@@ -77289,7 +79887,7 @@ const baseInputRules = [
             field: "BG-25",
             severity: "fatal",
             message: "An invoice must have at least one invoice line (BG-25). A document with no lines has no taxable supply to describe, so it cannot be an invoice — even if its totals are zero.",
-            fix: "Add at least one entry to lines. To invoice a flat fee, use quantity 1 with unitCode \"C62\" (one/piece) and the fee as unitPrice.",
+            fix: "Add at least one entry to lines. To invoice a flat fee, use quantity 1 with unitCode \"C62\" (one) and the fee as unitPrice.",
             example: `"lines": [{ "id": "1", "description": "Retainer", "quantity": 1, "unitCode": "C62", "unitPrice": 500, "vatCategory": "S", "vatRate": 19 }]`,
             xpath: "/ubl:Invoice/cac:InvoiceLine",
             docsUrl: `${rules_DOCS}/BR-16`,
@@ -77360,7 +79958,7 @@ const baseInputRules = [
                     field: "BT-130",
                     severity: "fatal",
                     message: `${where} has no unit of measure code (BT-130). EN 16931 requires a code from UN/ECE Recommendation 20, not a free-text unit — "hours" is not valid, "HUR" is.`,
-                    fix: 'Set line.unitCode to the UN/ECE Rec 20 code: "HUR" hours, "DAY" days, "C62" one/piece, "MTR" metres, "KGM" kilograms, "MON" months.',
+                    fix: 'Set line.unitCode to the UN/ECE Rec 20 code: "HUR" hours, "DAY" days, "H87" pieces, "C62" one (a unit of anything), "MTR" metres, "KGM" kilograms, "MON" months. resolveUnitCode() turns a unit word such as "Stk" or "hours" into its code.',
                     example: `"unitCode": "HUR"`,
                     xpath: `${at}/cbc:InvoicedQuantity/@unitCode`,
                     docsUrl: `${rules_DOCS}/BR-23`,
@@ -78449,10 +81047,54 @@ function notAnInvoiceObject(inv) {
         docsUrl: rules_LIMITS_DOCS,
     };
 }
-function runInputRules(inv) {
-    const notAnObject = notAnInvoiceObject(inv);
+/**
+ * Every rule over one input: the findings `validateInput` sorts into errors,
+ * warnings and information, in rule order. Accepts business facts as
+ * `validateInput` does.
+ */
+function runInputRules(input) {
+    const notAnObject = notAnInvoiceObject(input);
     if (notAnObject)
         return [notAnObject];
+    // Business facts first (0.14.0). A `vatScenario` stands for codes, and so
+    // does an IBAN with no payment means code; the document the generators write
+    // carries the codes, so every rule judges the explicit invoice the facts
+    // stand for (`applyDefaults`). The facts themselves are judged as the caller
+    // stated them, by the one family that reads them: on the explicit invoice it
+    // has nothing left to read and returns null, so nothing is reported twice.
+    // Input with nothing to fill in, which includes every document read from
+    // XML, comes back as the same object and runs exactly as it always did.
+    const inv = defaults_expandDefaults(input);
+    const out = [];
+    let typeError = null;
+    const run = (rules, subject, ctx) => {
+        for (const rule of rules) {
+            let result;
+            try {
+                result = rule(subject, ctx);
+            }
+            catch (error) {
+                // The rules trust the InvoiceInput types. A JavaScript or JSON caller
+                // can still pass a number where text belongs, and a rule calling
+                // `.trim()` on it threw out of validateInput (fuzz run, 2026-09-23).
+                // Report it once, as a finding; anything else is a bug and propagates.
+                // A RangeError is the same thing for numbers (a NaN or 1e308 the rule
+                // cannot round); the input check usually names it already.
+                if (!(error instanceof TypeError) && !(error instanceof RangeError))
+                    throw error;
+                typeError ??= error;
+                continue;
+            }
+            if (!result)
+                continue;
+            if (Array.isArray(result))
+                out.push(...result);
+            else
+                out.push(result);
+        }
+    };
+    if (inv !== input)
+        run(defaultsRules, input);
     // One pass, one set of totals. See `RuleContext` in rule-kit.ts for why this
     // is built here — at the top of a single run, thrown away at the bottom of it
     // — rather than keyed on `inv` in a WeakMap that would outlive the caller's
@@ -78462,33 +81104,7 @@ function runInputRules(inv) {
     // `makeRuleContext` records the throw instead of propagating it, so a rule
     // that swallows the defect still swallows it and the one rule that does not
     // still raises it, at the point in the run where it always did.
-    const ctx = makeRuleContext(inv);
-    const out = [];
-    let typeError = null;
-    for (const rule of inputRules) {
-        let result;
-        try {
-            result = rule(inv, ctx);
-        }
-        catch (error) {
-            // The rules trust the InvoiceInput types. A JavaScript or JSON caller
-            // can still pass a number where text belongs, and a rule calling
-            // `.trim()` on it threw out of validateInput (fuzz run, 2026-09-23).
-            // Report it once, as a finding; anything else is a bug and propagates.
-            // A RangeError is the same thing for numbers (a NaN or 1e308 the rule
-            // cannot round); the input check usually names it already.
-            if (!(error instanceof TypeError) && !(error instanceof RangeError))
-                throw error;
-            typeError ??= error;
-            continue;
-        }
-        if (!result)
-            continue;
-        if (Array.isArray(result))
-            out.push(...result);
-        else
-            out.push(result);
-    }
+    run(inputRules, inv, makeRuleContext(inv));
     // The exception's own text is deliberately NOT in the message. It is the
     // runtime's wording, not ours, and a service that returns findings to its
     // callers (apps/api) promises never to echo an exception; a scan of that
@@ -78523,8 +81139,12 @@ function runInputRules(inv) {
  * holding the reader's own exception, whose `code` says why. It throws only
  * for a programming error, such as passing a number.
  *
- * Every finding carries a `location` in the caller's file: see locate.ts.
+ * Every rule finding carries a `location` in the caller's file: see locate.ts.
+ * A Factur-X / ZUGFeRD PDF adds the container's own findings (`AW-PDF-*`,
+ * never fatal, see facturx-findings.ts), which are about the PDF around the
+ * XML and so have no line to carry.
  */
+
 
 
 
@@ -78570,6 +81190,7 @@ function notADocument(value) {
 function validate(document, options = {}) {
     let xml;
     let container = null;
+    let extracted;
     if (typeof document === "string") {
         if (document.startsWith("%PDF")) {
             return unreadable("AW-PDF", "This is a PDF passed as text. A PDF's bytes do not survive being decoded to a string.", "Pass the file's bytes: validate(await readFile(path)) in Node, or new Uint8Array(await file.arrayBuffer()) in a browser.");
@@ -78588,7 +81209,7 @@ function validate(document, options = {}) {
         // .xml by a mail client is still a Factur-X.
         if (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) {
             try {
-                const extracted = extractFacturX(bytes, options.pdfLimits);
+                extracted = extractFacturX(bytes, options.pdfLimits);
                 xml = extracted.xml;
                 container = extracted.attachmentName ?? "embedded XML";
             }
@@ -78637,7 +81258,9 @@ function validate(document, options = {}) {
         const result = SIZE_CODES.has(err.code)
             ? tooLarge(err)
             : unreadable("AW-PARSE", `This is not an invoice this validator can read: ${err.message}`, "Supply a UBL 2.1 Invoice or CreditNote, or a UN/CEFACT CrossIndustryInvoice (XRechnung, Peppol, Factur-X).", err);
-        return { ...result, container };
+        // The PDF was read, so what it says about itself still holds, and one of
+        // its findings may be the explanation: an attachment that is not CII.
+        return withContainer({ ...result, container }, extracted?.findings ?? []);
     }
     const invoice = options.profile ? { ...parsed.invoice, profile: options.profile } : parsed.invoice;
     const findings = runInputRules(invoice).map((f) => {
@@ -78649,6 +81272,17 @@ function validate(document, options = {}) {
             out.xpath = xpath;
         return out;
     });
+    // The container's findings, about the PDF around the XML: after the engine's
+    // findings about the profile and before the rules, as findings about the
+    // whole file come first. The ones that set the PDF against the XML's BT-24
+    // are made here, from the BT-24 just read, so the XML is parsed once.
+    if (extracted) {
+        const aboutThePdf = sortFacturXFindings([
+            ...extracted.findings,
+            ...facturXProfileFindings(extracted, parsed.customizationId),
+        ]);
+        findings.unshift(...aboutThePdf.map(asDocumentFinding));
+    }
     const sub = subInvoiceProfile(parsed.customizationId);
     if (sub) {
         findings.unshift({
@@ -78699,6 +81333,26 @@ function unreadable(rule, message, fix, error) {
     if (error)
         result.error = error;
     return result;
+}
+/**
+ * A container finding as `validate` reports it: the `TeachingError` fields and
+ * nothing else. The observation's `id` stays on `extractFacturX`'s result; the
+ * hosted API passes these findings through verbatim, and its schema admits no
+ * other key.
+ */
+function asDocumentFinding(f) {
+    return { rule: f.rule, field: f.field, severity: f.severity, message: f.message, fix: f.fix };
+}
+/** A result with the container's findings added, each under its severity. */
+function withContainer(result, aboutThePdf) {
+    if (aboutThePdf.length === 0)
+        return result;
+    const found = aboutThePdf.map(asDocumentFinding);
+    return {
+        ...result,
+        warnings: [...found.filter((f) => f.severity === "warning"), ...result.warnings],
+        information: [...found.filter((f) => f.severity === "information"), ...result.information],
+    };
 }
 function tooLarge(err) {
     return unreadable("AW-SIZE", `This is larger than the default limits: ${err.message.split(". ")[0]}.`, "If a document this size is expected, raise the limit it names through the limits (XML) or pdfLimits (PDF) option.", err);
@@ -78773,14 +81427,14 @@ const PROFILE_SYNTAX = {
     "xrechnung-cii": "cii",
     "facturx-en16931": "cii",
 };
-/** Factur-X / ZUGFeRD profiles below EN 16931: they are not full invoices. */
+/**
+ * Factur-X / ZUGFeRD profiles below EN 16931: they are not full invoices.
+ * Read by the classifier the container's metadata checks use, so this finding
+ * and those can never disagree about what a BT-24 declares.
+ */
 function subInvoiceProfile(customizationId) {
-    const id = (customizationId ?? "").toLowerCase();
-    if (/factur-x\.eu:1p0:minimum|zugferd.*:minimum/.test(id))
-        return "MINIMUM";
-    if (/factur-x\.eu:1p0:basicwl|zugferd.*:basicwl/.test(id))
-        return "BASIC WL";
-    return null;
+    const level = facturXLevel(customizationId);
+    return level === "MINIMUM" || level === "BASIC WL" ? level : null;
 }
 
 ;// CONCATENATED MODULE: ./src/read.js
@@ -79758,7 +82412,7 @@ function buildSarif(results, { engineVersion, generatedAt, rulesetVersions } = {
  * `test/metadata.test.js`, which compares this string against both the installed
  * package and the exact pin in our own `package.json`.
  */
-const ENGINE_VERSION = "0.13.0";
+const ENGINE_VERSION = "0.14.0";
 
 /** Name reported in the SARIF driver and the summary. */
 const ENGINE_NAME = "@attestwire/en16931";
